@@ -9,11 +9,12 @@ use std::process::ExitCode;
 use serde::Serialize;
 use uasset_parser::asset::{AssetDecodeContext, AssetDecoder, AssetError, AssetErrorKind};
 use uasset_parser::asset::{DataTableDecoder, DecodedAsset};
-use uasset_parser::package::{PackageError, PackageErrorKind, TableLocation};
+use uasset_parser::package::{PackageError, PackageErrorKind, PackageIndex, TableLocation};
+use uasset_parser::property::{PropertyRecord, PropertyValue, RawReason};
 use uasset_parser::schema::{ClassSchema, SchemaProvider, StructSchema};
 use uasset_parser::{Package, PackageSummary};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const EXIT_SUCCESS: u8 = 0;
 const EXIT_MALFORMED: u8 = 2;
 const EXIT_UNSUPPORTED: u8 = 3;
@@ -265,8 +266,18 @@ fn render_text_output(output: &InspectOutput) -> String {
         if let Some(row_struct) = &asset.row_struct {
             writeln!(rendered, "row_struct: {row_struct}").unwrap();
         }
-        if !asset.rows.is_empty() {
-            writeln!(rendered, "rows: {}", asset.rows.join(", ")).unwrap();
+        for row in &asset.rows {
+            writeln!(rendered, "  row {}:", row.name).unwrap();
+            for property in &row.properties {
+                writeln!(
+                    rendered,
+                    "    {} ({}) = {}",
+                    property.name,
+                    property.type_name,
+                    property.value.render()
+                )
+                .unwrap();
+            }
         }
     }
     rendered
@@ -386,7 +397,15 @@ impl InspectOutput {
                     rows: datatable
                         .rows
                         .iter()
-                        .filter_map(|row| package.resolve_name(row.name))
+                        .map(|row| RowOutput {
+                            name: resolve_name_or_placeholder(package, row.name),
+                            properties: row
+                                .properties
+                                .records
+                                .iter()
+                                .map(|record| PropertyOutput::from_record(record, package))
+                                .collect(),
+                        })
                         .collect(),
                 });
             }
@@ -425,7 +444,103 @@ struct AssetOutput {
     object_path: String,
     row_struct: Option<String>,
     row_count: usize,
-    rows: Vec<String>,
+    rows: Vec<RowOutput>,
+}
+
+#[derive(Serialize)]
+struct RowOutput {
+    name: String,
+    properties: Vec<PropertyOutput>,
+}
+
+#[derive(Serialize)]
+struct PropertyOutput {
+    name: String,
+    #[serde(rename = "type")]
+    type_name: String,
+    #[serde(flatten)]
+    value: PropertyValueOutput,
+}
+
+impl PropertyOutput {
+    fn from_record(record: &PropertyRecord, package: &Package) -> Self {
+        let value = match &record.value {
+            PropertyValue::Bool(value) => PropertyValueOutput::Bool { value: *value },
+            PropertyValue::Int(value) => PropertyValueOutput::Int { value: *value },
+            PropertyValue::UInt(value) => PropertyValueOutput::Uint { value: *value },
+            PropertyValue::Float(value) => PropertyValueOutput::Float { value: *value },
+            PropertyValue::Double(value) => PropertyValueOutput::Double { value: *value },
+            PropertyValue::Name(name) => PropertyValueOutput::Name {
+                value: resolve_name_or_placeholder(package, *name),
+            },
+            PropertyValue::String(value) => PropertyValueOutput::String {
+                value: value.clone(),
+            },
+            PropertyValue::ObjectRef(index) => PropertyValueOutput::ObjectRef {
+                value: resolve_object_ref(package, *index),
+            },
+            PropertyValue::Raw { reason } => PropertyValueOutput::Raw {
+                reason: render_raw_reason(reason),
+                size: record.payload.len(),
+            },
+        };
+        Self {
+            name: resolve_name_or_placeholder(package, record.name),
+            type_name: resolve_name_or_placeholder(package, record.type_name.name),
+            value,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "value_kind", rename_all = "snake_case")]
+enum PropertyValueOutput {
+    Bool { value: bool },
+    Int { value: i64 },
+    Uint { value: u64 },
+    Float { value: f32 },
+    Double { value: f64 },
+    Name { value: String },
+    String { value: String },
+    ObjectRef { value: Option<String> },
+    Raw { reason: String, size: u64 },
+}
+
+impl PropertyValueOutput {
+    fn render(&self) -> String {
+        match self {
+            Self::Bool { value } => value.to_string(),
+            Self::Int { value } => value.to_string(),
+            Self::Uint { value } => value.to_string(),
+            Self::Float { value } => value.to_string(),
+            Self::Double { value } => value.to_string(),
+            Self::Name { value } => value.clone(),
+            Self::String { value } => format!("{value:?}"),
+            Self::ObjectRef { value } => value.clone().unwrap_or_else(|| "null".to_owned()),
+            Self::Raw { reason, size } => format!("<raw {reason}, {size} bytes>"),
+        }
+    }
+}
+
+fn resolve_name_or_placeholder(package: &Package, name: uasset_parser::archive::NameRef) -> String {
+    package
+        .resolve_name(name)
+        .unwrap_or_else(|| "<unresolved>".to_owned())
+}
+
+fn resolve_object_ref(package: &Package, index: PackageIndex) -> Option<String> {
+    if index == PackageIndex::Null {
+        None
+    } else {
+        package.resolve_index(index).map(|path| path.to_string())
+    }
+}
+
+fn render_raw_reason(reason: &RawReason) -> String {
+    match reason {
+        RawReason::UnsupportedType => "unsupported type".to_owned(),
+        RawReason::DecoderRejected(detail) => detail.clone(),
+    }
 }
 
 #[derive(Serialize)]

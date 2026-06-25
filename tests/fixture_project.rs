@@ -271,7 +271,7 @@ fn shared_fixture_corpus_matches_the_spawned_cli_contract() {
 
         let json: Value = serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|error| panic!("invalid JSON for {}: {error}", path.display()));
-        assert_eq!(json["schema_version"], 1, "{}", path.display());
+        assert_eq!(json["schema_version"], 2, "{}", path.display());
         assert_eq!(json["status"], "ok", "{}", path.display());
         assert_eq!(
             json["package"]["name"],

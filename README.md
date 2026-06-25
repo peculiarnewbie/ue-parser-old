@@ -5,10 +5,7 @@ The Rust library is an implementation detail; the versioned CLI output is the
 integration contract for other programs.
 
 The initial compatibility target is UE 5.7.2, uncooked editor packages using
-versioned tagged properties. See:
-
-- `../docs/05-implementation/datatable-poc-roadmap.md`
-- `../docs/05-implementation/foundation-architecture.md`
+versioned tagged properties.
 
 ## Current status
 
@@ -41,7 +38,11 @@ Phases 1 through 6 are implemented:
 - `UDataTable` asset adapter with row-count and row-name decoding
 - Row tagged-property streams are parsed and decoded where the supported
   property subset applies
+- Per-row property names, types, and decoded values are surfaced in both the
+  text and JSON `inspect` output; unsupported property types are reported as
+  raw with their type and payload byte length
 - `uasset inspect` command with text and schema-versioned JSON output
+  (current `schema_version` is 2)
 - File and stdin input
 - Stable stdout/stderr and exit-code behavior
 

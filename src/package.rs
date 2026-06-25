@@ -1527,9 +1527,23 @@ mod tests {
 
     #[test]
     fn parses_existing_classic_ue5_asset_summary() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-            "../Samples/StarterContent/Content/StarterContent/Architecture/Floor_400x400.uasset",
-        );
+        // The StarterContent sample lived alongside the old in-engine project
+        // location. Resolution order mirrors the fixture tests: an explicit
+        // override, then the historical relative default. When neither is
+        // present the test skips so portable builds outside that layout pass.
+        let path = std::env::var_os("UASSET_STARTER_SAMPLE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+                    "../Samples/StarterContent/Content/StarterContent/Architecture/Floor_400x400.uasset",
+                )
+            });
+        if !path.is_file() {
+            eprintln!(
+                "skipping classic UE5 summary check; set UASSET_STARTER_SAMPLE to a Floor_400x400.uasset to run it"
+            );
+            return;
+        }
         let bytes = std::fs::read(path).unwrap();
 
         let summary = PackageSummary::parse(&bytes).unwrap();
