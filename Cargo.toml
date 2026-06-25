@@ -1,0 +1,25 @@
+[package]
+name = "uasset-parser"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Read-only parser foundation for classic Unreal Engine asset packages"
+license = "MIT"
+
+[lib]
+name = "uasset_parser"
+path = "src/lib.rs"
+
+[[bin]]
+name = "uasset"
+path = "src/bin/uasset.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

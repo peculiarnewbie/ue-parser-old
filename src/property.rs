@@ -1,0 +1,456 @@
+//! Generic tagged-property model and envelope parsing.
+
+use std::fmt;
+
+use crate::archive::{ArchiveError, ArchiveErrorKind, Guid, NameRef, Reader, Span};
+use crate::package::PackageIndex;
+use crate::version::VersionContext;
+
+const UE5_PROPERTY_TAG_EXTENSION_AND_OVERRIDABLE_SERIALIZATION: i32 = 1011;
+const UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME: i32 = 1012;
+
+const TAG_FLAG_HAS_ARRAY_INDEX: u8 = 0x01;
+const TAG_FLAG_HAS_PROPERTY_GUID: u8 = 0x02;
+const TAG_FLAG_HAS_PROPERTY_EXTENSIONS: u8 = 0x04;
+const TAG_FLAG_HAS_BINARY_OR_NATIVE_SERIALIZE: u8 = 0x08;
+const TAG_FLAG_BOOL_TRUE: u8 = 0x10;
+const TAG_FLAG_SKIPPED_SERIALIZE: u8 = 0x20;
+
+const PROPERTY_EXTENSION_RESERVE_FOR_FUTURE_USE: u8 = 0x01;
+const PROPERTY_EXTENSION_OVERRIDABLE_INFORMATION: u8 = 0x02;
+
+const CLASS_EXTENSION_RESERVE_FOR_FUTURE_USE: u8 = 0x01;
+const CLASS_EXTENSION_OVERRIDABLE_SERIALIZATION_INFORMATION: u8 = 0x02;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropertyTypeName {
+    pub name: NameRef,
+    pub parameters: Vec<PropertyTypeName>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PropertyTagFlags(pub u8);
+
+impl PropertyTagFlags {
+    #[must_use]
+    pub const fn contains(self, flag: u8) -> bool {
+        self.0 & flag == flag
+    }
+
+    #[must_use]
+    pub const fn bool_value(self) -> bool {
+        self.contains(TAG_FLAG_BOOL_TRUE)
+    }
+
+    #[must_use]
+    pub const fn is_binary_or_native(self) -> bool {
+        self.contains(TAG_FLAG_HAS_BINARY_OR_NATIVE_SERIALIZE)
+    }
+
+    #[must_use]
+    pub const fn is_skipped(self) -> bool {
+        self.contains(TAG_FLAG_SKIPPED_SERIALIZE)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RawReason {
+    UnsupportedType,
+    DecoderRejected(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PropertyValue {
+    Bool(bool),
+    Float(f32),
+    Double(f64),
+    Int(i64),
+    UInt(u64),
+    Name(NameRef),
+    String(String),
+    ObjectRef(PackageIndex),
+    Raw { reason: RawReason },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropertyRecord {
+    pub name: NameRef,
+    pub type_name: PropertyTypeName,
+    pub array_index: i32,
+    pub flags: PropertyTagFlags,
+    pub property_guid: Option<Guid>,
+    pub extensions: Option<PropertyTagExtensions>,
+    pub payload: Span,
+    pub value: PropertyValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropertyTagExtensions {
+    pub raw_flags: u8,
+    pub override_operation: Option<u8>,
+    pub experimental_overridable_logic: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropertyStream {
+    pub class_extensions: Option<ClassSerializationControlExtensions>,
+    pub records: Vec<PropertyRecord>,
+    pub terminator: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClassSerializationControlExtensions {
+    pub raw_flags: u8,
+    pub overridable_operation: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PropertyErrorKind {
+    MalformedData,
+    UnsupportedVersion,
+    UnsupportedCapability,
+}
+
+#[derive(Debug)]
+pub struct PropertyError {
+    kind: PropertyErrorKind,
+    offset: Option<u64>,
+    path: String,
+    detail: String,
+    source: Option<Box<ArchiveError>>,
+}
+
+impl PropertyError {
+    fn new(
+        kind: PropertyErrorKind,
+        offset: Option<u64>,
+        path: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            offset,
+            path: path.into(),
+            detail: detail.into(),
+            source: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> PropertyErrorKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn offset(&self) -> Option<u64> {
+        self.offset
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl fmt::Display for PropertyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.offset {
+            Some(offset) => write!(
+                formatter,
+                "{:?} at byte {offset} while reading {}: {}",
+                self.kind, self.path, self.detail
+            ),
+            None => write!(
+                formatter,
+                "{:?} while reading {}: {}",
+                self.kind, self.path, self.detail
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PropertyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
+impl From<ArchiveError> for PropertyError {
+    fn from(source: ArchiveError) -> Self {
+        let kind = match source.kind() {
+            ArchiveErrorKind::OutOfBounds
+            | ArchiveErrorKind::InvalidSeek
+            | ArchiveErrorKind::InvalidCount
+            | ArchiveErrorKind::AllocationLimit
+            | ArchiveErrorKind::MissingNullTerminator
+            | ArchiveErrorKind::InvalidString
+            | ArchiveErrorKind::InvalidNameReference
+            | ArchiveErrorKind::IntegerOverflow => PropertyErrorKind::MalformedData,
+        };
+        Self {
+            kind,
+            offset: Some(source.offset()),
+            path: source.path().to_owned(),
+            detail: source.detail().to_owned(),
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
+/// Parses a root UObject versioned tagged-property stream.
+///
+/// UE5 root object streams include class serialization-control extensions
+/// immediately before the tagged-property array. Struct/row streams do not.
+///
+/// # Errors
+///
+/// Returns the same errors as [`read_tagged_property_stream`], plus unsupported
+/// class serialization-control extension groups.
+pub fn read_uobject_tagged_property_stream(
+    reader: &mut Reader<'_>,
+    versions: &VersionContext,
+    names: &[String],
+    path: &str,
+) -> Result<PropertyStream, PropertyError> {
+    let class_extensions = versions
+        .is_at_least_ue5(UE5_PROPERTY_TAG_EXTENSION_AND_OVERRIDABLE_SERIALIZATION)
+        .then(|| {
+            read_class_serialization_control_extensions(
+                reader,
+                &format!("{path}.SerializationControlExtensions"),
+            )
+        })
+        .transpose()?;
+    let mut stream = read_tagged_property_stream(reader, versions, names, path)?;
+    stream.class_extensions = class_extensions;
+    Ok(stream)
+}
+
+/// Parses a versioned tagged-property stream until `NAME_None`.
+///
+/// The reader must already be bounded to the containing export or row stream.
+/// On success, the reader cursor is positioned immediately after the terminator.
+///
+/// # Errors
+///
+/// Returns an error for unsupported pre-complete-type-name tags, malformed name
+/// references, malformed type trees, invalid payload sizes, unsupported future
+/// extension groups, or any bounded-reader failure.
+pub fn read_tagged_property_stream(
+    reader: &mut Reader<'_>,
+    versions: &VersionContext,
+    names: &[String],
+    path: &str,
+) -> Result<PropertyStream, PropertyError> {
+    if !versions.is_at_least_ue5(UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME) {
+        return Err(PropertyError::new(
+            PropertyErrorKind::UnsupportedVersion,
+            Some(reader.tell()),
+            path,
+            "property tags before complete type names are not supported",
+        ));
+    }
+
+    let mut records = Vec::new();
+    loop {
+        let tag_start = reader.tell();
+        let name = reader.read_name_ref(&format!("{path}.Tag.Name"))?;
+        validate_name_ref(names, name, &format!("{path}.Tag.Name"))?;
+        if resolve_name_ref(names, name)? == "None" {
+            return Ok(PropertyStream {
+                class_extensions: None,
+                records,
+                terminator: Span::new(tag_start, reader.tell() - tag_start)?,
+            });
+        }
+
+        let type_name = read_property_type_name(reader, names, &format!("{path}.Tag.Type"))?;
+        let size_offset = reader.tell();
+        let size = reader.read_i32(&format!("{path}.Tag.Size"))?;
+        if size < 0 {
+            return Err(PropertyError::new(
+                PropertyErrorKind::MalformedData,
+                Some(size_offset),
+                format!("{path}.Tag.Size"),
+                format!("property payload size must be non-negative, got {size}"),
+            ));
+        }
+        let payload_size = u64::try_from(size).expect("size was checked as non-negative");
+        let flags = PropertyTagFlags(reader.read_u8(&format!("{path}.Tag.Flags"))?);
+        let array_index = if flags.contains(TAG_FLAG_HAS_ARRAY_INDEX) {
+            reader.read_i32(&format!("{path}.Tag.ArrayIndex"))?
+        } else {
+            0
+        };
+        let property_guid = flags
+            .contains(TAG_FLAG_HAS_PROPERTY_GUID)
+            .then(|| reader.read_guid(&format!("{path}.Tag.PropertyGuid")))
+            .transpose()?;
+        let extensions = if flags.contains(TAG_FLAG_HAS_PROPERTY_EXTENSIONS) {
+            Some(read_property_extensions(
+                reader,
+                versions,
+                &format!("{path}.Tag.PropertyExtensions"),
+            )?)
+        } else {
+            None
+        };
+
+        let payload = Span::new(reader.tell(), payload_size)?;
+        reader.skip(payload_size, &format!("{path}.Tag.Payload"))?;
+        records.push(PropertyRecord {
+            name,
+            type_name,
+            array_index,
+            flags,
+            property_guid,
+            extensions,
+            payload,
+            value: PropertyValue::Raw {
+                reason: RawReason::UnsupportedType,
+            },
+        });
+    }
+}
+
+fn read_class_serialization_control_extensions(
+    reader: &mut Reader<'_>,
+    path: &str,
+) -> Result<ClassSerializationControlExtensions, PropertyError> {
+    let extension_offset = reader.tell();
+    let raw_flags = reader.read_u8(path)?;
+    if raw_flags & CLASS_EXTENSION_RESERVE_FOR_FUTURE_USE != 0 {
+        return Err(PropertyError::new(
+            PropertyErrorKind::UnsupportedCapability,
+            Some(extension_offset),
+            path,
+            "future class serialization-control extension groups are not supported",
+        ));
+    }
+    let overridable_operation = (raw_flags & CLASS_EXTENSION_OVERRIDABLE_SERIALIZATION_INFORMATION
+        != 0)
+        .then(|| reader.read_u8(&format!("{path}.OverridableOperation")))
+        .transpose()?;
+    Ok(ClassSerializationControlExtensions {
+        raw_flags,
+        overridable_operation,
+    })
+}
+
+fn read_property_type_name(
+    reader: &mut Reader<'_>,
+    names: &[String],
+    path: &str,
+) -> Result<PropertyTypeName, PropertyError> {
+    let name = reader.read_name_ref(&format!("{path}.Name"))?;
+    validate_name_ref(names, name, &format!("{path}.Name"))?;
+    let inner_count_offset = reader.tell();
+    let inner_count = reader.read_i32(&format!("{path}.InnerCount"))?;
+    if inner_count < 0 {
+        return Err(PropertyError::new(
+            PropertyErrorKind::MalformedData,
+            Some(inner_count_offset),
+            format!("{path}.InnerCount"),
+            format!("type-name inner count must be non-negative, got {inner_count}"),
+        ));
+    }
+    let inner_count = usize::try_from(inner_count).expect("non-negative i32 fits in usize");
+    let mut parameters = Vec::with_capacity(inner_count);
+    for index in 0..inner_count {
+        parameters.push(read_property_type_name(
+            reader,
+            names,
+            &format!("{path}.Parameters[{index}]"),
+        )?);
+    }
+    Ok(PropertyTypeName { name, parameters })
+}
+
+fn read_property_extensions(
+    reader: &mut Reader<'_>,
+    versions: &VersionContext,
+    path: &str,
+) -> Result<PropertyTagExtensions, PropertyError> {
+    if !versions.is_at_least_ue5(UE5_PROPERTY_TAG_EXTENSION_AND_OVERRIDABLE_SERIALIZATION) {
+        return Err(PropertyError::new(
+            PropertyErrorKind::MalformedData,
+            Some(reader.tell()),
+            path,
+            "property tag has extension flag before extension serialization is supported",
+        ));
+    }
+    let extension_offset = reader.tell();
+    let raw_flags = reader.read_u8(path)?;
+    if raw_flags & PROPERTY_EXTENSION_RESERVE_FOR_FUTURE_USE != 0 {
+        return Err(PropertyError::new(
+            PropertyErrorKind::UnsupportedCapability,
+            Some(extension_offset),
+            path,
+            "future property-tag extension groups are not supported",
+        ));
+    }
+    let (override_operation, experimental_overridable_logic) =
+        if raw_flags & PROPERTY_EXTENSION_OVERRIDABLE_INFORMATION != 0 {
+            (
+                Some(reader.read_u8(&format!("{path}.OverriddenPropertyOperation"))?),
+                Some(read_archive_bool(
+                    reader,
+                    &format!("{path}.ExperimentalOverridableLogic"),
+                )?),
+            )
+        } else {
+            (None, None)
+        };
+    Ok(PropertyTagExtensions {
+        raw_flags,
+        override_operation,
+        experimental_overridable_logic,
+    })
+}
+
+fn read_archive_bool(reader: &mut Reader<'_>, path: &str) -> Result<bool, PropertyError> {
+    let offset = reader.tell();
+    match reader.read_u32(path)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(PropertyError::new(
+            PropertyErrorKind::MalformedData,
+            Some(offset),
+            path,
+            format!("serialized bool must be 0 or 1, got {value}"),
+        )),
+    }
+}
+
+fn validate_name_ref(names: &[String], name: NameRef, path: &str) -> Result<(), PropertyError> {
+    if usize::try_from(name.index().get())
+        .ok()
+        .is_some_and(|index| index < names.len())
+    {
+        Ok(())
+    } else {
+        Err(PropertyError::new(
+            PropertyErrorKind::MalformedData,
+            None,
+            path,
+            format!("name index {} is outside name map", name.index().get()),
+        ))
+    }
+}
+
+fn resolve_name_ref(names: &[String], name: NameRef) -> Result<String, PropertyError> {
+    validate_name_ref(names, name, "NameRef")?;
+    let base = &names[usize::try_from(name.index().get()).expect("u32 fits in usize")];
+    if name.number() == 0 {
+        Ok(base.clone())
+    } else {
+        Ok(format!("{}_{}", base, name.number() - 1))
+    }
+}
