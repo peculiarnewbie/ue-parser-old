@@ -73,6 +73,20 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
 
+## Unreal Engine source
+
+Serialization contracts (package summary layout, version gates, property tags,
+primitive wire formats) can be verified against the local UE 5.7 tree:
+
+```text
+C:\Users\Ryzen\Perforce\Arif_UE-ManaBreak
+```
+
+Start with `Engine/Source/Runtime/CoreUObject/Public/UObject/PackageFileSummary.h`,
+`Engine/Source/Runtime/Core/Public/UObject/ObjectVersion.h`, and
+`Engine/Source/Runtime/CoreUObject/Private/UObject/PropertyTag.cpp`. A fuller
+file-to-module map lives in `memory/ue-source-reference.md`.
+
 ## Shared Unreal fixture project
 
 The parser reuses Electroswag's UE 5.7 fixture project rather than maintaining
@@ -81,6 +95,14 @@ a second Unreal project. The parser-owned mirror of fixture contract v7 is:
 ```text
 tests/fixtures/electroswag-v7.json
 ```
+
+Its upstream source of truth is Electroswag's
+`e2e/fixtures/unreal/contract.ts`; keep the two in sync when the contract
+changes. The mirror's `datatables` section pins each DataTable's object path,
+ordered row names, expected columns, and typed cell values, which the fixture
+tests assert against decoded output (e.g. `DT_Scalars2` row `Row_Beta` decodes
+to `IntValue = 222`, `StringValue = "FromScalars2"`, the composite override
+that `contract.ts` pins).
 
 Fixture tests validate both the Rust parser and the spawned CLI against every
 contract asset. Resolution order:

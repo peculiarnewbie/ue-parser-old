@@ -1,22 +1,49 @@
 ---
 name: softobject-property-misdecode
-description: codec.rs decodes Soft/Weak/LazyObjectProperty as a 4-byte FPackageIndex, which is wrong
+description: SoftObjectProperty decoding — inline FString vs package soft-object-path index table
 metadata:
   type: project
 ---
 
-In `src/codec.rs`, `decode_property_record` groups `SoftObjectProperty`,
-`WeakObjectProperty`, and `LazyObjectProperty` with `ObjectProperty`/`ClassProperty`
-and decodes all of them as a 4-byte `FPackageIndex` (`read_i32` → `PackageIndex`).
+## Wire format
 
-**Why:** Only hard `ObjectProperty`/`ClassProperty` serialize as `FPackageIndex` in
-uncooked editor packages. A `SoftObjectProperty` is an `FSoftObjectPath` (asset path
-name + subpath string); weak/lazy refs have their own formats. Discovered via the
-`DT_AssetRefs` fixture, whose `Texture (SoftObjectProperty)` is empty (4 zero bytes),
-so reading it as an index gives a coincidentally-harmless `null`. A populated soft
-ref would misparse or be flagged raw.
+`SoftObjectProperty` / `TSoftObjectPtr` payloads are **not** always an inline `FString`.
 
-**How to apply:** Don't trust soft/weak/lazy ref output until `FSoftObjectPath` is
-implemented properly. The conservative interim fix is to drop soft/weak/lazy out of
-the FPackageIndex match arm so they fall through to `Raw` instead of emitting a
-misleading decoded value.
+When the package summary includes a **soft object path table** (UE5+), each
+property stores a **4-byte `i32` index** into that table. Table entries serialize
+via `FSoftObjectPath::SerializePathWithoutFixup` (asset path `FString` + subpath
+`FString`).
+
+When the table is absent or the payload is not exactly 4 bytes, decode as inline
+`FString` (+ optional subpath). Empty unset ref = 4 zero bytes (index 0 or empty
+inline string).
+
+## Parser status
+
+| Piece | Status |
+|-------|--------|
+| Inline `FString` (+ subpath) decode | Done — `decode_soft_object_path` in `src/codec.rs` |
+| Index resolve when table populated | Done — uses `Package::soft_object_paths` when payload is 4 bytes |
+| **`Summary.SoftObjectPaths` table parse** | Done — binary structured-archive streams are no-ops; table is consecutive `FSoftObjectPath` wire entries at `Summary.SoftObjectPathsOffset`. |
+| `WeakObjectProperty` / `LazyObjectProperty` | Verified — UE routes both through `UObject*` archive serialization on save, which `FLinkerSave` persists as `FPackageIndex`; parser decodes both as `ObjectRef`. |
+| Unit tests | `decodes_populated_soft_object_path_payload`, `decodes_indexed_soft_object_path_payload`, `decodes_soft_object_path_with_subpath`, `decodes_weak_object_payload_as_package_index`, `decodes_lazy_object_payload_as_package_index` |
+
+Until the table parser exists, indexed refs on real assets with populated paths
+will not resolve. Empty refs (4 zero bytes) still decode correctly via inline path.
+
+Some editor packages store a placeholder `SoftObjectPathsCount` whose bytes overlap
+the gatherable-text section; invalid table literals are sanitized to empty during
+parse so indexed unset refs still decode as empty.
+
+## Fixture gap: `DT_AssetRefs`
+
+`DT_AssetRefs.Texture` is `TSoftObjectPtr<UTexture2D>`. SWAG/native row set +
+save currently persist an **empty** soft-path table entry on disk. Contract v8
+pins `Texture` as empty. Target when save works:
+`/Engine/EngineResources/DefaultTexture.DefaultTexture`.
+
+See also [[swag-datatable-plugin-roadmap]] for plugin-side improvements.
+
+## Still open
+
+- Structured-archive parser for `Summary.SoftObjectPaths`
