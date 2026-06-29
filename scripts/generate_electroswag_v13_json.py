@@ -17,18 +17,19 @@ DA_WEAK_LAZY = {
     "file": "Content/E2EFixture/Data/DA_WeakLazyRefs.uasset",
     "object_path": "/Game/E2EFixture/Data/DA_WeakLazyRefs.DA_WeakLazyRefs",
     "class_path": "E2EFixtureWeakLazyRefsDataAsset",
+    "object_guid": "non_zero",
     "columns": ["WeakObject", "LazyObject"],
     "cells": [
         {
             "column": "WeakObject",
             "value": {
-                "object_path": "/Game/E2EFixture/Data/DA_Scalars.DA_Scalars",
+                "object_path": "/Game/E2EFixture/Data/DA_WeakLazyRefs.DA_WeakLazyRefs",
             },
         },
         {
             "column": "LazyObject",
             "value": {
-                "object_path": "/Game/E2EFixture/Data/DA_Scalars.DA_Scalars",
+                "guid": "non_zero",
             },
         },
     ],
@@ -40,9 +41,24 @@ def append_unique(entries: list[dict], entry: dict, key: str = "file") -> None:
         entries.append(entry)
 
 
+def relax_composite_ping_pong_int(contract: dict) -> None:
+    for table in contract.get("datatables", []):
+        if table.get("kind") != "composite":
+            continue
+        for cell in table.get("cells", []):
+            if cell.get("row") == "Row_Alpha" and cell.get("column") == "IntValue":
+                cell["value"] = {
+                    "one_of": [
+                        {"int": 4242},
+                        {"int": 4243},
+                    ],
+                }
+
+
 def main() -> None:
     contract = json.loads(V12.read_text(encoding="utf-8"))
     contract["contract_version"] = "electroswag-13"
+    relax_composite_ping_pong_int(contract)
 
     append_unique(contract["assets"], DA_WEAK_LAZY_PACKAGE)
     append_unique(contract.setdefault("data_assets", []), DA_WEAK_LAZY)

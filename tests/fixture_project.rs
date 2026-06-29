@@ -5,15 +5,15 @@ use std::process::Command;
 
 use serde::Deserialize;
 use serde_json::Value;
+use uasset_parser::PackageSummary;
 use uasset_parser::asset::{
-    AssetDecodeContext, AssetDecoder, DataAssetDecoder, DataTableDecoder, DataTableKind,
-    DataTableRow, DecodedAsset, DecodedDataAsset, DecodedDataTable, DecodedUObject,
-    COMPOSITE_DATATABLE_CLASS, DATATABLE_CLASS, decode_export,
+    AssetDecodeContext, AssetDecoder, COMPOSITE_DATATABLE_CLASS, DATATABLE_CLASS, DataAssetDecoder,
+    DataTableDecoder, DataTableKind, DataTableRow, DecodedAsset, DecodedDataAsset,
+    DecodedDataTable, DecodedUObject, decode_export,
 };
 use uasset_parser::package::{Package, PackageIndex};
 use uasset_parser::property::{PropertyStream, PropertyValue};
 use uasset_parser::schema::{ClassSchema, SchemaProvider, StructSchema};
-use uasset_parser::{PackageSummary};
 
 const CONTRACT_JSON: &str = include_str!("fixtures/electroswag-v13.json");
 
@@ -71,6 +71,8 @@ struct FixtureDataAsset {
     file: PathBuf,
     object_path: String,
     class_path: String,
+    #[serde(default)]
+    object_guid: Option<String>,
     columns: Vec<String>,
     #[serde(default)]
     cells: Vec<ExpectedDataAssetCell>,
@@ -105,6 +107,7 @@ enum ExpectedValue {
     Ints(Vec<i64>),
     Vector([f64; 3]),
     ObjectPath(String),
+    Guid(String),
     SoftObjectPath(String),
     RowHandle(ExpectedRowHandle),
     StructFields(BTreeMap<String, ExpectedValue>),
@@ -130,7 +133,9 @@ impl ExpectedValue {
         match (self, actual) {
             (Self::Int(expected), PropertyValue::Int(actual)) => expected == actual,
             (Self::Uint(expected), PropertyValue::UInt(actual)) => expected == actual,
-            (Self::Float(expected), PropertyValue::Float(actual)) => f64::from(*actual) == *expected,
+            (Self::Float(expected), PropertyValue::Float(actual)) => {
+                f64::from(*actual) == *expected
+            }
             (Self::Double(expected), PropertyValue::Double(actual)) => *actual == *expected,
             (Self::Bool(expected), PropertyValue::Bool(actual)) => expected == actual,
             (Self::String(expected), PropertyValue::String(actual)) => expected == actual,
@@ -169,18 +174,25 @@ impl ExpectedValue {
             (Self::ObjectPath(expected), PropertyValue::ObjectRef(actual)) => package
                 .resolve_index(*actual)
                 .is_some_and(|path| path.as_str() == expected),
+            (Self::Guid(expected), PropertyValue::Guid(actual)) => {
+                if expected == "non_zero" {
+                    !actual.is_zero()
+                } else {
+                    actual.to_string() == *expected
+                }
+            }
             (Self::SoftObjectPath(expected), PropertyValue::SoftObjectPath(actual)) => {
                 expected == actual
             }
             (Self::RowHandle(expected), PropertyValue::Struct(stream)) => {
                 row_handle_matches(package, stream, expected)
             }
-            (Self::StructFields(expected), PropertyValue::Struct(stream)) => expected
-                .iter()
-                .all(|(field, expected_value)| {
+            (Self::StructFields(expected), PropertyValue::Struct(stream)) => {
+                expected.iter().all(|(field, expected_value)| {
                     struct_field(package, stream, field)
                         .is_some_and(|actual| expected_value.matches(package, actual))
-                }),
+                })
+            }
             (Self::MapEntries(expected), PropertyValue::Map(actual)) => {
                 expected.len() == actual.len()
                     && expected.iter().all(|expected_entry| {
@@ -251,9 +263,10 @@ fn contains_raw_value(value: &PropertyValue) -> bool {
         PropertyValue::Map(entries) => entries
             .iter()
             .any(|entry| contains_raw_value(&entry.key) || contains_raw_value(&entry.value)),
-        PropertyValue::Struct(stream) => stream.records.iter().any(|record| {
-            contains_raw_value(&record.value)
-        }),
+        PropertyValue::Struct(stream) => stream
+            .records
+            .iter()
+            .any(|record| contains_raw_value(&record.value)),
         _ => false,
     }
 }
@@ -327,7 +340,11 @@ fn skip_missing_fixture_asset(root: &Path, file: &Path) -> bool {
 
 /// Reads, parses, and decodes a DataTable or CompositeDataTable export from a fixture
 /// file, then runs `check` against the package and decoded table.
-fn with_decoded_datatable(root: &Path, relative: &str, check: impl FnOnce(&Package, &DecodedDataTable)) {
+fn with_decoded_datatable(
+    root: &Path,
+    relative: &str,
+    check: impl FnOnce(&Package, &DecodedDataTable),
+) {
     let path = root.join(relative);
     let bytes = std::fs::read(&path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
@@ -338,10 +355,7 @@ fn with_decoded_datatable(root: &Path, relative: &str, check: impl FnOnce(&Packa
         .iter()
         .find(|export| {
             export.class_path.as_ref().is_some_and(|class| {
-                matches!(
-                    class.as_str(),
-                    DATATABLE_CLASS | COMPOSITE_DATATABLE_CLASS
-                )
+                matches!(class.as_str(), DATATABLE_CLASS | COMPOSITE_DATATABLE_CLASS)
             })
         })
         .unwrap_or_else(|| {
@@ -381,16 +395,12 @@ fn with_decoded_data_asset(
         .exports
         .iter()
         .find(|export| {
-            export.class_path.as_ref().is_some_and(|class| {
-                uasset_parser::asset::is_data_asset_class(class.as_str())
-            })
+            export
+                .class_path
+                .as_ref()
+                .is_some_and(|class| uasset_parser::asset::is_data_asset_class(class.as_str()))
         })
-        .unwrap_or_else(|| {
-            panic!(
-                "no DataAsset export in {}",
-                path.display()
-            )
-        });
+        .unwrap_or_else(|| panic!("no DataAsset export in {}", path.display()));
     let schemas = EmptySchemas;
     let context = AssetDecodeContext {
         source: &bytes,
@@ -426,7 +436,11 @@ fn cell(package: &Package, row: &DataTableRow, column: &str) -> PropertyValue {
         .clone()
 }
 
-fn data_asset_property(package: &Package, data_asset: &DecodedDataAsset, column: &str) -> PropertyValue {
+fn data_asset_property(
+    package: &Package,
+    data_asset: &DecodedDataAsset,
+    column: &str,
+) -> PropertyValue {
     data_asset
         .properties
         .records
@@ -448,7 +462,10 @@ fn uobject_property(package: &Package, object: &DecodedUObject, column: &str) ->
         .clone()
 }
 
-fn find_uobject_export<'a>(package: &'a Package, expected: &FixtureUObject) -> &'a uasset_parser::package::Export {
+fn find_uobject_export<'a>(
+    package: &'a Package,
+    expected: &FixtureUObject,
+) -> &'a uasset_parser::package::Export {
     package
         .exports
         .iter()
@@ -712,7 +729,7 @@ fn shared_fixture_datatables_decode_row_names() {
         {
             DecodedAsset::DataTable(datatable) => datatable,
             DecodedAsset::DataAsset(_) => panic!("expected DataTable in {}", path.display()),
-        DecodedAsset::UObject(_) => panic!("expected DataTable in {}", path.display()),
+            DecodedAsset::UObject(_) => panic!("expected DataTable in {}", path.display()),
         };
 
         let Some(row_struct_path) = datatable.row_struct.as_ref() else {
@@ -898,6 +915,20 @@ fn shared_fixture_data_assets_match_contract_mirror() {
                 data_asset.class_path,
                 asset.class_path
             );
+            if let Some(expected_guid) = &asset.object_guid {
+                match (expected_guid.as_str(), data_asset.object_guid) {
+                    ("non_zero", Some(guid)) => assert!(
+                        !guid.is_zero(),
+                        "{context} expected non-zero object GUID footer"
+                    ),
+                    (expected, Some(guid)) => assert_eq!(
+                        guid.to_string(),
+                        expected,
+                        "object GUID footer for {context}"
+                    ),
+                    (_, None) => panic!("{context} missing object GUID footer"),
+                }
+            }
 
             let columns: Vec<String> = data_asset
                 .properties

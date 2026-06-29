@@ -90,6 +90,7 @@ pub enum PropertyValue {
     Text(TextValue),
     Vector(VectorValue),
     ObjectRef(PackageIndex),
+    Guid(Guid),
     SoftObjectPath(String),
     Array(Vec<PropertyValue>),
     Set(Vec<PropertyValue>),

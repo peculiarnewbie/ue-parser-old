@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use serde::Serialize;
-use uasset_parser::asset::{AssetDecodeContext, AssetError, AssetErrorKind, DecodedAsset, decode_export};
+use uasset_parser::asset::{
+    AssetDecodeContext, AssetError, AssetErrorKind, DecodedAsset, decode_export,
+};
 use uasset_parser::asset::{DATA_ASSET_CLASS, PRIMARY_DATA_ASSET_CLASS};
 use uasset_parser::package::{PackageError, PackageErrorKind, PackageIndex, TableLocation};
 use uasset_parser::property::{PropertyRecord, PropertyValue, RawReason};
@@ -387,11 +389,13 @@ impl InspectOutput {
                 summary_size: summary.span.len(),
                 total_header_size: summary.total_header_size,
                 names: TableOutput::from(summary.names),
-                soft_object_paths: summary.soft_object_paths.map(|table| SoftObjectPathsOutput {
-                    count: table.count,
-                    offset: table.offset.get(),
-                    parsed_count: 0,
-                }),
+                soft_object_paths: summary
+                    .soft_object_paths
+                    .map(|table| SoftObjectPathsOutput {
+                        count: table.count,
+                        offset: table.offset.get(),
+                        parsed_count: 0,
+                    }),
                 imports: TableOutput::from(summary.imports),
                 exports: TableOutput::from(summary.exports),
             },
@@ -413,7 +417,9 @@ impl InspectOutput {
         for export in &package.exports {
             match decode_export(export, &context) {
                 Ok(Some(decoded)) => {
-                    output.assets.push(asset_output_from_decoded(package, decoded));
+                    output
+                        .assets
+                        .push(asset_output_from_decoded(package, decoded));
                 }
                 Ok(None) => {}
                 Err(error) if error.kind() == AssetErrorKind::UnsupportedCapability => {}
@@ -433,6 +439,7 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             },
             object_path: datatable.object_path.to_string(),
             class_path: None,
+            object_guid: None,
             row_struct: datatable.row_struct.map(|path| path.to_string()),
             parent_tables: datatable
                 .parent_tables
@@ -454,6 +461,7 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             kind: data_asset_kind(data_asset.class_path.as_str()),
             object_path: data_asset.object_path.to_string(),
             class_path: Some(data_asset.class_path.to_string()),
+            object_guid: data_asset.object_guid.map(|guid| guid.to_string()),
             row_struct: None,
             parent_tables: Vec::new(),
             properties: property_outputs(package, &data_asset.properties),
@@ -464,6 +472,7 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             kind: "UObject",
             object_path: object.object_path.to_string(),
             class_path: Some(object.class_path.to_string()),
+            object_guid: object.object_guid.map(|guid| guid.to_string()),
             row_struct: None,
             parent_tables: Vec::new(),
             properties: property_outputs(package, &object.properties),
@@ -473,7 +482,10 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
     }
 }
 
-fn property_outputs(package: &Package, stream: &uasset_parser::property::PropertyStream) -> Vec<PropertyOutput> {
+fn property_outputs(
+    package: &Package,
+    stream: &uasset_parser::property::PropertyStream,
+) -> Vec<PropertyOutput> {
     stream
         .records
         .iter()
@@ -529,6 +541,8 @@ struct AssetOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     class_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    object_guid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     row_struct: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     parent_tables: Vec<String>,
@@ -580,6 +594,9 @@ impl PropertyOutput {
             },
             PropertyValue::ObjectRef(index) => PropertyValueOutput::ObjectRef {
                 value: resolve_object_ref(package, *index),
+            },
+            PropertyValue::Guid(guid) => PropertyValueOutput::Guid {
+                value: guid.to_string(),
             },
             PropertyValue::SoftObjectPath(path) => PropertyValueOutput::SoftObjectPath {
                 value: path.clone(),
@@ -645,6 +662,7 @@ enum PropertyValueOutput {
     Text { value: String },
     Vector { x: f32, y: f32, z: f32 },
     ObjectRef { value: Option<String> },
+    Guid { value: String },
     SoftObjectPath { value: String },
     Array { values: Vec<PropertyValueOutput> },
     Set { values: Vec<PropertyValueOutput> },
@@ -679,6 +697,9 @@ fn value_output(package: &Package, value: &PropertyValue) -> PropertyValueOutput
         },
         PropertyValue::ObjectRef(index) => PropertyValueOutput::ObjectRef {
             value: resolve_object_ref(package, *index),
+        },
+        PropertyValue::Guid(guid) => PropertyValueOutput::Guid {
+            value: guid.to_string(),
         },
         PropertyValue::SoftObjectPath(path) => PropertyValueOutput::SoftObjectPath {
             value: path.clone(),
@@ -732,6 +753,7 @@ impl PropertyValueOutput {
             Self::Text { value } => format!("{value:?}"),
             Self::Vector { x, y, z } => format!("({x}, {y}, {z})"),
             Self::ObjectRef { value } => value.clone().unwrap_or_else(|| "null".to_owned()),
+            Self::Guid { value } => value.clone(),
             Self::SoftObjectPath { value } => {
                 if value.is_empty() {
                     "<none>".to_owned()

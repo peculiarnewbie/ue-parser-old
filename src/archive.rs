@@ -139,6 +139,23 @@ pub struct Guid {
     pub d: u32,
 }
 
+impl Guid {
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.a == 0 && self.b == 0 && self.c == 0 && self.d == 0
+    }
+}
+
+impl fmt::Display for Guid {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{:08x}-{:08x}-{:08x}-{:08x}",
+            self.a, self.b, self.c, self.d
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct IoHash([u8; Self::BYTE_LEN]);
 

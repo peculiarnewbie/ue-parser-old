@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::archive::{ArchiveError, ArchiveErrorKind, NameRef};
+use crate::archive::{ArchiveError, ArchiveErrorKind, Guid, NameRef};
 use crate::codec::{DecodeContext, decode_property_stream_values};
 use crate::package::{Export, ObjectPath, Package, PackageError, PackageIndex};
 use crate::property::{
@@ -33,13 +33,11 @@ const SKIP_UOBJECT_DECODE_CLASSES: &[&str] = &[
 /// Matches engine base classes and native subclasses whose UClass name ends in
 /// `DataAsset` (for example `/Script/E2EFixtures.E2EFixtureScalarsDataAsset`).
 pub fn is_data_asset_class(class_path: &str) -> bool {
-    matches!(
-        class_path,
-        DATA_ASSET_CLASS | PRIMARY_DATA_ASSET_CLASS
-    ) || class_path
-        .rsplit('.')
-        .next()
-        .is_some_and(|class_name| class_name.ends_with("DataAsset"))
+    matches!(class_path, DATA_ASSET_CLASS | PRIMARY_DATA_ASSET_CLASS)
+        || class_path
+            .rsplit('.')
+            .next()
+            .is_some_and(|class_name| class_name.ends_with("DataAsset"))
 }
 
 /// Returns whether `class_path` should use the generic UObject property decoder.
@@ -66,6 +64,7 @@ pub enum DecodedAsset {
 pub struct DecodedDataAsset {
     pub object_path: ObjectPath,
     pub class_path: ObjectPath,
+    pub object_guid: Option<Guid>,
     pub properties: PropertyStream,
 }
 
@@ -73,6 +72,7 @@ pub struct DecodedDataAsset {
 pub struct DecodedUObject {
     pub object_path: ObjectPath,
     pub class_path: ObjectPath,
+    pub object_guid: Option<Guid>,
     pub properties: PropertyStream,
 }
 
@@ -337,11 +337,13 @@ impl AssetDecoder for DataAssetDecoder {
             ));
         }
 
-        let (properties, class_path) = decode_uobject_asset_properties(export, context)?;
+        let (properties, class_path, object_guid) =
+            decode_uobject_asset_properties(export, context)?;
 
         Ok(DecodedAsset::DataAsset(DecodedDataAsset {
             object_path: export.object_path.clone(),
             class_path,
+            object_guid,
             properties,
         }))
     }
@@ -373,11 +375,13 @@ impl AssetDecoder for UObjectDecoder {
             ));
         }
 
-        let (properties, class_path) = decode_uobject_asset_properties(export, context)?;
+        let (properties, class_path, object_guid) =
+            decode_uobject_asset_properties(export, context)?;
 
         Ok(DecodedAsset::UObject(DecodedUObject {
             object_path: export.object_path.clone(),
             class_path,
+            object_guid,
             properties,
         }))
     }
@@ -414,7 +418,7 @@ pub fn decode_export(
 fn decode_uobject_asset_properties(
     export: &Export,
     context: &AssetDecodeContext<'_>,
-) -> Result<(PropertyStream, ObjectPath), AssetError> {
+) -> Result<(PropertyStream, ObjectPath, Option<Guid>), AssetError> {
     let class_path = export.class_path.clone().ok_or_else(|| {
         AssetError::new(
             AssetErrorKind::UnsupportedFormat,
@@ -422,8 +426,8 @@ fn decode_uobject_asset_properties(
         )
     })?;
     let (properties, mut reader) = decode_uobject_properties(export, context)?;
-    consume_uobject_export_footer(&mut reader, &export.object_path)?;
-    Ok((properties, class_path))
+    let object_guid = consume_uobject_export_footer(&mut reader, &export.object_path)?;
+    Ok((properties, class_path, object_guid))
 }
 
 fn decode_uobject_properties<'a>(
@@ -451,7 +455,7 @@ fn decode_uobject_properties<'a>(
 fn consume_uobject_export_footer(
     reader: &mut crate::archive::Reader<'_>,
     object_path: &ObjectPath,
-) -> Result<(), AssetError> {
+) -> Result<Option<Guid>, AssetError> {
     if reader.remaining() == 4 {
         let offset = reader.tell();
         let footer = reader
@@ -460,11 +464,28 @@ fn consume_uobject_export_footer(
         if footer != 0 {
             return Err(AssetError::new(
                 AssetErrorKind::MalformedData,
+                format!("expected zero UObject export footer at byte {offset}, got {footer}"),
+            ));
+        }
+        return Ok(None);
+    }
+    if reader.remaining() == 20 {
+        let offset = reader.tell();
+        let has_guid = reader
+            .read_i32(&format!("{object_path}.ExportFooter.HasObjectGuid"))
+            .map_err(AssetError::from)?;
+        if has_guid != 1 {
+            return Err(AssetError::new(
+                AssetErrorKind::MalformedData,
                 format!(
-                    "expected zero UObject export footer at byte {offset}, got {footer}"
+                    "expected UObject export footer object-guid marker 1 at byte {offset}, got {has_guid}"
                 ),
             ));
         }
+        let guid = reader
+            .read_guid(&format!("{object_path}.ExportFooter.ObjectGuid"))
+            .map_err(AssetError::from)?;
+        return Ok(Some(guid));
     }
     if reader.remaining() != 0 {
         return Err(AssetError::new(
@@ -475,13 +496,15 @@ fn consume_uobject_export_footer(
             ),
         ));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn parent_tables_paths(package: &Package, properties: &PropertyStream) -> Vec<ObjectPath> {
-    let Some(record) = properties.records.iter().find(|record| {
-        package.resolve_name(record.name).as_deref() == Some("ParentTables")
-    }) else {
+    let Some(record) = properties
+        .records
+        .iter()
+        .find(|record| package.resolve_name(record.name).as_deref() == Some("ParentTables"))
+    else {
         return Vec::new();
     };
     let PropertyValue::Array(entries) = &record.value else {
@@ -558,7 +581,11 @@ mod tests {
         ]
     }
 
-    fn decode_datatable(export_bytes: Vec<u8>, package: Package, export: Export) -> DecodedDataTable {
+    fn decode_datatable(
+        export_bytes: Vec<u8>,
+        package: Package,
+        export: Export,
+    ) -> DecodedDataTable {
         let schemas = EmptySchemas;
         let context = AssetDecodeContext {
             source: &export_bytes,
@@ -591,10 +618,7 @@ mod tests {
         assert_eq!(datatable.kind, DataTableKind::Plain);
         assert!(datatable.parent_tables.is_empty());
         assert_eq!(datatable.rows.len(), 1);
-        assert_eq!(
-            datatable.object_path.as_str(),
-            "/Game/Test/DT_Test.DT_Test"
-        );
+        assert_eq!(datatable.object_path.as_str(), "/Game/Test/DT_Test.DT_Test");
         assert!(datatable.row_struct.is_none());
         let row = &datatable.rows[0];
         assert_eq!(row.name, name_ref(3, 0));
@@ -785,11 +809,7 @@ mod tests {
         assert!(!is_generic_uobject_class("/Script/CoreUObject.Package"));
     }
 
-    fn decode_uobject(
-        export_bytes: Vec<u8>,
-        package: Package,
-        export: Export,
-    ) -> DecodedUObject {
+    fn decode_uobject(export_bytes: Vec<u8>, package: Package, export: Export) -> DecodedUObject {
         let schemas = EmptySchemas;
         let context = AssetDecodeContext {
             source: &export_bytes,
@@ -810,11 +830,7 @@ mod tests {
         let mut properties = Vec::new();
         write_int_property_tag(&mut properties, 2, 1, 4243);
         let export_bytes = write_uobject_export(0, &properties);
-        let package = test_package(vec![
-            "None".into(),
-            "IntProperty".into(),
-            "IntValue".into(),
-        ]);
+        let package = test_package(vec!["None".into(), "IntProperty".into(), "IntValue".into()]);
         let export = test_export(
             export_bytes.len() as u64,
             "/Game/Test/BP_Test.Default__BP_Test_C",
@@ -882,11 +898,7 @@ mod tests {
         let mut properties = Vec::new();
         write_int_property_tag(&mut properties, 2, 1, 4243);
         let export_bytes = write_uobject_export(0, &properties);
-        let package = test_package(vec![
-            "None".into(),
-            "IntProperty".into(),
-            "IntValue".into(),
-        ]);
+        let package = test_package(vec!["None".into(), "IntProperty".into(), "IntValue".into()]);
         let export = test_export(
             export_bytes.len() as u64,
             "/Game/Test/DA_Test.DA_Test",
@@ -904,7 +916,10 @@ mod tests {
             "/Script/E2EFixtures.E2EFixtureScalarsDataAsset"
         );
         assert_eq!(data_asset.properties.records.len(), 1);
-        assert_eq!(data_asset.properties.records[0].value, PropertyValue::Int(4243));
+        assert_eq!(
+            data_asset.properties.records[0].value,
+            PropertyValue::Int(4243)
+        );
     }
 
     #[test]

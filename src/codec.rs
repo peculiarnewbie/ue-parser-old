@@ -167,12 +167,17 @@ fn decode_typed_value(
         "StrProperty" => Ok(Some(PropertyValue::String(
             payload.read_fstring(&format!("{path}.String"))?,
         ))),
-        "TextProperty" => decode_text_value(payload, path).map(|text| text.map(PropertyValue::Text)),
-        "ObjectProperty" | "ClassProperty" | "WeakObjectProperty" | "LazyObjectProperty" => {
+        "TextProperty" => {
+            decode_text_value(payload, path).map(|text| text.map(PropertyValue::Text))
+        }
+        "ObjectProperty" | "ClassProperty" | "WeakObjectProperty" => {
             Ok(Some(PropertyValue::ObjectRef(PackageIndex::from_raw(
                 payload.read_i32(&format!("{path}.ObjectRef"))?,
             ))))
         }
+        "LazyObjectProperty" => Ok(Some(PropertyValue::Guid(
+            payload.read_guid(&format!("{path}.Guid"))?,
+        ))),
         "SoftObjectProperty" => Ok(Some(PropertyValue::SoftObjectPath(
             decode_soft_object_path(payload, path, context)?,
         ))),
@@ -515,12 +520,8 @@ fn decode_struct_value(
     context: &DecodeContext<'_>,
     path: &str,
 ) -> Result<PropertyValue, PropertyError> {
-    let mut stream = read_tagged_property_stream(
-        payload,
-        context.versions,
-        &context.package.names,
-        path,
-    )?;
+    let mut stream =
+        read_tagged_property_stream(payload, context.versions, &context.package.names, path)?;
     decode_property_stream_values(source, &mut stream, context)?;
     Ok(PropertyValue::Struct(stream))
 }
@@ -593,15 +594,15 @@ fn read_archive_bool(reader: &mut Reader<'_>, path: &str) -> Result<bool, Proper
 mod tests {
     use super::*;
     use crate::archive::{Reader, Span};
+    use crate::package::test_package;
     use crate::property::{
-        PropertyRecord, PropertyStream, PropertyTagFlags, PropertyTypeName, PropertyValue, RawReason,
-        TextValue, VectorValue, read_tagged_property_stream,
+        PropertyRecord, PropertyStream, PropertyTagFlags, PropertyTypeName, PropertyValue,
+        RawReason, TextValue, VectorValue, read_tagged_property_stream,
     };
     use crate::schema::{ClassSchema, SchemaProvider, StructSchema};
-    use crate::package::test_package;
     use crate::test_support::{
-        TypeParam, push_f32, push_f64, push_fstring, push_i32, ue5_versions,
-        write_property_tag, write_property_terminator,
+        TypeParam, push_f32, push_f64, push_fstring, push_i32, ue5_versions, write_property_tag,
+        write_property_terminator,
     };
 
     struct EmptySchemas;
@@ -678,11 +679,7 @@ mod tests {
 
     #[test]
     fn decodes_enum_payload_as_name_literal() {
-        let names = vec![
-            "None".into(),
-            "EnumProperty".into(),
-            "MyEnum::Alpha".into(),
-        ];
+        let names = vec!["None".into(), "EnumProperty".into(), "MyEnum::Alpha".into()];
         let mut payload = Vec::new();
         push_i32(&mut payload, 2);
         push_i32(&mut payload, 0);
@@ -702,22 +699,27 @@ mod tests {
 
         let value = decode_record(names, 0, Vec::new(), PropertyTagFlags(0), &payload);
 
-        assert_eq!(
-            value,
-            PropertyValue::ObjectRef(PackageIndex::from_raw(-2))
-        );
+        assert_eq!(value, PropertyValue::ObjectRef(PackageIndex::from_raw(-2)));
     }
 
     #[test]
-    fn decodes_lazy_object_payload_as_package_index() {
+    fn decodes_lazy_object_payload_as_guid() {
         let names = vec!["LazyObjectProperty".into()];
-        let payload = (-3_i32).to_le_bytes();
+        let mut payload = Vec::new();
+        for value in [1_u32, 2, 3, 4] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
 
         let value = decode_record(names, 0, Vec::new(), PropertyTagFlags(0), &payload);
 
         assert_eq!(
             value,
-            PropertyValue::ObjectRef(PackageIndex::from_raw(-3))
+            PropertyValue::Guid(crate::archive::Guid {
+                a: 1,
+                b: 2,
+                c: 3,
+                d: 4
+            })
         );
     }
 

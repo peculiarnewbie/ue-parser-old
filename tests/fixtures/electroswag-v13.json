@@ -159,7 +159,14 @@
           "row": "Row_Alpha",
           "column": "IntValue",
           "value": {
-            "int": 4243
+            "one_of": [
+              {
+                "int": 4242
+              },
+              {
+                "int": 4243
+              }
+            ]
           }
         },
         {
@@ -280,7 +287,14 @@
           "row": "Row_Alpha",
           "column": "IntValue",
           "value": {
-            "int": 4243
+            "one_of": [
+              {
+                "int": 4242
+              },
+              {
+                "int": 4243
+              }
+            ]
           }
         },
         {
@@ -1479,6 +1493,7 @@
       "file": "Content/E2EFixture/Data/DA_WeakLazyRefs.uasset",
       "object_path": "/Game/E2EFixture/Data/DA_WeakLazyRefs.DA_WeakLazyRefs",
       "class_path": "E2EFixtureWeakLazyRefsDataAsset",
+      "object_guid": "non_zero",
       "columns": [
         "WeakObject",
         "LazyObject"
@@ -1487,13 +1502,13 @@
         {
           "column": "WeakObject",
           "value": {
-            "object_path": "/Game/E2EFixture/Data/DA_Scalars.DA_Scalars"
+            "object_path": "/Game/E2EFixture/Data/DA_WeakLazyRefs.DA_WeakLazyRefs"
           }
         },
         {
           "column": "LazyObject",
           "value": {
-            "object_path": "/Game/E2EFixture/Data/DA_Scalars.DA_Scalars"
+            "guid": "non_zero"
           }
         }
       ]

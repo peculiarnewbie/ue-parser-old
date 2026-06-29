@@ -25,8 +25,9 @@ inline string).
 | Inline `FString` (+ subpath) decode | Done — `decode_soft_object_path` in `src/codec.rs` |
 | Index resolve when table populated | Done — uses `Package::soft_object_paths` when payload is 4 bytes |
 | **`Summary.SoftObjectPaths` table parse** | Done — binary structured-archive streams are no-ops; table is consecutive `FSoftObjectPath` wire entries at `Summary.SoftObjectPathsOffset`. |
-| `WeakObjectProperty` / `LazyObjectProperty` | Verified — UE routes both through `UObject*` archive serialization on save, which `FLinkerSave` persists as `FPackageIndex`; parser decodes both as `ObjectRef`. |
-| Unit tests | `decodes_populated_soft_object_path_payload`, `decodes_indexed_soft_object_path_payload`, `decodes_soft_object_path_with_subpath`, `decodes_weak_object_payload_as_package_index`, `decodes_lazy_object_payload_as_package_index` |
+| `WeakObjectProperty` / `ObjectProperty` weak refs | Verified — saved weak fixture resolves through object archive serialization as an `FPackageIndex`; parser decodes it as `ObjectRef`. |
+| `LazyObjectProperty` | Verified — persistent lazy refs serialize as a 16-byte `FGuid`; parser decodes them as `Guid`. Self-referencing lazy fixtures also produce a populated UObject export GUID footer. |
+| Unit tests | `decodes_populated_soft_object_path_payload`, `decodes_indexed_soft_object_path_payload`, `decodes_soft_object_path_with_subpath`, `decodes_weak_object_payload_as_package_index`, `decodes_lazy_object_payload_as_guid` |
 
 Until the table parser exists, indexed refs on real assets with populated paths
 will not resolve. Empty refs (4 zero bytes) still decode correctly via inline path.
