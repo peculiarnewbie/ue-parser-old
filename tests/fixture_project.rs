@@ -7,15 +7,16 @@ use serde::Deserialize;
 use serde_json::Value;
 use uasset_parser::PackageSummary;
 use uasset_parser::asset::{
-    AssetDecodeContext, AssetDecoder, COMPOSITE_DATATABLE_CLASS, DATATABLE_CLASS, DataAssetDecoder,
-    DataTableDecoder, DataTableKind, DataTableRow, DecodedAsset, DecodedDataAsset,
-    DecodedDataTable, DecodedUObject, decode_export,
+    AssetDecodeContext, AssetDecoder, COMPOSITE_DATATABLE_CLASS, CURVETABLE_CLASS,
+    CurveTableDecoder, DATATABLE_CLASS, DataAssetDecoder, DataTableDecoder, DataTableKind,
+    DataTableRow, DecodedAsset, DecodedCurveTable, DecodedDataAsset, DecodedDataTable,
+    DecodedUObject, decode_export,
 };
 use uasset_parser::package::{Package, PackageIndex};
 use uasset_parser::property::{PropertyStream, PropertyValue};
 use uasset_parser::schema::{ClassSchema, SchemaProvider, StructSchema};
 
-const CONTRACT_JSON: &str = include_str!("fixtures/electroswag-v13.json");
+const CONTRACT_JSON: &str = include_str!("fixtures/electroswag-v14.json");
 
 #[derive(Deserialize)]
 struct FixtureContract {
@@ -29,6 +30,8 @@ struct FixtureContract {
     data_assets: Vec<FixtureDataAsset>,
     #[serde(default)]
     uobjects: Vec<FixtureUObject>,
+    #[serde(default)]
+    curve_tables: Vec<FixtureCurveTable>,
 }
 
 /// Parser-owned mirror of one `contract.ts` DataTable: object path, ordered row
@@ -89,6 +92,25 @@ struct ExpectedCell {
     row: String,
     column: String,
     value: ExpectedValue,
+}
+
+#[derive(Deserialize)]
+struct FixtureCurveTable {
+    file: PathBuf,
+    object_path: String,
+    rows: Vec<ExpectedCurveRow>,
+}
+
+#[derive(Deserialize)]
+struct ExpectedCurveRow {
+    name: String,
+    keys: Vec<ExpectedCurveKey>,
+}
+
+#[derive(Deserialize)]
+struct ExpectedCurveKey {
+    time: f32,
+    value: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -376,6 +398,7 @@ fn with_decoded_datatable(
     {
         DecodedAsset::DataTable(datatable) => datatable,
         DecodedAsset::DataAsset(_) => panic!("expected DataTable in {}", path.display()),
+        DecodedAsset::CurveTable(_) => panic!("expected DataTable in {}", path.display()),
         DecodedAsset::UObject(_) => panic!("expected DataTable in {}", path.display()),
     };
     check(&package, &datatable);
@@ -413,9 +436,48 @@ fn with_decoded_data_asset(
     {
         DecodedAsset::DataAsset(data_asset) => data_asset,
         DecodedAsset::DataTable(_) => panic!("expected DataAsset in {}", path.display()),
+        DecodedAsset::CurveTable(_) => panic!("expected DataAsset in {}", path.display()),
         DecodedAsset::UObject(_) => panic!("expected DataAsset in {}", path.display()),
     };
     check(&package, &data_asset);
+}
+
+fn with_decoded_curve_table(
+    root: &Path,
+    relative: &str,
+    check: impl FnOnce(&Package, &DecodedCurveTable),
+) {
+    let path = root.join(relative);
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let package = Package::parse(&bytes)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()));
+    let export = package
+        .exports
+        .iter()
+        .find(|export| {
+            export
+                .class_path
+                .as_ref()
+                .is_some_and(|class| class.as_str() == CURVETABLE_CLASS)
+        })
+        .unwrap_or_else(|| panic!("no CurveTable export in {}", path.display()));
+    let schemas = EmptySchemas;
+    let context = AssetDecodeContext {
+        source: &bytes,
+        package: &package,
+        schemas: &schemas,
+    };
+    let curve_table = match CurveTableDecoder
+        .decode(export, &context)
+        .unwrap_or_else(|error| panic!("failed to decode {}: {error}", path.display()))
+    {
+        DecodedAsset::CurveTable(curve_table) => curve_table,
+        DecodedAsset::DataTable(_) => panic!("expected CurveTable in {}", path.display()),
+        DecodedAsset::DataAsset(_) => panic!("expected CurveTable in {}", path.display()),
+        DecodedAsset::UObject(_) => panic!("expected CurveTable in {}", path.display()),
+    };
+    check(&package, &curve_table);
 }
 
 fn row<'a>(package: &Package, datatable: &'a DecodedDataTable, name: &str) -> &'a DataTableRow {
@@ -513,6 +575,7 @@ fn with_decoded_uobject(
     {
         Some(DecodedAsset::UObject(object)) => object,
         Some(DecodedAsset::DataTable(_)) => panic!("expected UObject in {}", path.display()),
+        Some(DecodedAsset::CurveTable(_)) => panic!("expected UObject in {}", path.display()),
         Some(DecodedAsset::DataAsset(_)) => panic!("expected UObject in {}", path.display()),
         None => panic!("no decoder matched export in {}", path.display()),
     };
@@ -729,6 +792,7 @@ fn shared_fixture_datatables_decode_row_names() {
         {
             DecodedAsset::DataTable(datatable) => datatable,
             DecodedAsset::DataAsset(_) => panic!("expected DataTable in {}", path.display()),
+            DecodedAsset::CurveTable(_) => panic!("expected DataTable in {}", path.display()),
             DecodedAsset::UObject(_) => panic!("expected DataTable in {}", path.display()),
         };
 
@@ -981,6 +1045,71 @@ fn shared_fixture_data_assets_decode_without_raw_properties() {
                     "{context} column {column} decoded as raw: {:?}",
                     record.value
                 );
+            }
+        });
+    }
+}
+
+#[test]
+fn shared_fixture_curve_tables_match_contract_mirror() {
+    let contract = contract();
+    let Some(root) = fixture_root(&contract) else {
+        return;
+    };
+    assert!(
+        !contract.curve_tables.is_empty(),
+        "contract mirror must define CurveTable fixtures"
+    );
+
+    for table in &contract.curve_tables {
+        if skip_missing_fixture_asset(&root, &table.file) {
+            continue;
+        }
+        let relative = table.file.to_string_lossy().replace('\\', "/");
+        with_decoded_curve_table(&root, &relative, |package, curve_table| {
+            let context = &table.object_path;
+            assert_eq!(
+                curve_table.object_path.as_str(),
+                table.object_path,
+                "object path for {context}"
+            );
+            assert_eq!(
+                curve_table.rows.len(),
+                table.rows.len(),
+                "{context} row count"
+            );
+
+            for expected_row in &table.rows {
+                let actual_row = curve_table
+                    .rows
+                    .iter()
+                    .find(|row| {
+                        package.resolve_name(row.name).as_deref() == Some(&expected_row.name)
+                    })
+                    .unwrap_or_else(|| panic!("{context} missing curve row {}", expected_row.name));
+                assert_eq!(
+                    actual_row.keys.len(),
+                    expected_row.keys.len(),
+                    "{context} {} key count",
+                    expected_row.name
+                );
+                for (index, (actual, expected)) in actual_row
+                    .keys
+                    .iter()
+                    .zip(expected_row.keys.iter())
+                    .enumerate()
+                {
+                    assert_eq!(
+                        actual.time, expected.time,
+                        "{context} {} key {index} time",
+                        expected_row.name
+                    );
+                    assert_eq!(
+                        actual.value, expected.value,
+                        "{context} {} key {index} value",
+                        expected_row.name
+                    );
+                }
             }
         });
     }

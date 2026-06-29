@@ -4,7 +4,7 @@
 use std::env;
 
 use uasset_parser::Package;
-use uasset_parser::asset::{AssetDecodeContext, decode_export, DecodedAsset};
+use uasset_parser::asset::{AssetDecodeContext, DecodedAsset, decode_export};
 use uasset_parser::package::ObjectPath;
 use uasset_parser::property::PropertyValue;
 use uasset_parser::schema::{ClassSchema, SchemaProvider, StructSchema};
@@ -66,6 +66,7 @@ fn main() {
                     );
                 }
             }
+            DecodedAsset::CurveTable(_) => {}
             DecodedAsset::DataAsset(data_asset) => {
                 dump_properties(
                     &package,

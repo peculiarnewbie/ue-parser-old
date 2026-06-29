@@ -1,0 +1,1609 @@
+{
+  "contract_version": "electroswag-14",
+  "default_fixture_dir": "D:\\Perforce\\Arif_Fixtures",
+  "expected_versions": {
+    "legacy_file": -9,
+    "ue4": 522,
+    "ue5": 1018,
+    "licensee": 0
+  },
+  "assets": [
+    {
+      "file": "Content/E2EFixture/Data/CDT_E2EFixture.uasset",
+      "package_name": "/Game/E2EFixture/Data/CDT_E2EFixture"
+    },
+    {
+      "file": "Content/E2EFixture/Data/CDT_Empty.uasset",
+      "package_name": "/Game/E2EFixture/Data/CDT_Empty"
+    },
+    {
+      "file": "Content/E2EFixture/Data/CDT_Nested.uasset",
+      "package_name": "/Game/E2EFixture/Data/CDT_Nested"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_AssetRefs.uasset",
+      "package_name": "/Game/E2EFixture/Data/DT_AssetRefs"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_Empty.uasset",
+      "package_name": "/Game/E2EFixture/Data/DT_Empty"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_Enums.uasset",
+      "package_name": "/Game/E2EFixture/Data/DT_Enums"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_LeftRefs.uasset",
+      "package_name": "/Game/E2EFixture/Data/DT_LeftRefs"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_Localized.uasset",
+      "package_name": "/Game/E2EFixture/Data/DT_Localized"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_RightRefs.uasset",
+      "package_name": "/Game/E2EFixture/Data/DT_RightRefs"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_Scalars.uasset",
+      "package_name": "/Game/E2EFixture/Data/DT_Scalars"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_Scalars2.uasset",
+      "package_name": "/Game/E2EFixture/Data/DT_Scalars2"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_Structs.uasset",
+      "package_name": "/Game/E2EFixture/Data/DT_Structs"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_WideScalars.uasset",
+      "package_name": "/Game/E2EFixture/Data/DT_WideScalars"
+    },
+    {
+      "file": "Content/E2EFixture/Data/ItemBuilder/DT_ManaArmorItemData.uasset",
+      "package_name": "/Game/E2EFixture/Data/ItemBuilder/DT_ManaArmorItemData"
+    },
+    {
+      "file": "Content/E2EFixture/Data/ItemBuilder/DT_ManaItemData.uasset",
+      "package_name": "/Game/E2EFixture/Data/ItemBuilder/DT_ManaItemData"
+    },
+    {
+      "file": "Content/E2EFixture/Data/ItemBuilder/DT_ManaItemGiftableData.uasset",
+      "package_name": "/Game/E2EFixture/Data/ItemBuilder/DT_ManaItemGiftableData"
+    },
+    {
+      "file": "Content/E2EFixture/Data/ItemBuilder/DT_ManaItemPriceData.uasset",
+      "package_name": "/Game/E2EFixture/Data/ItemBuilder/DT_ManaItemPriceData"
+    },
+    {
+      "file": "Content/E2EFixture/Data/ItemBuilder/DT_ManaItemSellableShopData.uasset",
+      "package_name": "/Game/E2EFixture/Data/ItemBuilder/DT_ManaItemSellableShopData"
+    },
+    {
+      "file": "Content/E2EFixture/Data/ItemBuilder/DT_ManaItemUIData.uasset",
+      "package_name": "/Game/E2EFixture/Data/ItemBuilder/DT_ManaItemUIData"
+    },
+    {
+      "file": "Content/E2EFixture/Data/ItemBuilder/DT_ManaLifesimToolItemData.uasset",
+      "package_name": "/Game/E2EFixture/Data/ItemBuilder/DT_ManaLifesimToolItemData"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_Empty.uasset",
+      "package_name": "/Game/E2EFixture/Data/DA_Empty"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_Scalars.uasset",
+      "package_name": "/Game/E2EFixture/Data/DA_Scalars"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_Structs.uasset",
+      "package_name": "/Game/E2EFixture/Data/DA_Structs"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_Enums.uasset",
+      "package_name": "/Game/E2EFixture/Data/DA_Enums"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_WideScalars.uasset",
+      "package_name": "/Game/E2EFixture/Data/DA_WideScalars"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_MapSet.uasset",
+      "package_name": "/Game/E2EFixture/Data/DA_MapSet"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_MapSet.uasset",
+      "package_name": "/Game/E2EFixture/Data/DT_MapSet"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_Collections.uasset",
+      "package_name": "/Game/E2EFixture/Data/DA_Collections"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_Localized.uasset",
+      "package_name": "/Game/E2EFixture/Data/DA_Localized"
+    },
+    {
+      "file": "Content/E2EFixture/Data/UO_Plain.uasset",
+      "package_name": "/Game/E2EFixture/Data/UO_Plain"
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_WeakLazyRefs.uasset",
+      "package_name": "/Game/E2EFixture/Data/DA_WeakLazyRefs"
+    },
+    {
+      "file": "Content/E2EFixture/Data/CT_Simple.uasset",
+      "package_name": "/Game/E2EFixture/Data/CT_Simple"
+    }
+  ],
+  "datatables": [
+    {
+      "file": "Content/E2EFixture/Data/CDT_E2EFixture.uasset",
+      "object_path": "/Game/E2EFixture/Data/CDT_E2EFixture.CDT_E2EFixture",
+      "row_struct": "E2EFixtureScalarsRow",
+      "kind": "composite",
+      "parent_tables": [
+        "/Game/E2EFixture/Data/DT_Scalars.DT_Scalars",
+        "/Game/E2EFixture/Data/DT_Scalars2.DT_Scalars2"
+      ],
+      "rows": [
+        "Row_Alpha",
+        "Row_Beta",
+        "Row_Gamma"
+      ],
+      "columns": [
+        "IntValue",
+        "FloatValue",
+        "BoolValue",
+        "StringValue"
+      ],
+      "cells": [
+        {
+          "row": "Row_Alpha",
+          "column": "IntValue",
+          "value": {
+            "one_of": [
+              {
+                "int": 4242
+              },
+              {
+                "int": 4243
+              }
+            ]
+          }
+        },
+        {
+          "row": "Row_Alpha",
+          "column": "FloatValue",
+          "value": {
+            "float": 0.0
+          }
+        },
+        {
+          "row": "Row_Alpha",
+          "column": "BoolValue",
+          "value": {
+            "bool": false
+          }
+        },
+        {
+          "row": "Row_Alpha",
+          "column": "StringValue",
+          "value": {
+            "string": ""
+          }
+        },
+        {
+          "row": "Row_Beta",
+          "column": "IntValue",
+          "value": {
+            "int": 222
+          }
+        },
+        {
+          "row": "Row_Beta",
+          "column": "FloatValue",
+          "value": {
+            "float": 2.5
+          }
+        },
+        {
+          "row": "Row_Beta",
+          "column": "BoolValue",
+          "value": {
+            "bool": true
+          }
+        },
+        {
+          "row": "Row_Beta",
+          "column": "StringValue",
+          "value": {
+            "string": "FromScalars2"
+          }
+        },
+        {
+          "row": "Row_Gamma",
+          "column": "IntValue",
+          "value": {
+            "int": 333
+          }
+        },
+        {
+          "row": "Row_Gamma",
+          "column": "FloatValue",
+          "value": {
+            "float": 3.5
+          }
+        },
+        {
+          "row": "Row_Gamma",
+          "column": "BoolValue",
+          "value": {
+            "bool": false
+          }
+        },
+        {
+          "row": "Row_Gamma",
+          "column": "StringValue",
+          "value": {
+            "string": "GammaOnly"
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/CDT_Empty.uasset",
+      "object_path": "/Game/E2EFixture/Data/CDT_Empty.CDT_Empty",
+      "row_struct": "E2EFixtureScalarsRow",
+      "kind": "composite",
+      "parent_tables": [],
+      "rows": [],
+      "columns": [
+        "IntValue",
+        "FloatValue",
+        "BoolValue",
+        "StringValue"
+      ],
+      "cells": []
+    },
+    {
+      "file": "Content/E2EFixture/Data/CDT_Nested.uasset",
+      "object_path": "/Game/E2EFixture/Data/CDT_Nested.CDT_Nested",
+      "row_struct": "E2EFixtureScalarsRow",
+      "kind": "composite",
+      "parent_tables": [
+        "/Game/E2EFixture/Data/CDT_E2EFixture.CDT_E2EFixture"
+      ],
+      "rows": [
+        "Row_Alpha",
+        "Row_Beta",
+        "Row_Gamma"
+      ],
+      "columns": [
+        "IntValue",
+        "FloatValue",
+        "BoolValue",
+        "StringValue"
+      ],
+      "cells": [
+        {
+          "row": "Row_Alpha",
+          "column": "IntValue",
+          "value": {
+            "one_of": [
+              {
+                "int": 4242
+              },
+              {
+                "int": 4243
+              }
+            ]
+          }
+        },
+        {
+          "row": "Row_Alpha",
+          "column": "FloatValue",
+          "value": {
+            "float": 0.0
+          }
+        },
+        {
+          "row": "Row_Alpha",
+          "column": "BoolValue",
+          "value": {
+            "bool": false
+          }
+        },
+        {
+          "row": "Row_Alpha",
+          "column": "StringValue",
+          "value": {
+            "string": ""
+          }
+        },
+        {
+          "row": "Row_Beta",
+          "column": "IntValue",
+          "value": {
+            "int": 222
+          }
+        },
+        {
+          "row": "Row_Beta",
+          "column": "FloatValue",
+          "value": {
+            "float": 2.5
+          }
+        },
+        {
+          "row": "Row_Beta",
+          "column": "BoolValue",
+          "value": {
+            "bool": true
+          }
+        },
+        {
+          "row": "Row_Beta",
+          "column": "StringValue",
+          "value": {
+            "string": "FromScalars2"
+          }
+        },
+        {
+          "row": "Row_Gamma",
+          "column": "IntValue",
+          "value": {
+            "int": 333
+          }
+        },
+        {
+          "row": "Row_Gamma",
+          "column": "FloatValue",
+          "value": {
+            "float": 3.5
+          }
+        },
+        {
+          "row": "Row_Gamma",
+          "column": "BoolValue",
+          "value": {
+            "bool": false
+          }
+        },
+        {
+          "row": "Row_Gamma",
+          "column": "StringValue",
+          "value": {
+            "string": "GammaOnly"
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_AssetRefs.uasset",
+      "object_path": "/Game/E2EFixture/Data/DT_AssetRefs.DT_AssetRefs",
+      "row_struct": "E2EFixtureAssetRefRow",
+      "rows": [
+        "AssetRef_One"
+      ],
+      "columns": [
+        "Texture"
+      ],
+      "cells": [
+        {
+          "row": "AssetRef_One",
+          "column": "Texture",
+          "value": {
+            "soft_object_path": ""
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_Empty.uasset",
+      "object_path": "/Game/E2EFixture/Data/DT_Empty.DT_Empty",
+      "row_struct": "E2EFixtureScalarsRow",
+      "rows": [],
+      "columns": [
+        "IntValue",
+        "FloatValue",
+        "BoolValue",
+        "StringValue"
+      ],
+      "cells": []
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_Enums.uasset",
+      "object_path": "/Game/E2EFixture/Data/DT_Enums.DT_Enums",
+      "row_struct": "E2EFixtureEnumsRow",
+      "rows": [
+        "Enum_RowA",
+        "Enum_RowB"
+      ],
+      "columns": [
+        "EnumValue"
+      ],
+      "cells": [
+        {
+          "row": "Enum_RowA",
+          "column": "EnumValue",
+          "value": {
+            "enum": "EE2EFixtureEnum::Alpha"
+          }
+        },
+        {
+          "row": "Enum_RowB",
+          "column": "EnumValue",
+          "value": {
+            "enum": "EE2EFixtureEnum::Alpha"
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_LeftRefs.uasset",
+      "object_path": "/Game/E2EFixture/Data/DT_LeftRefs.DT_LeftRefs",
+      "row_struct": "E2EFixtureLeftRefRow",
+      "rows": [
+        "Left_A",
+        "Left_B",
+        "Left_C"
+      ],
+      "columns": [
+        "Target"
+      ],
+      "cells": [
+        {
+          "row": "Left_A",
+          "column": "Target",
+          "value": {
+            "row_handle": {
+              "data_table": "/Game/E2EFixture/Data/DT_RightRefs.DT_RightRefs",
+              "row_name": "Right_X"
+            }
+          }
+        },
+        {
+          "row": "Left_B",
+          "column": "Target",
+          "value": {
+            "row_handle": {
+              "data_table": "/Game/E2EFixture/Data/DT_RightRefs.DT_RightRefs",
+              "row_name": "Right_Y"
+            }
+          }
+        },
+        {
+          "row": "Left_C",
+          "column": "Target",
+          "value": {
+            "row_handle": {
+              "data_table": "/Game/E2EFixture/Data/DT_RightRefs.DT_RightRefs",
+              "row_name": "Right_X"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_Localized.uasset",
+      "object_path": "/Game/E2EFixture/Data/DT_Localized.DT_Localized",
+      "row_struct": "E2EFixtureLocalizedRow",
+      "rows": [
+        "Loc_Row1",
+        "Loc_Row2"
+      ],
+      "columns": [
+        "LocalizedText"
+      ],
+      "cells": [
+        {
+          "row": "Loc_Row1",
+          "column": "LocalizedText",
+          "value": {
+            "text": "E2E localized source"
+          }
+        },
+        {
+          "row": "Loc_Row2",
+          "column": "LocalizedText",
+          "value": {
+            "text": ""
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_RightRefs.uasset",
+      "object_path": "/Game/E2EFixture/Data/DT_RightRefs.DT_RightRefs",
+      "row_struct": "E2EFixtureRightRefRow",
+      "rows": [
+        "Right_X",
+        "Right_Y"
+      ],
+      "columns": [
+        "Label"
+      ],
+      "cells": [
+        {
+          "row": "Right_X",
+          "column": "Label",
+          "value": {
+            "string": ""
+          }
+        },
+        {
+          "row": "Right_Y",
+          "column": "Label",
+          "value": {
+            "string": ""
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_Scalars.uasset",
+      "object_path": "/Game/E2EFixture/Data/DT_Scalars.DT_Scalars",
+      "row_struct": "E2EFixtureScalarsRow",
+      "rows": [
+        "Row_Alpha",
+        "Row_Beta"
+      ],
+      "columns": [
+        "IntValue",
+        "FloatValue",
+        "BoolValue",
+        "StringValue"
+      ],
+      "cells": [
+        {
+          "row": "Row_Alpha",
+          "column": "IntValue",
+          "value": {
+            "one_of": [
+              {
+                "int": 4242
+              },
+              {
+                "int": 4243
+              }
+            ]
+          }
+        },
+        {
+          "row": "Row_Alpha",
+          "column": "FloatValue",
+          "value": {
+            "float": 0.0
+          }
+        },
+        {
+          "row": "Row_Alpha",
+          "column": "BoolValue",
+          "value": {
+            "bool": false
+          }
+        },
+        {
+          "row": "Row_Alpha",
+          "column": "StringValue",
+          "value": {
+            "string": ""
+          }
+        },
+        {
+          "row": "Row_Beta",
+          "column": "IntValue",
+          "value": {
+            "int": 0
+          }
+        },
+        {
+          "row": "Row_Beta",
+          "column": "StringValue",
+          "value": {
+            "string": ""
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_Scalars2.uasset",
+      "object_path": "/Game/E2EFixture/Data/DT_Scalars2.DT_Scalars2",
+      "row_struct": "E2EFixtureScalarsRow",
+      "rows": [
+        "Row_Beta",
+        "Row_Gamma"
+      ],
+      "columns": [
+        "IntValue",
+        "FloatValue",
+        "BoolValue",
+        "StringValue"
+      ],
+      "cells": [
+        {
+          "row": "Row_Beta",
+          "column": "IntValue",
+          "value": {
+            "int": 222
+          }
+        },
+        {
+          "row": "Row_Beta",
+          "column": "FloatValue",
+          "value": {
+            "float": 2.5
+          }
+        },
+        {
+          "row": "Row_Beta",
+          "column": "BoolValue",
+          "value": {
+            "bool": true
+          }
+        },
+        {
+          "row": "Row_Beta",
+          "column": "StringValue",
+          "value": {
+            "string": "FromScalars2"
+          }
+        },
+        {
+          "row": "Row_Gamma",
+          "column": "IntValue",
+          "value": {
+            "int": 333
+          }
+        },
+        {
+          "row": "Row_Gamma",
+          "column": "FloatValue",
+          "value": {
+            "float": 3.5
+          }
+        },
+        {
+          "row": "Row_Gamma",
+          "column": "BoolValue",
+          "value": {
+            "bool": false
+          }
+        },
+        {
+          "row": "Row_Gamma",
+          "column": "StringValue",
+          "value": {
+            "string": "GammaOnly"
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_Structs.uasset",
+      "object_path": "/Game/E2EFixture/Data/DT_Structs.DT_Structs",
+      "row_struct": "E2EFixtureStructsRow",
+      "rows": [
+        "Struct_One",
+        "Struct_Two"
+      ],
+      "columns": [
+        "Nested",
+        "Label"
+      ],
+      "cells": [
+        {
+          "row": "Struct_One",
+          "column": "Nested",
+          "value": {
+            "struct_fields": {
+              "NestedInt": {
+                "int": 0
+              },
+              "NestedString": {
+                "string": ""
+              },
+              "NestedVector": {
+                "vector": [
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              }
+            }
+          }
+        },
+        {
+          "row": "Struct_One",
+          "column": "Label",
+          "value": {
+            "string": ""
+          }
+        },
+        {
+          "row": "Struct_Two",
+          "column": "Label",
+          "value": {
+            "string": ""
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_WideScalars.uasset",
+      "object_path": "/Game/E2EFixture/Data/DT_WideScalars.DT_WideScalars",
+      "row_struct": "E2EFixtureWideScalarsRow",
+      "rows": [
+        "Wide_Row1"
+      ],
+      "columns": [
+        "ByteValue",
+        "Int8Value",
+        "Int16Value",
+        "Int64Value",
+        "UInt32Value",
+        "DoubleValue",
+        "NameValue"
+      ],
+      "cells": [
+        {
+          "row": "Wide_Row1",
+          "column": "ByteValue",
+          "value": {
+            "uint": 255
+          }
+        },
+        {
+          "row": "Wide_Row1",
+          "column": "Int8Value",
+          "value": {
+            "int": -42
+          }
+        },
+        {
+          "row": "Wide_Row1",
+          "column": "Int16Value",
+          "value": {
+            "int": -1000
+          }
+        },
+        {
+          "row": "Wide_Row1",
+          "column": "Int64Value",
+          "value": {
+            "int": 9999999999
+          }
+        },
+        {
+          "row": "Wide_Row1",
+          "column": "UInt32Value",
+          "value": {
+            "uint": 4000000000
+          }
+        },
+        {
+          "row": "Wide_Row1",
+          "column": "DoubleValue",
+          "value": {
+            "double": 2.718281828
+          }
+        },
+        {
+          "row": "Wide_Row1",
+          "column": "NameValue",
+          "value": {
+            "name": "FixtureName"
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/ItemBuilder/DT_ManaArmorItemData.uasset",
+      "object_path": "/Game/E2EFixture/Data/ItemBuilder/DT_ManaArmorItemData.DT_ManaArmorItemData",
+      "row_struct": "E2EFixtureManaArmorItemData",
+      "rows": [
+        "1001",
+        "1002"
+      ],
+      "columns": [
+        "ArmorType"
+      ],
+      "cells": [
+        {
+          "row": "1001",
+          "column": "ArmorType",
+          "value": {
+            "enum": "EE2EFixtureManaArmorItemType::HeadArmor"
+          }
+        },
+        {
+          "row": "1002",
+          "column": "ArmorType",
+          "value": {
+            "enum": "EE2EFixtureManaArmorItemType::Undefined"
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/ItemBuilder/DT_ManaItemData.uasset",
+      "object_path": "/Game/E2EFixture/Data/ItemBuilder/DT_ManaItemData.DT_ManaItemData",
+      "row_struct": "E2EFixtureManaItemData",
+      "rows": [
+        "1001",
+        "1002"
+      ],
+      "columns": [
+        "ItemID",
+        "Type",
+        "Stackable",
+        "StackLimit",
+        "ItemNumber",
+        "Variant",
+        "Rarity"
+      ],
+      "cells": [
+        {
+          "row": "1001",
+          "column": "ItemID",
+          "value": {
+            "int": 1001
+          }
+        },
+        {
+          "row": "1001",
+          "column": "Type",
+          "value": {
+            "enum": "EE2EFixtureManaItemType::Armor"
+          }
+        },
+        {
+          "row": "1001",
+          "column": "Stackable",
+          "value": {
+            "bool": false
+          }
+        },
+        {
+          "row": "1001",
+          "column": "StackLimit",
+          "value": {
+            "int": 1
+          }
+        },
+        {
+          "row": "1001",
+          "column": "ItemNumber",
+          "value": {
+            "int": 1
+          }
+        },
+        {
+          "row": "1001",
+          "column": "Variant",
+          "value": {
+            "int": 0
+          }
+        },
+        {
+          "row": "1001",
+          "column": "Rarity",
+          "value": {
+            "int": 0
+          }
+        },
+        {
+          "row": "1002",
+          "column": "ItemID",
+          "value": {
+            "int": 1002
+          }
+        },
+        {
+          "row": "1002",
+          "column": "Type",
+          "value": {
+            "enum": "EE2EFixtureManaItemType::Food"
+          }
+        },
+        {
+          "row": "1002",
+          "column": "Stackable",
+          "value": {
+            "bool": true
+          }
+        },
+        {
+          "row": "1002",
+          "column": "StackLimit",
+          "value": {
+            "int": 99
+          }
+        },
+        {
+          "row": "1002",
+          "column": "ItemNumber",
+          "value": {
+            "int": 2
+          }
+        },
+        {
+          "row": "1002",
+          "column": "Variant",
+          "value": {
+            "int": 1
+          }
+        },
+        {
+          "row": "1002",
+          "column": "Rarity",
+          "value": {
+            "int": 1
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/ItemBuilder/DT_ManaItemGiftableData.uasset",
+      "object_path": "/Game/E2EFixture/Data/ItemBuilder/DT_ManaItemGiftableData.DT_ManaItemGiftableData",
+      "row_struct": "E2EFixtureManaItemGiftableData",
+      "rows": [
+        "1001",
+        "1002"
+      ],
+      "columns": [
+        "CanBeGifted"
+      ],
+      "cells": [
+        {
+          "row": "1001",
+          "column": "CanBeGifted",
+          "value": {
+            "bool": true
+          }
+        },
+        {
+          "row": "1002",
+          "column": "CanBeGifted",
+          "value": {
+            "bool": false
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/ItemBuilder/DT_ManaItemPriceData.uasset",
+      "object_path": "/Game/E2EFixture/Data/ItemBuilder/DT_ManaItemPriceData.DT_ManaItemPriceData",
+      "row_struct": "E2EFixtureManaItemPriceData",
+      "rows": [
+        "1001",
+        "1002"
+      ],
+      "columns": [
+        "PurchasePrice",
+        "IsSellable",
+        "SellPrice"
+      ],
+      "cells": [
+        {
+          "row": "1001",
+          "column": "PurchasePrice",
+          "value": {
+            "int": 10
+          }
+        },
+        {
+          "row": "1001",
+          "column": "IsSellable",
+          "value": {
+            "bool": true
+          }
+        },
+        {
+          "row": "1001",
+          "column": "SellPrice",
+          "value": {
+            "int": 5
+          }
+        },
+        {
+          "row": "1002",
+          "column": "PurchasePrice",
+          "value": {
+            "int": 0
+          }
+        },
+        {
+          "row": "1002",
+          "column": "IsSellable",
+          "value": {
+            "bool": false
+          }
+        },
+        {
+          "row": "1002",
+          "column": "SellPrice",
+          "value": {
+            "int": 0
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/ItemBuilder/DT_ManaItemSellableShopData.uasset",
+      "object_path": "/Game/E2EFixture/Data/ItemBuilder/DT_ManaItemSellableShopData.DT_ManaItemSellableShopData",
+      "row_struct": "E2EFixtureManaItemSellableShopData",
+      "rows": [
+        "1001",
+        "1002"
+      ],
+      "columns": [
+        "ShopId"
+      ],
+      "cells": [
+        {
+          "row": "1001",
+          "column": "ShopId",
+          "value": {
+            "names": [
+              "GeneralStore",
+              "Blacksmith"
+            ]
+          }
+        },
+        {
+          "row": "1002",
+          "column": "ShopId",
+          "value": {
+            "names": []
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/ItemBuilder/DT_ManaItemUIData.uasset",
+      "object_path": "/Game/E2EFixture/Data/ItemBuilder/DT_ManaItemUIData.DT_ManaItemUIData",
+      "row_struct": "E2EFixtureManaItemUIData",
+      "rows": [
+        "1001",
+        "1002"
+      ],
+      "columns": [
+        "Name",
+        "Description",
+        "Icon"
+      ],
+      "cells": [
+        {
+          "row": "1001",
+          "column": "Name",
+          "value": {
+            "text": "E2E Item Alpha"
+          }
+        },
+        {
+          "row": "1001",
+          "column": "Description",
+          "value": {
+            "text": "Fixture row one"
+          }
+        },
+        {
+          "row": "1001",
+          "column": "Icon",
+          "value": {
+            "soft_object_path": ""
+          }
+        },
+        {
+          "row": "1002",
+          "column": "Name",
+          "value": {
+            "text": "E2E Item Beta"
+          }
+        },
+        {
+          "row": "1002",
+          "column": "Description",
+          "value": {
+            "text": "Fixture row two"
+          }
+        },
+        {
+          "row": "1002",
+          "column": "Icon",
+          "value": {
+            "soft_object_path": ""
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/ItemBuilder/DT_ManaLifesimToolItemData.uasset",
+      "object_path": "/Game/E2EFixture/Data/ItemBuilder/DT_ManaLifesimToolItemData.DT_ManaLifesimToolItemData",
+      "row_struct": "E2EFixtureManaLifesimToolItemData",
+      "rows": [
+        "1001",
+        "1002"
+      ],
+      "columns": [
+        "LifesimToolType"
+      ],
+      "cells": [
+        {
+          "row": "1001",
+          "column": "LifesimToolType",
+          "value": {
+            "name": "None"
+          }
+        },
+        {
+          "row": "1002",
+          "column": "LifesimToolType",
+          "value": {
+            "name": "None"
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DT_MapSet.uasset",
+      "object_path": "/Game/E2EFixture/Data/DT_MapSet.DT_MapSet",
+      "row_struct": "E2EFixtureMapSetRow",
+      "rows": [
+        "MapSet_One",
+        "MapSet_Two"
+      ],
+      "columns": [
+        "IntToStringMap",
+        "NameSet",
+        "Label"
+      ],
+      "cells": [
+        {
+          "row": "MapSet_One",
+          "column": "IntToStringMap",
+          "value": {
+            "map_entries": [
+              {
+                "key": {
+                  "int": 1
+                },
+                "value": {
+                  "string": "one"
+                }
+              },
+              {
+                "key": {
+                  "int": 2
+                },
+                "value": {
+                  "string": "two"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "row": "MapSet_One",
+          "column": "NameSet",
+          "value": {
+            "set_values": [
+              {
+                "name": "Alpha"
+              },
+              {
+                "name": "Beta"
+              }
+            ]
+          }
+        },
+        {
+          "row": "MapSet_One",
+          "column": "Label",
+          "value": {
+            "string": "first row"
+          }
+        },
+        {
+          "row": "MapSet_Two",
+          "column": "IntToStringMap",
+          "value": {
+            "map_entries": [
+              {
+                "key": {
+                  "int": 3
+                },
+                "value": {
+                  "string": "three"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "row": "MapSet_Two",
+          "column": "NameSet",
+          "value": {
+            "set_values": [
+              {
+                "name": "Gamma"
+              }
+            ]
+          }
+        },
+        {
+          "row": "MapSet_Two",
+          "column": "Label",
+          "value": {
+            "string": "second row"
+          }
+        }
+      ]
+    }
+  ],
+  "data_assets": [
+    {
+      "file": "Content/E2EFixture/Data/DA_Empty.uasset",
+      "object_path": "/Game/E2EFixture/Data/DA_Empty.DA_Empty",
+      "class_path": "E2EFixtureEmptyDataAsset",
+      "columns": [],
+      "cells": []
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_Scalars.uasset",
+      "object_path": "/Game/E2EFixture/Data/DA_Scalars.DA_Scalars",
+      "class_path": "E2EFixtureScalarsDataAsset",
+      "columns": [
+        "IntValue",
+        "FloatValue",
+        "BoolValue",
+        "StringValue"
+      ],
+      "cells": [
+        {
+          "column": "IntValue",
+          "value": {
+            "int": 4243
+          }
+        },
+        {
+          "column": "FloatValue",
+          "value": {
+            "float": 1.5
+          }
+        },
+        {
+          "column": "BoolValue",
+          "value": {
+            "bool": true
+          }
+        },
+        {
+          "column": "StringValue",
+          "value": {
+            "string": "DA_Scalars"
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_Structs.uasset",
+      "object_path": "/Game/E2EFixture/Data/DA_Structs.DA_Structs",
+      "class_path": "E2EFixtureStructsDataAsset",
+      "columns": [
+        "Nested",
+        "Label"
+      ],
+      "cells": [
+        {
+          "column": "Nested",
+          "value": {
+            "struct_fields": {
+              "NestedInt": {
+                "int": 7
+              },
+              "NestedString": {
+                "string": "nested"
+              },
+              "NestedVector": {
+                "vector": [
+                  1.0,
+                  2.0,
+                  3.0
+                ]
+              }
+            }
+          }
+        },
+        {
+          "column": "Label",
+          "value": {
+            "string": "DA_Structs"
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_Enums.uasset",
+      "object_path": "/Game/E2EFixture/Data/DA_Enums.DA_Enums",
+      "class_path": "E2EFixtureEnumsDataAsset",
+      "columns": [
+        "EnumValue"
+      ],
+      "cells": [
+        {
+          "column": "EnumValue",
+          "value": {
+            "enum": "EE2EFixtureEnum::Beta"
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_WideScalars.uasset",
+      "object_path": "/Game/E2EFixture/Data/DA_WideScalars.DA_WideScalars",
+      "class_path": "E2EFixtureWideScalarsDataAsset",
+      "columns": [
+        "ByteValue",
+        "Int8Value",
+        "Int16Value",
+        "Int64Value",
+        "UInt32Value",
+        "DoubleValue",
+        "NameValue"
+      ],
+      "cells": [
+        {
+          "column": "ByteValue",
+          "value": {
+            "uint": 255
+          }
+        },
+        {
+          "column": "Int8Value",
+          "value": {
+            "int": -42
+          }
+        },
+        {
+          "column": "Int16Value",
+          "value": {
+            "int": -1000
+          }
+        },
+        {
+          "column": "Int64Value",
+          "value": {
+            "int": 9999999999
+          }
+        },
+        {
+          "column": "UInt32Value",
+          "value": {
+            "uint": 4000000000
+          }
+        },
+        {
+          "column": "DoubleValue",
+          "value": {
+            "double": 2.718281828
+          }
+        },
+        {
+          "column": "NameValue",
+          "value": {
+            "name": "FixtureName"
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_MapSet.uasset",
+      "object_path": "/Game/E2EFixture/Data/DA_MapSet.DA_MapSet",
+      "class_path": "E2EFixtureMapSetDataAsset",
+      "columns": [
+        "IntToStringMap",
+        "NameSet"
+      ],
+      "cells": [
+        {
+          "column": "IntToStringMap",
+          "value": {
+            "map_entries": [
+              {
+                "key": {
+                  "int": 1
+                },
+                "value": {
+                  "string": "one"
+                }
+              },
+              {
+                "key": {
+                  "int": 2
+                },
+                "value": {
+                  "string": "two"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "column": "NameSet",
+          "value": {
+            "set_values": [
+              {
+                "name": "Alpha"
+              },
+              {
+                "name": "Beta"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_Collections.uasset",
+      "object_path": "/Game/E2EFixture/Data/DA_Collections.DA_Collections",
+      "class_path": "E2EFixtureCollectionsDataAsset",
+      "columns": [
+        "IntList",
+        "NameList"
+      ],
+      "cells": [
+        {
+          "column": "IntList",
+          "value": {
+            "ints": [
+              10,
+              20,
+              30
+            ]
+          }
+        },
+        {
+          "column": "NameList",
+          "value": {
+            "names": [
+              "TagA",
+              "TagB"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_Localized.uasset",
+      "object_path": "/Game/E2EFixture/Data/DA_Localized.DA_Localized",
+      "class_path": "E2EFixtureLocalizedDataAsset",
+      "columns": [
+        "LocalizedText"
+      ],
+      "cells": [
+        {
+          "column": "LocalizedText",
+          "value": {
+            "text": "E2E DA localized source"
+          }
+        }
+      ]
+    },
+    {
+      "file": "Content/E2EFixture/Data/DA_WeakLazyRefs.uasset",
+      "object_path": "/Game/E2EFixture/Data/DA_WeakLazyRefs.DA_WeakLazyRefs",
+      "class_path": "E2EFixtureWeakLazyRefsDataAsset",
+      "object_guid": "non_zero",
+      "columns": [
+        "WeakObject",
+        "LazyObject"
+      ],
+      "cells": [
+        {
+          "column": "WeakObject",
+          "value": {
+            "object_path": "/Game/E2EFixture/Data/DA_WeakLazyRefs.DA_WeakLazyRefs"
+          }
+        },
+        {
+          "column": "LazyObject",
+          "value": {
+            "guid": "non_zero"
+          }
+        }
+      ]
+    }
+  ],
+  "uobjects": [
+    {
+      "file": "Content/E2EFixture/Data/UO_Plain.uasset",
+      "object_path": "/Game/E2EFixture/Data/UO_Plain.Default__UO_Plain_C",
+      "class_path": "UO_Plain_C",
+      "columns": [
+        "IntValue",
+        "Label",
+        "NestedStruct"
+      ],
+      "cells": [
+        {
+          "column": "IntValue",
+          "value": {
+            "int": 9001
+          }
+        },
+        {
+          "column": "Label",
+          "value": {
+            "string": "UO_Plain"
+          }
+        },
+        {
+          "column": "NestedStruct",
+          "value": {
+            "struct_fields": {
+              "NestedInt": {
+                "int": 7
+              },
+              "NestedString": {
+                "string": "nested"
+              },
+              "NestedVector": {
+                "vector": [
+                  1.0,
+                  2.0,
+                  3.0
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "curve_tables": [
+    {
+      "file": "Content/E2EFixture/Data/CT_Simple.uasset",
+      "object_path": "/Game/E2EFixture/Data/CT_Simple.CT_Simple",
+      "rows": [
+        {
+          "name": "Linear_A",
+          "keys": [
+            {
+              "time": 0.0,
+              "value": 0.0
+            },
+            {
+              "time": 1.0,
+              "value": 10.0
+            },
+            {
+              "time": 2.0,
+              "value": 20.0
+            }
+          ]
+        },
+        {
+          "name": "Linear_B",
+          "keys": [
+            {
+              "time": 0.0,
+              "value": 5.0
+            },
+            {
+              "time": 1.0,
+              "value": 15.0
+            },
+            {
+              "time": 2.0,
+              "value": 30.0
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

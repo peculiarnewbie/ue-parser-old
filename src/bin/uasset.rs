@@ -302,6 +302,12 @@ fn render_text_output(output: &InspectOutput) -> String {
                 .unwrap();
             }
         }
+        for row in &asset.curve_rows {
+            writeln!(rendered, "  curve {}:", row.name).unwrap();
+            for key in &row.keys {
+                writeln!(rendered, "    {} => {}", key.time, key.value).unwrap();
+            }
+        }
     }
     rendered
 }
@@ -448,6 +454,7 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
                 .collect(),
             properties: Vec::new(),
             row_count: datatable.rows.len(),
+            curve_rows: Vec::new(),
             rows: datatable
                 .rows
                 .iter()
@@ -456,6 +463,32 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
                     properties: property_outputs(package, &row.properties),
                 })
                 .collect(),
+        },
+        DecodedAsset::CurveTable(curve_table) => AssetOutput {
+            kind: "CurveTable",
+            object_path: curve_table.object_path.to_string(),
+            class_path: Some(uasset_parser::asset::CURVETABLE_CLASS.to_owned()),
+            object_guid: None,
+            row_struct: None,
+            parent_tables: Vec::new(),
+            properties: property_outputs(package, &curve_table.properties),
+            row_count: curve_table.rows.len(),
+            curve_rows: curve_table
+                .rows
+                .iter()
+                .map(|row| CurveRowOutput {
+                    name: resolve_name_or_placeholder(package, row.name),
+                    keys: row
+                        .keys
+                        .iter()
+                        .map(|key| CurveKeyOutput {
+                            time: key.time,
+                            value: key.value,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            rows: Vec::new(),
         },
         DecodedAsset::DataAsset(data_asset) => AssetOutput {
             kind: data_asset_kind(data_asset.class_path.as_str()),
@@ -466,6 +499,7 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             parent_tables: Vec::new(),
             properties: property_outputs(package, &data_asset.properties),
             row_count: 0,
+            curve_rows: Vec::new(),
             rows: Vec::new(),
         },
         DecodedAsset::UObject(object) => AssetOutput {
@@ -477,6 +511,7 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             parent_tables: Vec::new(),
             properties: property_outputs(package, &object.properties),
             row_count: 0,
+            curve_rows: Vec::new(),
             rows: Vec::new(),
         },
     }
@@ -549,6 +584,8 @@ struct AssetOutput {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     properties: Vec<PropertyOutput>,
     row_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    curve_rows: Vec<CurveRowOutput>,
     rows: Vec<RowOutput>,
 }
 
@@ -556,6 +593,18 @@ struct AssetOutput {
 struct RowOutput {
     name: String,
     properties: Vec<PropertyOutput>,
+}
+
+#[derive(Serialize)]
+struct CurveRowOutput {
+    name: String,
+    keys: Vec<CurveKeyOutput>,
+}
+
+#[derive(Serialize)]
+struct CurveKeyOutput {
+    time: f32,
+    value: f32,
 }
 
 #[derive(Serialize)]

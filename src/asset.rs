@@ -19,6 +19,7 @@ pub struct AssetDecodeContext<'a> {
 
 pub const DATATABLE_CLASS: &str = "/Script/Engine.DataTable";
 pub const COMPOSITE_DATATABLE_CLASS: &str = "/Script/Engine.CompositeDataTable";
+pub const CURVETABLE_CLASS: &str = "/Script/Engine.CurveTable";
 pub const DATA_ASSET_CLASS: &str = "/Script/Engine.DataAsset";
 pub const PRIMARY_DATA_ASSET_CLASS: &str = "/Script/Engine.PrimaryDataAsset";
 
@@ -26,6 +27,7 @@ pub const PRIMARY_DATA_ASSET_CLASS: &str = "/Script/Engine.PrimaryDataAsset";
 const SKIP_UOBJECT_DECODE_CLASSES: &[&str] = &[
     "/Script/CoreUObject.Package",
     "/Script/CoreUObject.MetaData",
+    "/Script/Engine.AssetImportData",
 ];
 
 /// Returns whether `class_path` names a UObject Data Asset type.
@@ -43,6 +45,7 @@ pub fn is_data_asset_class(class_path: &str) -> bool {
 /// Returns whether `class_path` should use the generic UObject property decoder.
 pub fn is_generic_uobject_class(class_path: &str) -> bool {
     !DataTableDecoder::supports_class(class_path)
+        && class_path != CURVETABLE_CLASS
         && !is_data_asset_class(class_path)
         && !SKIP_UOBJECT_DECODE_CLASSES.contains(&class_path)
 }
@@ -56,6 +59,7 @@ pub enum DataTableKind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum DecodedAsset {
     DataTable(DecodedDataTable),
+    CurveTable(DecodedCurveTable),
     DataAsset(DecodedDataAsset),
     UObject(DecodedUObject),
 }
@@ -90,6 +94,33 @@ pub struct DecodedDataTable {
 pub struct DataTableRow {
     pub name: NameRef,
     pub properties: PropertyStream,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedCurveTable {
+    pub object_path: ObjectPath,
+    pub mode: CurveTableMode,
+    pub properties: PropertyStream,
+    pub rows: Vec<CurveTableRow>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CurveTableMode {
+    Empty,
+    SimpleCurves,
+    RichCurves,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CurveTableRow {
+    pub name: NameRef,
+    pub keys: Vec<SimpleCurveKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SimpleCurveKey {
+    pub time: f32,
+    pub value: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -312,6 +343,107 @@ impl DataTableDecoder {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub struct CurveTableDecoder;
+
+impl AssetDecoder for CurveTableDecoder {
+    fn supports(&self, class_path: &ObjectPath) -> bool {
+        class_path.as_str() == CURVETABLE_CLASS
+    }
+
+    fn decode(
+        &self,
+        export: &Export,
+        context: &AssetDecodeContext<'_>,
+    ) -> Result<DecodedAsset, AssetError> {
+        let Some(class_path) = export.class_path.as_ref() else {
+            return Err(AssetError::new(
+                AssetErrorKind::UnsupportedFormat,
+                format!("export {} has no resolved class", export.object_path),
+            ));
+        };
+        if class_path.as_str() != CURVETABLE_CLASS {
+            return Err(AssetError::new(
+                AssetErrorKind::UnsupportedFormat,
+                format!("unsupported asset class {class_path}"),
+            ));
+        }
+
+        let (properties, mut reader) = decode_uobject_properties(export, context)?;
+        let footer_offset = reader.tell();
+        let footer = reader.read_i32(&format!("{}.ExportFooter", export.object_path))?;
+        if footer != 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::MalformedData,
+                format!(
+                    "expected zero CurveTable UObject footer at byte {footer_offset}, got {footer}"
+                ),
+            ));
+        }
+
+        let row_count_offset = reader.tell();
+        let row_count = reader.read_i32(&format!("{}.Rows.Count", export.object_path))?;
+        if row_count < 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::MalformedData,
+                format!("negative CurveTable row count {row_count} at byte {row_count_offset}"),
+            ));
+        }
+
+        let raw_mode = reader.read_u8(&format!("{}.Mode", export.object_path))?;
+        let mode = match raw_mode {
+            0 => CurveTableMode::Empty,
+            1 => CurveTableMode::SimpleCurves,
+            2 => CurveTableMode::RichCurves,
+            value => {
+                return Err(AssetError::new(
+                    AssetErrorKind::MalformedData,
+                    format!("unsupported CurveTable mode {value}"),
+                ));
+            }
+        };
+        if mode != CurveTableMode::SimpleCurves && row_count > 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::UnsupportedCapability,
+                format!("CurveTable mode {mode:?} is not supported yet"),
+            ));
+        }
+
+        let mut rows = Vec::with_capacity(usize::try_from(row_count).expect("i32 fits in usize"));
+        for index in 0..row_count {
+            let row_path = format!("{}.Rows[{index}]", export.object_path);
+            let name = reader.read_name_ref(&format!("{row_path}.Name"))?;
+            let stream = read_tagged_property_stream(
+                &mut reader,
+                &context.package.summary.versions,
+                &context.package.names,
+                &format!("{row_path}.Curve"),
+            )?;
+            let keys =
+                decode_simple_curve_keys(context.source, context.package, &stream, &row_path)?;
+            rows.push(CurveTableRow { name, keys });
+        }
+
+        if reader.remaining() != 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::MalformedData,
+                format!(
+                    "CurveTable export {} left {} trailing bytes",
+                    export.object_path,
+                    reader.remaining()
+                ),
+            ));
+        }
+
+        Ok(DecodedAsset::CurveTable(DecodedCurveTable {
+            object_path: export.object_path.clone(),
+            mode,
+            properties,
+            rows,
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct DataAssetDecoder;
 
 impl AssetDecoder for DataAssetDecoder {
@@ -406,6 +538,9 @@ pub fn decode_export(
     if DataTableDecoder.supports(class_path) {
         return DataTableDecoder.decode(export, context).map(Some);
     }
+    if CurveTableDecoder.supports(class_path) {
+        return CurveTableDecoder.decode(export, context).map(Some);
+    }
     if DataAssetDecoder.supports(class_path) {
         return DataAssetDecoder.decode(export, context).map(Some);
     }
@@ -497,6 +632,56 @@ fn consume_uobject_export_footer(
         ));
     }
     Ok(None)
+}
+
+fn decode_simple_curve_keys(
+    source: &[u8],
+    package: &Package,
+    stream: &PropertyStream,
+    path: &str,
+) -> Result<Vec<SimpleCurveKey>, AssetError> {
+    let Some(record) = stream
+        .records
+        .iter()
+        .find(|record| package.resolve_name(record.name).as_deref() == Some("Keys"))
+    else {
+        return Ok(Vec::new());
+    };
+    if package.resolve_name(record.type_name.name).as_deref() != Some("ArrayProperty") {
+        return Err(AssetError::new(
+            AssetErrorKind::MalformedData,
+            format!("{path}.Keys is not an ArrayProperty"),
+        ));
+    }
+
+    let reader = crate::archive::Reader::new(source);
+    let mut payload = reader
+        .bounded(record.payload, &format!("{path}.Keys.Payload"))
+        .map_err(AssetError::from)?;
+    let count = payload.read_i32(&format!("{path}.Keys.Count"))?;
+    if count < 0 {
+        return Err(AssetError::new(
+            AssetErrorKind::MalformedData,
+            format!("negative SimpleCurve key count {count}"),
+        ));
+    }
+    let mut keys = Vec::with_capacity(usize::try_from(count).expect("i32 fits in usize"));
+    for index in 0..count {
+        keys.push(SimpleCurveKey {
+            time: payload.read_f32(&format!("{path}.Keys[{index}].Time"))?,
+            value: payload.read_f32(&format!("{path}.Keys[{index}].Value"))?,
+        });
+    }
+    if payload.remaining() != 0 {
+        return Err(AssetError::new(
+            AssetErrorKind::MalformedData,
+            format!(
+                "{path}.Keys left {} trailing bytes after SimpleCurve key decode",
+                payload.remaining()
+            ),
+        ));
+    }
+    Ok(keys)
 }
 
 fn parent_tables_paths(package: &Package, properties: &PropertyStream) -> Vec<ObjectPath> {
