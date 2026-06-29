@@ -15,7 +15,7 @@ use uasset_parser::property::{PropertyStream, PropertyValue};
 use uasset_parser::schema::{ClassSchema, SchemaProvider, StructSchema};
 use uasset_parser::{PackageSummary};
 
-const CONTRACT_JSON: &str = include_str!("fixtures/electroswag-v12.json");
+const CONTRACT_JSON: &str = include_str!("fixtures/electroswag-v13.json");
 
 #[derive(Deserialize)]
 struct FixtureContract {
@@ -104,6 +104,7 @@ enum ExpectedValue {
     Names(Vec<String>),
     Ints(Vec<i64>),
     Vector([f64; 3]),
+    ObjectPath(String),
     SoftObjectPath(String),
     RowHandle(ExpectedRowHandle),
     StructFields(BTreeMap<String, ExpectedValue>),
@@ -165,6 +166,9 @@ impl ExpectedValue {
                     && f64::from(actual.y) == expected[1]
                     && f64::from(actual.z) == expected[2]
             }
+            (Self::ObjectPath(expected), PropertyValue::ObjectRef(actual)) => package
+                .resolve_index(*actual)
+                .is_some_and(|path| path.as_str() == expected),
             (Self::SoftObjectPath(expected), PropertyValue::SoftObjectPath(actual)) => {
                 expected == actual
             }

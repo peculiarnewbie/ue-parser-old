@@ -11,10 +11,11 @@ repo at `C:\Users\Ryzen\git\swag\electroswag\e2e\fixtures\unreal\contract.ts`
 (`DEFAULT_CONTRACT`). The C++ row structs are in
 `D:\Perforce\Arif_Fixtures\Source\E2EFixtures\E2EFixtureTypes.h`.
 
-The parser's own `tests/fixtures/electroswag-v11.json` is the mirror (gitignored;
+The parser's own `tests/fixtures/electroswag-v13.json` is the mirror;
 generate from contract.ts when the upstream contract changes, or extend via
 `scripts/generate_electroswag_v12_json.py` for parser-only pins (v10: `DA_MapSet`;
-v11: `DT_MapSet`, `DA_Collections`, `DA_Localized`; v12: `UO_Plain` plain UObject).
+v11: `DT_MapSet`, `DA_Collections`, `DA_Localized`; v12: `UO_Plain` plain UObject;
+v13: `DA_WeakLazyRefs` weak/lazy object refs).
 Its `datatables` section pins each DataTable's object path, ordered row names, columns, and typed cell
 values, asserted by `shared_fixture_datatables_match_contract_mirror`.
 
