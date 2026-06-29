@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use serde::Serialize;
-use uasset_parser::asset::{AssetDecodeContext, AssetDecoder, AssetError, AssetErrorKind};
-use uasset_parser::asset::{DataTableDecoder, DecodedAsset};
+use uasset_parser::asset::{AssetDecodeContext, AssetError, AssetErrorKind, DecodedAsset, decode_export};
+use uasset_parser::asset::{DATA_ASSET_CLASS, PRIMARY_DATA_ASSET_CLASS};
 use uasset_parser::package::{PackageError, PackageErrorKind, PackageIndex, TableLocation};
 use uasset_parser::property::{PropertyRecord, PropertyValue, RawReason};
 use uasset_parser::schema::{ClassSchema, SchemaProvider, StructSchema};
@@ -244,6 +244,14 @@ fn render_text_output(output: &InspectOutput) -> String {
         output.package.names.count, output.package.names.offset
     )
     .unwrap();
+    if let Some(table) = &output.package.soft_object_paths {
+        writeln!(
+            rendered,
+            "soft_object_paths: count={} offset={} parsed={}",
+            table.count, table.offset, table.parsed_count
+        )
+        .unwrap();
+    }
     writeln!(
         rendered,
         "imports: count={} offset={}",
@@ -265,6 +273,19 @@ fn render_text_output(output: &InspectOutput) -> String {
         .unwrap();
         if let Some(row_struct) = &asset.row_struct {
             writeln!(rendered, "row_struct: {row_struct}").unwrap();
+        }
+        if let Some(class_path) = &asset.class_path {
+            writeln!(rendered, "class: {class_path}").unwrap();
+        }
+        for property in &asset.properties {
+            writeln!(
+                rendered,
+                "  {} ({}) = {}",
+                property.name,
+                property.type_name,
+                property.value.render()
+            )
+            .unwrap();
         }
         for row in &asset.rows {
             writeln!(rendered, "  row {}:", row.name).unwrap();
@@ -366,6 +387,11 @@ impl InspectOutput {
                 summary_size: summary.span.len(),
                 total_header_size: summary.total_header_size,
                 names: TableOutput::from(summary.names),
+                soft_object_paths: summary.soft_object_paths.map(|table| SoftObjectPathsOutput {
+                    count: table.count,
+                    offset: table.offset.get(),
+                    parsed_count: 0,
+                }),
                 imports: TableOutput::from(summary.imports),
                 exports: TableOutput::from(summary.exports),
             },
@@ -375,42 +401,91 @@ impl InspectOutput {
 
     fn from_package(path: String, source: &[u8], package: &Package) -> Result<Self, AssetError> {
         let mut output = Self::from_summary(path, &package.summary);
+        if let Some(table) = &mut output.package.soft_object_paths {
+            table.parsed_count = package.soft_object_paths.len();
+        }
         let schemas = EmptySchemas;
         let context = AssetDecodeContext {
             source,
             package,
             schemas: &schemas,
         };
-        let datatable_decoder = DataTableDecoder;
         for export in &package.exports {
-            let Some(class_path) = export.class_path.as_ref() else {
-                continue;
-            };
-            if datatable_decoder.supports(class_path) {
-                let DecodedAsset::DataTable(datatable) =
-                    datatable_decoder.decode(export, &context)?;
-                output.assets.push(AssetOutput {
-                    kind: "DataTable",
-                    object_path: datatable.object_path.to_string(),
-                    row_struct: datatable.row_struct.map(|path| path.to_string()),
-                    row_count: datatable.rows.len(),
-                    rows: datatable
-                        .rows
-                        .iter()
-                        .map(|row| RowOutput {
-                            name: resolve_name_or_placeholder(package, row.name),
-                            properties: row
-                                .properties
-                                .records
-                                .iter()
-                                .map(|record| PropertyOutput::from_record(record, package))
-                                .collect(),
-                        })
-                        .collect(),
-                });
+            match decode_export(export, &context) {
+                Ok(Some(decoded)) => {
+                    output.assets.push(asset_output_from_decoded(package, decoded));
+                }
+                Ok(None) => {}
+                Err(error) if error.kind() == AssetErrorKind::UnsupportedCapability => {}
+                Err(error) => return Err(error),
             }
         }
         Ok(output)
+    }
+}
+
+fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetOutput {
+    match decoded {
+        DecodedAsset::DataTable(datatable) => AssetOutput {
+            kind: match datatable.kind {
+                uasset_parser::asset::DataTableKind::Plain => "DataTable",
+                uasset_parser::asset::DataTableKind::Composite => "CompositeDataTable",
+            },
+            object_path: datatable.object_path.to_string(),
+            class_path: None,
+            row_struct: datatable.row_struct.map(|path| path.to_string()),
+            parent_tables: datatable
+                .parent_tables
+                .iter()
+                .map(|path| path.to_string())
+                .collect(),
+            properties: Vec::new(),
+            row_count: datatable.rows.len(),
+            rows: datatable
+                .rows
+                .iter()
+                .map(|row| RowOutput {
+                    name: resolve_name_or_placeholder(package, row.name),
+                    properties: property_outputs(package, &row.properties),
+                })
+                .collect(),
+        },
+        DecodedAsset::DataAsset(data_asset) => AssetOutput {
+            kind: data_asset_kind(data_asset.class_path.as_str()),
+            object_path: data_asset.object_path.to_string(),
+            class_path: Some(data_asset.class_path.to_string()),
+            row_struct: None,
+            parent_tables: Vec::new(),
+            properties: property_outputs(package, &data_asset.properties),
+            row_count: 0,
+            rows: Vec::new(),
+        },
+        DecodedAsset::UObject(object) => AssetOutput {
+            kind: "UObject",
+            object_path: object.object_path.to_string(),
+            class_path: Some(object.class_path.to_string()),
+            row_struct: None,
+            parent_tables: Vec::new(),
+            properties: property_outputs(package, &object.properties),
+            row_count: 0,
+            rows: Vec::new(),
+        },
+    }
+}
+
+fn property_outputs(package: &Package, stream: &uasset_parser::property::PropertyStream) -> Vec<PropertyOutput> {
+    stream
+        .records
+        .iter()
+        .map(|record| PropertyOutput::from_record(record, package))
+        .collect()
+}
+
+fn data_asset_kind(class_path: &str) -> &'static str {
+    match class_path {
+        PRIMARY_DATA_ASSET_CLASS => "PrimaryDataAsset",
+        DATA_ASSET_CLASS => "DataAsset",
+        _ => "DataAsset",
     }
 }
 
@@ -434,15 +509,31 @@ struct PackageOutput {
     summary_size: u64,
     total_header_size: u32,
     names: TableOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    soft_object_paths: Option<SoftObjectPathsOutput>,
     imports: TableOutput,
     exports: TableOutput,
+}
+
+#[derive(Serialize)]
+struct SoftObjectPathsOutput {
+    count: u32,
+    offset: u64,
+    parsed_count: usize,
 }
 
 #[derive(Serialize)]
 struct AssetOutput {
     kind: &'static str,
     object_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     row_struct: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    parent_tables: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    properties: Vec<PropertyOutput>,
     row_count: usize,
     rows: Vec<RowOutput>,
 }
@@ -473,11 +564,53 @@ impl PropertyOutput {
             PropertyValue::Name(name) => PropertyValueOutput::Name {
                 value: resolve_name_or_placeholder(package, *name),
             },
+            PropertyValue::Enum(name) => PropertyValueOutput::Enum {
+                value: resolve_name_or_placeholder(package, *name),
+            },
             PropertyValue::String(value) => PropertyValueOutput::String {
                 value: value.clone(),
             },
+            PropertyValue::Text(text) => PropertyValueOutput::Text {
+                value: text.source.clone(),
+            },
+            PropertyValue::Vector(vector) => PropertyValueOutput::Vector {
+                x: vector.x,
+                y: vector.y,
+                z: vector.z,
+            },
             PropertyValue::ObjectRef(index) => PropertyValueOutput::ObjectRef {
                 value: resolve_object_ref(package, *index),
+            },
+            PropertyValue::SoftObjectPath(path) => PropertyValueOutput::SoftObjectPath {
+                value: path.clone(),
+            },
+            PropertyValue::Array(values) => PropertyValueOutput::Array {
+                values: values
+                    .iter()
+                    .map(|value| value_output(package, value))
+                    .collect(),
+            },
+            PropertyValue::Set(values) => PropertyValueOutput::Set {
+                values: values
+                    .iter()
+                    .map(|value| value_output(package, value))
+                    .collect(),
+            },
+            PropertyValue::Map(entries) => PropertyValueOutput::Map {
+                entries: entries
+                    .iter()
+                    .map(|entry| MapEntryOutput {
+                        key: value_output(package, &entry.key),
+                        value: value_output(package, &entry.value),
+                    })
+                    .collect(),
+            },
+            PropertyValue::Struct(stream) => PropertyValueOutput::Struct {
+                properties: stream
+                    .records
+                    .iter()
+                    .map(|record| PropertyOutput::from_record(record, package))
+                    .collect(),
             },
             PropertyValue::Raw { reason } => PropertyValueOutput::Raw {
                 reason: render_raw_reason(reason),
@@ -493,6 +626,12 @@ impl PropertyOutput {
 }
 
 #[derive(Serialize)]
+struct MapEntryOutput {
+    key: PropertyValueOutput,
+    value: PropertyValueOutput,
+}
+
+#[derive(Serialize)]
 #[serde(tag = "value_kind", rename_all = "snake_case")]
 enum PropertyValueOutput {
     Bool { value: bool },
@@ -501,9 +640,82 @@ enum PropertyValueOutput {
     Float { value: f32 },
     Double { value: f64 },
     Name { value: String },
+    Enum { value: String },
     String { value: String },
+    Text { value: String },
+    Vector { x: f32, y: f32, z: f32 },
     ObjectRef { value: Option<String> },
+    SoftObjectPath { value: String },
+    Array { values: Vec<PropertyValueOutput> },
+    Set { values: Vec<PropertyValueOutput> },
+    Map { entries: Vec<MapEntryOutput> },
+    Struct { properties: Vec<PropertyOutput> },
     Raw { reason: String, size: u64 },
+}
+
+fn value_output(package: &Package, value: &PropertyValue) -> PropertyValueOutput {
+    match value {
+        PropertyValue::Bool(value) => PropertyValueOutput::Bool { value: *value },
+        PropertyValue::Int(value) => PropertyValueOutput::Int { value: *value },
+        PropertyValue::UInt(value) => PropertyValueOutput::Uint { value: *value },
+        PropertyValue::Float(value) => PropertyValueOutput::Float { value: *value },
+        PropertyValue::Double(value) => PropertyValueOutput::Double { value: *value },
+        PropertyValue::Name(name) => PropertyValueOutput::Name {
+            value: resolve_name_or_placeholder(package, *name),
+        },
+        PropertyValue::Enum(name) => PropertyValueOutput::Enum {
+            value: resolve_name_or_placeholder(package, *name),
+        },
+        PropertyValue::String(value) => PropertyValueOutput::String {
+            value: value.clone(),
+        },
+        PropertyValue::Text(text) => PropertyValueOutput::Text {
+            value: text.source.clone(),
+        },
+        PropertyValue::Vector(vector) => PropertyValueOutput::Vector {
+            x: vector.x,
+            y: vector.y,
+            z: vector.z,
+        },
+        PropertyValue::ObjectRef(index) => PropertyValueOutput::ObjectRef {
+            value: resolve_object_ref(package, *index),
+        },
+        PropertyValue::SoftObjectPath(path) => PropertyValueOutput::SoftObjectPath {
+            value: path.clone(),
+        },
+        PropertyValue::Array(values) => PropertyValueOutput::Array {
+            values: values
+                .iter()
+                .map(|value| value_output(package, value))
+                .collect(),
+        },
+        PropertyValue::Set(values) => PropertyValueOutput::Set {
+            values: values
+                .iter()
+                .map(|value| value_output(package, value))
+                .collect(),
+        },
+        PropertyValue::Map(entries) => PropertyValueOutput::Map {
+            entries: entries
+                .iter()
+                .map(|entry| MapEntryOutput {
+                    key: value_output(package, &entry.key),
+                    value: value_output(package, &entry.value),
+                })
+                .collect(),
+        },
+        PropertyValue::Struct(stream) => PropertyValueOutput::Struct {
+            properties: stream
+                .records
+                .iter()
+                .map(|record| PropertyOutput::from_record(record, package))
+                .collect(),
+        },
+        PropertyValue::Raw { reason } => PropertyValueOutput::Raw {
+            reason: render_raw_reason(reason),
+            size: 0,
+        },
+    }
 }
 
 impl PropertyValueOutput {
@@ -515,8 +727,40 @@ impl PropertyValueOutput {
             Self::Float { value } => value.to_string(),
             Self::Double { value } => value.to_string(),
             Self::Name { value } => value.clone(),
+            Self::Enum { value } => value.clone(),
             Self::String { value } => format!("{value:?}"),
+            Self::Text { value } => format!("{value:?}"),
+            Self::Vector { x, y, z } => format!("({x}, {y}, {z})"),
             Self::ObjectRef { value } => value.clone().unwrap_or_else(|| "null".to_owned()),
+            Self::SoftObjectPath { value } => {
+                if value.is_empty() {
+                    "<none>".to_owned()
+                } else {
+                    value.clone()
+                }
+            }
+            Self::Array { values } => {
+                let rendered: Vec<String> = values.iter().map(Self::render).collect();
+                format!("[{}]", rendered.join(", "))
+            }
+            Self::Set { values } => {
+                let rendered: Vec<String> = values.iter().map(Self::render).collect();
+                format!("{{{}}}", rendered.join(", "))
+            }
+            Self::Map { entries } => {
+                let rendered: Vec<String> = entries
+                    .iter()
+                    .map(|entry| format!("{} => {}", entry.key.render(), entry.value.render()))
+                    .collect();
+                format!("{{{}}}", rendered.join(", "))
+            }
+            Self::Struct { properties } => {
+                let rendered: Vec<String> = properties
+                    .iter()
+                    .map(|property| format!("{} = {}", property.name, property.value.render()))
+                    .collect();
+                format!("{{{}}}", rendered.join(", "))
+            }
             Self::Raw { reason, size } => format!("<raw {reason}, {size} bytes>"),
         }
     }

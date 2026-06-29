@@ -60,6 +60,24 @@ pub enum RawReason {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct TextValue {
+    pub source: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorValue {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MapEntry {
+    pub key: PropertyValue,
+    pub value: PropertyValue,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum PropertyValue {
     Bool(bool),
     Float(f32),
@@ -67,8 +85,16 @@ pub enum PropertyValue {
     Int(i64),
     UInt(u64),
     Name(NameRef),
+    Enum(NameRef),
     String(String),
+    Text(TextValue),
+    Vector(VectorValue),
     ObjectRef(PackageIndex),
+    SoftObjectPath(String),
+    Array(Vec<PropertyValue>),
+    Set(Vec<PropertyValue>),
+    Map(Vec<MapEntry>),
+    Struct(PropertyStream),
     Raw { reason: RawReason },
 }
 
@@ -121,7 +147,7 @@ pub struct PropertyError {
 }
 
 impl PropertyError {
-    fn new(
+    pub(crate) fn new(
         kind: PropertyErrorKind,
         offset: Option<u64>,
         path: impl Into<String>,
@@ -452,5 +478,104 @@ fn resolve_name_ref(names: &[String], name: NameRef) -> Result<String, PropertyE
         Ok(base.clone())
     } else {
         Ok(format!("{}_{}", base, name.number() - 1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::Reader;
+    use crate::test_support::{
+        TypeParam, name_ref, push_i32, ue5_versions, write_property_tag, write_property_terminator,
+        write_type_name,
+    };
+
+    fn names() -> Vec<String> {
+        vec![
+            "None".into(),
+            "IntProperty".into(),
+            "EnumProperty".into(),
+            "EnumValue".into(),
+            "MyEnum::Alpha".into(),
+            "ArrayProperty".into(),
+            "NameProperty".into(),
+            "Shop".into(),
+            "Forge".into(),
+        ]
+    }
+
+    #[test]
+    fn reads_tagged_property_stream_with_complete_type_names() {
+        let mut bytes = Vec::new();
+        let payload = 42_i32.to_le_bytes();
+        write_property_tag(
+            &mut bytes,
+            3,
+            &TypeParam {
+                type_index: 1,
+                parameters: Vec::new(),
+            },
+            0,
+            &payload,
+        );
+        write_property_terminator(&mut bytes, 0);
+
+        let mut reader = Reader::new(&bytes);
+        let stream = read_tagged_property_stream(&mut reader, &ue5_versions(), &names(), "Test")
+            .expect("parse stream");
+
+        assert_eq!(stream.records.len(), 1);
+        assert_eq!(stream.records[0].payload.len(), 4);
+        assert_eq!(stream.records[0].type_name.name, name_ref(1, 0));
+        assert_eq!(reader.tell(), bytes.len() as u64);
+    }
+
+    #[test]
+    fn reads_array_property_inner_type_parameters() {
+        let mut bytes = Vec::new();
+        write_type_name(
+            &mut bytes,
+            &TypeParam {
+                type_index: 5,
+                parameters: vec![TypeParam {
+                    type_index: 6,
+                    parameters: Vec::new(),
+                }],
+            },
+        );
+        let mut reader = Reader::new(&bytes);
+        let type_name =
+            read_property_type_name_for_test(&mut reader, &names()).expect("read type name");
+        assert_eq!(type_name.name, name_ref(5, 0));
+        assert_eq!(type_name.parameters.len(), 1);
+        assert_eq!(type_name.parameters[0].name, name_ref(6, 0));
+    }
+
+    #[test]
+    fn rejects_negative_property_payload_size() {
+        let mut bytes = Vec::new();
+        push_i32(&mut bytes, 3);
+        push_i32(&mut bytes, 0);
+        write_type_name(
+            &mut bytes,
+            &TypeParam {
+                type_index: 1,
+                parameters: Vec::new(),
+            },
+        );
+        push_i32(&mut bytes, -1);
+
+        let mut reader = Reader::new(&bytes);
+        let error = read_tagged_property_stream(&mut reader, &ue5_versions(), &names(), "Test")
+            .expect_err("negative size");
+        assert_eq!(error.kind(), PropertyErrorKind::MalformedData);
+        assert!(error.path().contains("Tag.Size"));
+    }
+
+    fn read_property_type_name_for_test(
+        reader: &mut Reader<'_>,
+        names: &[String],
+    ) -> Result<PropertyTypeName, PropertyError> {
+        read_property_type_name(reader, names, "Test.Type")
     }
 }

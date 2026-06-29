@@ -427,6 +427,17 @@ impl<'a> Reader<'a> {
         })
     }
 
+    /// Reads `FSoftObjectPath` wire format: asset-path `FString` plus optional subpath `FString`.
+    pub fn read_soft_object_path(&mut self, path: &str) -> Result<String, ArchiveError> {
+        let asset_path = self.read_fstring(&format!("{path}.AssetPath"))?;
+        if self.remaining() == 0 {
+            return Ok(asset_path);
+        }
+
+        let sub_path = self.read_fstring(&format!("{path}.SubPath"))?;
+        Ok(Self::format_soft_object_path(&asset_path, &sub_path))
+    }
+
     /// Reads Unreal's signed-length, null-terminated serialized `FString`.
     pub fn read_fstring(&mut self, path: &str) -> Result<String, ArchiveError> {
         let length_offset = self.position;
@@ -471,7 +482,7 @@ impl<'a> Reader<'a> {
         Ok(values)
     }
 
-    fn read_count(&mut self, path: &str) -> Result<usize, ArchiveError> {
+    pub(crate) fn read_count(&mut self, path: &str) -> Result<usize, ArchiveError> {
         let offset = self.position;
         let count = self.read_i32(path)?;
         if count < 0 {
@@ -524,6 +535,14 @@ impl<'a> Reader<'a> {
             ));
         }
         Ok(())
+    }
+
+    fn format_soft_object_path(asset_path: &str, sub_path: &str) -> String {
+        if sub_path.is_empty() {
+            asset_path.to_owned()
+        } else {
+            format!("{asset_path}:{sub_path}")
+        }
     }
 
     fn read_ansi_string(

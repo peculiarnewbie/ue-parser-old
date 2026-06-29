@@ -302,6 +302,8 @@ pub struct Export {
 pub struct Package {
     pub summary: PackageSummary,
     pub names: Vec<String>,
+    /// Package-level soft object path table used by indexed `SoftObjectProperty` payloads.
+    pub soft_object_paths: Vec<String>,
     pub imports: Vec<Import>,
     pub exports: Vec<Export>,
 }
@@ -317,6 +319,7 @@ impl Package {
         let summary = PackageSummary::parse(source)?;
         let mut reader = Reader::new(source);
         let names = read_name_map(&mut reader, &summary)?;
+        let soft_object_paths = read_soft_object_path_list(source, &summary)?;
         let mut imports = read_import_map(&mut reader, &summary, &names)?;
         let mut exports = read_export_map(&mut reader, &summary, &names)?;
 
@@ -361,6 +364,7 @@ impl Package {
         Ok(Self {
             summary,
             names,
+            soft_object_paths,
             imports,
             exports,
         })
@@ -860,6 +864,58 @@ fn read_table(reader: &mut Reader<'_>, path: &str) -> Result<TableLocation, Pack
     Ok(TableLocation {
         count: read_non_negative_u32(reader, &format!("{path}.Count"))?,
         offset: read_offset(reader, &format!("{path}.Offset"))?,
+    })
+}
+
+fn read_soft_object_path_list(
+    source: &[u8],
+    summary: &PackageSummary,
+) -> Result<Vec<String>, PackageError> {
+    let Some(table) = summary.soft_object_paths.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if table.count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let count = usize::try_from(table.count).map_err(|error| {
+        PackageError::new(
+            PackageErrorKind::MalformedData,
+            Some(table.offset.get()),
+            "Summary.SoftObjectPaths.Count",
+            format!("soft object path count does not fit in usize: {error}"),
+        )
+    })?;
+
+    let mut reader = Reader::new(source);
+    reader.seek(table.offset.get(), "Summary.SoftObjectPaths")?;
+    let mut paths = Vec::with_capacity(count);
+    for index in 0..count {
+        let path = reader.read_soft_object_path(&format!("Summary.SoftObjectPaths[{index}]"))?;
+        paths.push(sanitize_soft_object_path_table_entry(path));
+    }
+    Ok(paths)
+}
+
+/// Editor packages should only store `/Package/Asset` literals (or empty) in the
+/// header table. Reject malformed spans that overlap adjacent header sections.
+fn sanitize_soft_object_path_table_entry(path: String) -> String {
+    if is_plausible_soft_object_path(&path) {
+        path
+    } else {
+        String::new()
+    }
+}
+
+fn is_plausible_soft_object_path(path: &str) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+    if !path.starts_with('/') {
+        return false;
+    }
+    path.chars().all(|ch| {
+        ch == ':' || ch == '.' || ch == '_' || ch == '-' || ch.is_ascii_alphanumeric() || ch == '/'
     })
 }
 
@@ -1402,6 +1458,123 @@ fn validate_table_location(
 }
 
 #[cfg(test)]
+pub(crate) fn test_package(names: Vec<String>) -> Package {
+    use crate::archive::{IoHash, Span};
+
+    let engine = EngineVersion {
+        major: 5,
+        minor: 7,
+        patch: 2,
+        changelist: 0,
+        branch: String::new(),
+    };
+    Package {
+        summary: PackageSummary {
+            span: Span::new(0, 0).expect("empty span"),
+            versions: crate::test_support::ue5_versions(),
+            custom_versions: Vec::new(),
+            saved_hash: IoHash::default(),
+            total_header_size: 0,
+            package_name: "/Game/Test/Test".to_owned(),
+            names: TableLocation {
+                count: u32::try_from(names.len()).expect("fits in u32"),
+                offset: FileOffset(0),
+            },
+            soft_object_paths: None,
+            localization_id: None,
+            gatherable_text_data: None,
+            exports: TableLocation {
+                count: 0,
+                offset: FileOffset(0),
+            },
+            imports: TableLocation {
+                count: 0,
+                offset: FileOffset(0),
+            },
+            cell_exports: None,
+            cell_imports: None,
+            metadata_offset: None,
+            depends_offset: FileOffset(0),
+            soft_package_references: None,
+            searchable_names_offset: None,
+            thumbnail_table_offset: FileOffset(0),
+            import_type_hierarchies: None,
+            persistent_guid: None,
+            generations: vec![GenerationInfo {
+                export_count: 0,
+                name_count: 0,
+            }],
+            saved_by_engine_version: engine.clone(),
+            compatible_with_engine_version: engine,
+            compression_flags: 0,
+            package_source: 0,
+            asset_registry_data_offset: FileOffset(0),
+            bulk_data_start_offset: 0,
+            world_tile_info_data_offset: None,
+            chunk_ids: Vec::new(),
+            preload_dependencies: None,
+            names_referenced_from_export_data_count: 0,
+            payload_toc_offset: None,
+            data_resource_offset: None,
+        },
+        names,
+        soft_object_paths: Vec::new(),
+        imports: Vec::new(),
+        exports: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_object_path(path: &str) -> ObjectPath {
+    ObjectPath(path.to_owned())
+}
+
+#[cfg(test)]
+pub(crate) fn test_import(
+    object_path: &str,
+    class_path: &str,
+    object_name_index: i32,
+    package_name_index: Option<i32>,
+) -> Import {
+    Import {
+        class_package: crate::test_support::name_ref(0, 0),
+        class_name: crate::test_support::name_ref(0, 0),
+        outer_index: PackageIndex::Null,
+        object_name: crate::test_support::name_ref(object_name_index, 0),
+        package_name: package_name_index.map(|index| crate::test_support::name_ref(index, 0)),
+        import_optional: None,
+        object_path: test_object_path(object_path),
+        class_path: test_object_path(class_path),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_export(serial_size: u64, object_path: &str, class_path: &str) -> Export {
+    Export {
+        class_index: PackageIndex::Null,
+        super_index: PackageIndex::Null,
+        template_index: None,
+        outer_index: PackageIndex::Null,
+        object_name: crate::test_support::name_ref(0, 0),
+        object_flags: 0,
+        serial_size,
+        serial_offset: FileOffset(0),
+        forced_export: false,
+        not_for_client: false,
+        not_for_server: false,
+        inherited_instance: None,
+        package_flags: 0,
+        not_always_loaded_for_editor_game: None,
+        is_asset: Some(true),
+        generate_public_hash: None,
+        script_serialization_start_offset: None,
+        script_serialization_end_offset: None,
+        object_path: ObjectPath(object_path.to_owned()),
+        class_path: Some(ObjectPath(class_path.to_owned())),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
@@ -1555,6 +1728,40 @@ mod tests {
         assert!(summary.names.count > 0);
         assert!(summary.exports.count > 0);
         assert!(summary.names.offset.get() < bytes.len() as u64);
+    }
+
+    #[test]
+    fn sanitizes_malformed_soft_object_path_table_entries() {
+        assert!(is_plausible_soft_object_path(""));
+        assert!(is_plausible_soft_object_path(
+            "/Engine/EngineResources/DefaultTexture.DefaultTexture"
+        ));
+        assert!(!is_plausible_soft_object_path("\0\0\0\0\u{c}\0\0\0\0\0\0"));
+        assert_eq!(
+            sanitize_soft_object_path_table_entry("\0\0\0\0\u{c}\0\0\0\0\0\0".into()),
+            ""
+        );
+    }
+
+    #[test]
+    fn parses_soft_object_path_list_from_fixture_when_available() {
+        let path = std::env::var_os("UASSET_FIXTURE_DIR")
+            .map(PathBuf::from)
+            .map(|dir| dir.join("Content/E2EFixture/Data/DT_AssetRefs.uasset"));
+        let Some(path) = path.filter(|path| path.is_file()) else {
+            eprintln!("skipping soft object path fixture check; set UASSET_FIXTURE_DIR");
+            return;
+        };
+
+        let bytes = std::fs::read(path).unwrap();
+        let package = Package::parse(&bytes).unwrap();
+        let table = package
+            .summary
+            .soft_object_paths
+            .as_ref()
+            .expect("fixture has soft object path table");
+        assert_eq!(package.soft_object_paths.len(), table.count as usize);
+        assert_eq!(package.soft_object_paths[0], "");
     }
 
     #[test]

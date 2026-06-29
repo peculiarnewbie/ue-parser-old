@@ -11,5 +11,8 @@ pub mod property;
 pub mod schema;
 pub mod version;
 
+#[cfg(test)]
+mod test_support;
+
 pub use archive::{ArchiveError, ArchiveErrorKind, ArchiveLimits, Reader, Span};
 pub use package::{Package, PackageError, PackageErrorKind, PackageSummary};
