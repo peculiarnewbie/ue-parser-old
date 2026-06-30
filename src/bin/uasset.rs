@@ -10,7 +10,9 @@ use serde::Serialize;
 use uasset_parser::asset::{
     AssetDecodeContext, AssetError, AssetErrorKind, DecodedAsset, EnumCppForm, decode_export,
 };
-use uasset_parser::asset::{DATA_ASSET_CLASS, PRIMARY_DATA_ASSET_CLASS, USERDEFINEDENUM_CLASS};
+use uasset_parser::asset::{
+    DATA_ASSET_CLASS, PRIMARY_DATA_ASSET_CLASS, USERDEFINEDENUM_CLASS, USERDEFINEDSTRUCT_CLASS,
+};
 use uasset_parser::package::{PackageError, PackageErrorKind, PackageIndex, TableLocation};
 use uasset_parser::property::{PropertyRecord, PropertyValue, RawReason};
 use uasset_parser::schema::{ClassSchema, SchemaProvider, StructSchema};
@@ -296,6 +298,19 @@ fn render_text_output(output: &InspectOutput) -> String {
                 None => writeln!(rendered, "  {} = {}", entry.name, entry.value).unwrap(),
             }
         }
+        if let Some(struct_flags) = asset.struct_flags {
+            writeln!(rendered, "struct_flags: {struct_flags:#x}").unwrap();
+        }
+        for field in &asset.struct_fields {
+            let mut line = format!("  {} ({})", field.name, field.type_name);
+            if let Some(referenced) = &field.referenced_path {
+                line.push_str(&format!(" -> {referenced}"));
+            }
+            if let Some(display_name) = &field.display_name {
+                line.push_str(&format!(" [{display_name:?}]"));
+            }
+            writeln!(rendered, "{line}").unwrap();
+        }
         for property in &asset.properties {
             writeln!(
                 rendered,
@@ -476,6 +491,8 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             string_table_entries: Vec::new(),
             enum_cpp_form: None,
             enum_entries: Vec::new(),
+            struct_flags: None,
+            struct_fields: Vec::new(),
             properties: Vec::new(),
             row_count: datatable.rows.len(),
             curve_rows: Vec::new(),
@@ -499,6 +516,8 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             string_table_entries: Vec::new(),
             enum_cpp_form: None,
             enum_entries: Vec::new(),
+            struct_flags: None,
+            struct_fields: Vec::new(),
             properties: property_outputs(package, &curve_table.properties),
             row_count: curve_table.rows.len(),
             curve_rows: curve_table
@@ -536,6 +555,8 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
                 .collect(),
             enum_cpp_form: None,
             enum_entries: Vec::new(),
+            struct_flags: None,
+            struct_fields: Vec::new(),
             properties: Vec::new(),
             row_count: 0,
             curve_rows: Vec::new(),
@@ -552,6 +573,8 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             string_table_entries: Vec::new(),
             enum_cpp_form: None,
             enum_entries: Vec::new(),
+            struct_flags: None,
+            struct_fields: Vec::new(),
             properties: property_outputs(package, &data_asset.properties),
             row_count: 0,
             curve_rows: Vec::new(),
@@ -568,6 +591,8 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             string_table_entries: Vec::new(),
             enum_cpp_form: None,
             enum_entries: Vec::new(),
+            struct_flags: None,
+            struct_fields: Vec::new(),
             properties: property_outputs(package, &object.properties),
             row_count: 0,
             curve_rows: Vec::new(),
@@ -592,8 +617,37 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
                     display_name: entry.display_name.clone(),
                 })
                 .collect(),
+            struct_flags: None,
+            struct_fields: Vec::new(),
             properties: Vec::new(),
             row_count: decoded_enum.entries.len(),
+            curve_rows: Vec::new(),
+            rows: Vec::new(),
+        },
+        DecodedAsset::Struct(decoded_struct) => AssetOutput {
+            kind: "Struct",
+            object_path: decoded_struct.object_path.to_string(),
+            class_path: Some(USERDEFINEDSTRUCT_CLASS.to_owned()),
+            object_guid: None,
+            row_struct: None,
+            parent_tables: Vec::new(),
+            string_table_namespace: None,
+            string_table_entries: Vec::new(),
+            enum_cpp_form: None,
+            enum_entries: Vec::new(),
+            struct_flags: Some(decoded_struct.struct_flags),
+            struct_fields: decoded_struct
+                .fields
+                .iter()
+                .map(|field| StructFieldOutput {
+                    name: resolve_name_or_placeholder(package, field.name),
+                    type_name: resolve_name_or_placeholder(package, field.type_name),
+                    referenced_path: field.referenced_path.as_ref().map(ToString::to_string),
+                    display_name: field.display_name.clone(),
+                })
+                .collect(),
+            properties: property_outputs(package, &decoded_struct.default_values),
+            row_count: decoded_struct.fields.len(),
             curve_rows: Vec::new(),
             rows: Vec::new(),
         },
@@ -680,6 +734,10 @@ struct AssetOutput {
     enum_cpp_form: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     enum_entries: Vec<EnumEntryOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    struct_flags: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    struct_fields: Vec<StructFieldOutput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     properties: Vec<PropertyOutput>,
     row_count: usize,
@@ -692,6 +750,17 @@ struct AssetOutput {
 struct EnumEntryOutput {
     name: String,
     value: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StructFieldOutput {
+    name: String,
+    #[serde(rename = "type")]
+    type_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    referenced_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     display_name: Option<String>,
 }

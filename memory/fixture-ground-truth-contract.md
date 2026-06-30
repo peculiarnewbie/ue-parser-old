@@ -27,9 +27,17 @@ pinned by parser unit tests against the `FStringTable::Serialize` wire format.
 
 Contract v8 adds: `emptyTable`, `wideScalarsTable`, `compositeEmptyTable`,
 `compositeNestedTable`, populated `DT_Localized` (`Loc_Row1`), and composite row pins
-(`CDT_E2EFixture.Row_Alpha.IntValue` = 4243 from parent `DT_Scalars`). `DT_AssetRefs.Texture`
-is pinned empty until SWAG/UE save persists soft refs on disk (see
-[[softobject-property-misdecode]]).
+(`CDT_E2EFixture.Row_Alpha.IntValue` = 4243 from parent `DT_Scalars`).
+
+`DT_AssetRefs.Texture` now resolves to
+`/Engine/EngineResources/DefaultTexture.DefaultTexture` (the parser mirror was
+corrected from `""` on 2026-06-30 once the soft-object-path table parse was
+fixed — see [[softobject-property-misdecode]]). Upstream `contract.ts` still
+pins it empty and should be corrected to match.
+
+`S_E2EFixture.uasset` is the first on-disk `UUserDefinedStruct` fixture; its
+decoder is validated by a dedicated ground-truth test, not the contract mirror
+(see [[userdefinedstruct-fixture-spec]]).
 
 **How to apply:** When validating decoded DataTable values, assert against contract.ts
 (via the electroswag-v8.json mirror), not guesses. For wire-format contracts

@@ -44,6 +44,13 @@ Phases 1 through 6 are implemented:
 - `UUserDefinedEnum` decoding: the `UEnum` name/value pairs and `CppForm`
   from the export tail, with per-entry display names resolved from the
   `DisplayNameMap` carried in the tagged-property stream
+- `UUserDefinedStruct` decoding: the `UStruct` tail (`SuperStruct`, `Children`,
+  the `ChildProperties` `FField`/`FProperty` schema, `StructFlags`) plus the
+  default-instance property stream; each field surfaces its on-disk type, the
+  struct/enum/class it references, and its friendly `DisplayName`
+- Package `SoftObjectPaths` summary table parsed as `FTopLevelAssetPath`
+  (PackageName + AssetName name-map pairs) + subpath, so indexed soft-object
+  references resolve to real paths
 - `uasset inspect` command with text and schema-versioned JSON output
   (current `schema_version` is 3)
 - File and stdin input

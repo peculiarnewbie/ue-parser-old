@@ -24,6 +24,7 @@ pub const DATA_ASSET_CLASS: &str = "/Script/Engine.DataAsset";
 pub const PRIMARY_DATA_ASSET_CLASS: &str = "/Script/Engine.PrimaryDataAsset";
 pub const STRINGTABLE_CLASS: &str = "/Script/Engine.StringTable";
 pub const USERDEFINEDENUM_CLASS: &str = "/Script/Engine.UserDefinedEnum";
+pub const USERDEFINEDSTRUCT_CLASS: &str = "/Script/CoreUObject.UserDefinedStruct";
 
 /// Package/meta exports that share the package file but are not inspectable assets.
 const SKIP_UOBJECT_DECODE_CLASSES: &[&str] = &[
@@ -50,6 +51,7 @@ pub fn is_generic_uobject_class(class_path: &str) -> bool {
         && class_path != CURVETABLE_CLASS
         && class_path != STRINGTABLE_CLASS
         && class_path != USERDEFINEDENUM_CLASS
+        && class_path != USERDEFINEDSTRUCT_CLASS
         && !is_data_asset_class(class_path)
         && !SKIP_UOBJECT_DECODE_CLASSES.contains(&class_path)
 }
@@ -68,6 +70,7 @@ pub enum DecodedAsset {
     DataAsset(DecodedDataAsset),
     UObject(DecodedUObject),
     Enum(DecodedEnum),
+    Struct(DecodedStruct),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -128,6 +131,33 @@ pub struct EnumEntry {
     /// Qualified `FName` for the entry, e.g. `MyEnum::Entry0`.
     pub name: NameRef,
     pub value: i64,
+    pub display_name: Option<String>,
+}
+
+/// A decoded `UUserDefinedStruct` export.
+///
+/// Carries the struct's own tagged properties (`Status`, `Guid`), the field
+/// schema parsed from `ChildProperties`, the serialized `StructFlags`, and the
+/// default-instance property stream.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedStruct {
+    pub object_path: ObjectPath,
+    pub struct_flags: u32,
+    pub properties: PropertyStream,
+    pub fields: Vec<StructField>,
+    pub default_values: PropertyStream,
+}
+
+/// One field from a `UUserDefinedStruct`'s `ChildProperties` (`FProperty`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StructField {
+    /// On-disk `FName` of the field (GUID-mangled, e.g. `IntValue_2_<hex>`).
+    pub name: NameRef,
+    /// `FProperty` subclass name, e.g. `IntProperty`, `StructProperty`.
+    pub type_name: NameRef,
+    /// Resolved struct/enum/class/object path the field references, when any.
+    pub referenced_path: Option<ObjectPath>,
+    /// Friendly display name from the field's `DisplayName` metadata, when present.
     pub display_name: Option<String>,
 }
 
@@ -784,6 +814,254 @@ fn display_name_map(package: &Package, properties: &PropertyStream) -> Vec<(Name
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub struct StructDecoder;
+
+impl AssetDecoder for StructDecoder {
+    fn supports(&self, class_path: &ObjectPath) -> bool {
+        class_path.as_str() == USERDEFINEDSTRUCT_CLASS
+    }
+
+    fn decode(
+        &self,
+        export: &Export,
+        context: &AssetDecodeContext<'_>,
+    ) -> Result<DecodedAsset, AssetError> {
+        let Some(class_path) = export.class_path.as_ref() else {
+            return Err(AssetError::new(
+                AssetErrorKind::UnsupportedFormat,
+                format!("export {} has no resolved class", export.object_path),
+            ));
+        };
+        if class_path.as_str() != USERDEFINEDSTRUCT_CLASS {
+            return Err(AssetError::new(
+                AssetErrorKind::UnsupportedFormat,
+                format!("unsupported asset class {class_path}"),
+            ));
+        }
+
+        let (properties, mut reader) = decode_uobject_properties(export, context)?;
+
+        let footer_offset = reader.tell();
+        let footer = reader.read_i32(&format!("{}.ExportFooter", export.object_path))?;
+        if footer != 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::MalformedData,
+                format!(
+                    "expected zero struct UObject footer at byte {footer_offset}, got {footer}"
+                ),
+            ));
+        }
+
+        // UStruct::Serialize tail. SuperStruct is an FPackageIndex; user structs
+        // have no super, so it is null (0). Children is a TArray<UField*>; user
+        // structs carry their members as ChildProperties (FFields), not UFields.
+        let _super_struct = reader.read_i32(&format!("{}.SuperStruct", export.object_path))?;
+        let child_count = reader.read_i32(&format!("{}.Children.Count", export.object_path))?;
+        for index in 0..child_count.max(0) {
+            reader.read_i32(&format!("{}.Children[{index}]", export.object_path))?;
+        }
+
+        let field_count_offset = reader.tell();
+        let field_count =
+            reader.read_i32(&format!("{}.ChildProperties.Count", export.object_path))?;
+        if field_count < 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::MalformedData,
+                format!("negative struct field count {field_count} at byte {field_count_offset}"),
+            ));
+        }
+        let mut fields = Vec::with_capacity(usize::try_from(field_count).expect("fits in usize"));
+        for index in 0..field_count {
+            let field_path = format!("{}.ChildProperties[{index}]", export.object_path);
+            if let Some(field) = read_field(&mut reader, context, &field_path)? {
+                fields.push(field);
+            }
+        }
+
+        // UStruct script bytecode: a user struct has none, but honor the markers.
+        let bytecode_size =
+            reader.read_i32(&format!("{}.ScriptBytecodeSize", export.object_path))?;
+        let storage_size = reader.read_i32(&format!("{}.ScriptStorageSize", export.object_path))?;
+        if bytecode_size != 0 || storage_size != 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::UnsupportedCapability,
+                format!(
+                    "struct {} carries {storage_size} bytes of script bytecode (unsupported)",
+                    export.object_path
+                ),
+            ));
+        }
+
+        // UScriptStruct::Serialize: the non-computed StructFlags.
+        let struct_flags = reader.read_u32(&format!("{}.StructFlags", export.object_path))?;
+
+        // UUserDefinedStruct::Serialize: the default struct instance, serialized
+        // as a tagged-property stream.
+        let mut default_values = read_tagged_property_stream(
+            &mut reader,
+            &context.package.summary.versions,
+            &context.package.names,
+            &format!("{}.DefaultInstance", export.object_path),
+        )?;
+        let decode_context = DecodeContext {
+            package: context.package,
+            versions: &context.package.summary.versions,
+            schemas: context.schemas,
+        };
+        decode_property_stream_values(context.source, &mut default_values, &decode_context)?;
+
+        if reader.remaining() != 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::MalformedData,
+                format!(
+                    "struct export {} left {} trailing bytes",
+                    export.object_path,
+                    reader.remaining()
+                ),
+            ));
+        }
+
+        Ok(DecodedAsset::Struct(DecodedStruct {
+            object_path: export.object_path.clone(),
+            struct_flags,
+            properties,
+            fields,
+            default_values,
+        }))
+    }
+}
+
+/// Reads one `FField`/`FProperty` as written by `UStruct::SerializeProperties`
+/// (and `SerializeSingleField` for inner fields): a leading type `FName`, then
+/// `FField::Serialize` (name + flags + optional metadata map), then
+/// `FProperty::Serialize`, then any type-specific tail. Returns `None` for a
+/// `NAME_None` type (a null inner field).
+fn read_field(
+    reader: &mut crate::archive::Reader<'_>,
+    context: &AssetDecodeContext<'_>,
+    path: &str,
+) -> Result<Option<StructField>, AssetError> {
+    let type_name = reader.read_name_ref(&format!("{path}.Type"))?;
+    let type_str = context.package.resolve_name(type_name).unwrap_or_default();
+    if type_str == "None" || type_str.is_empty() {
+        return Ok(None);
+    }
+
+    // FField::Serialize: name, flags, then (uncooked) the metadata map.
+    let name = reader.read_name_ref(&format!("{path}.Name"))?;
+    let _flags = reader.read_u32(&format!("{path}.Flags"))?;
+    let display_name = read_field_metadata(reader, context, path)?;
+
+    // FProperty::Serialize.
+    let _array_dim = reader.read_i32(&format!("{path}.ArrayDim"))?;
+    let _element_size = reader.read_i32(&format!("{path}.ElementSize"))?;
+    let _property_flags = reader.read_u64(&format!("{path}.PropertyFlags"))?;
+    // FProperty::RepIndex is a uint16 (serialized as a default 0 on save).
+    let _rep_index = reader.read_u16(&format!("{path}.RepIndex"))?;
+    let _rep_notify = reader.read_name_ref(&format!("{path}.RepNotifyFunc"))?;
+    let _bp_rep_condition = reader.read_u8(&format!("{path}.BlueprintReplicationCondition"))?;
+
+    // Type-specific tail.
+    let referenced_path = read_field_type_tail(reader, context, path, &type_str)?;
+
+    Ok(Some(StructField {
+        name,
+        type_name,
+        referenced_path,
+        display_name,
+    }))
+}
+
+/// Reads the per-type tail of an `FProperty`, returning the struct/enum/class
+/// path it references when applicable. Recurses for container inner fields.
+fn read_field_type_tail(
+    reader: &mut crate::archive::Reader<'_>,
+    context: &AssetDecodeContext<'_>,
+    path: &str,
+    type_str: &str,
+) -> Result<Option<ObjectPath>, AssetError> {
+    let read_ref = |reader: &mut crate::archive::Reader<'_>,
+                    field: &str|
+     -> Result<Option<ObjectPath>, AssetError> {
+        let raw = reader.read_i32(&format!("{path}.{field}"))?;
+        Ok(context.package.resolve_index(PackageIndex::from_raw(raw)))
+    };
+
+    match type_str {
+        "BoolProperty" => {
+            // FieldSize, ByteOffset, ByteMask, FieldMask, BoolSize, NativeBool: u8 each.
+            reader.skip(6, &format!("{path}.BoolLayout"))?;
+            Ok(None)
+        }
+        "ByteProperty" => read_ref(reader, "Enum"),
+        "EnumProperty" => {
+            let enum_ref = read_ref(reader, "Enum")?;
+            read_field(reader, context, &format!("{path}.UnderlyingProp"))?;
+            Ok(enum_ref)
+        }
+        "StructProperty" => read_ref(reader, "Struct"),
+        "ObjectProperty" | "WeakObjectProperty" | "LazyObjectProperty" | "SoftObjectProperty" => {
+            read_ref(reader, "PropertyClass")
+        }
+        "ClassProperty" | "SoftClassProperty" => {
+            let property_class = read_ref(reader, "PropertyClass")?;
+            read_ref(reader, "MetaClass")?;
+            Ok(property_class)
+        }
+        "InterfaceProperty" => read_ref(reader, "InterfaceClass"),
+        "ArrayProperty" => {
+            read_field(reader, context, &format!("{path}.Inner"))?;
+            Ok(None)
+        }
+        "SetProperty" | "OptionalProperty" => {
+            read_field(reader, context, &format!("{path}.Element"))?;
+            Ok(None)
+        }
+        "MapProperty" => {
+            read_field(reader, context, &format!("{path}.Key"))?;
+            read_field(reader, context, &format!("{path}.Value"))?;
+            Ok(None)
+        }
+        "IntProperty" | "Int8Property" | "Int16Property" | "Int64Property" | "UInt16Property"
+        | "UInt32Property" | "UInt64Property" | "FloatProperty" | "DoubleProperty"
+        | "StrProperty" | "NameProperty" | "TextProperty" => Ok(None),
+        other => Err(AssetError::new(
+            AssetErrorKind::UnsupportedCapability,
+            format!("struct field property type {other} is not supported yet"),
+        )),
+    }
+}
+
+/// Reads `FField`'s optional metadata map (`bHasMetaData` + `TMap<FName,FString>`)
+/// for an uncooked package, returning the `DisplayName` value when present.
+fn read_field_metadata(
+    reader: &mut crate::archive::Reader<'_>,
+    context: &AssetDecodeContext<'_>,
+    path: &str,
+) -> Result<Option<String>, AssetError> {
+    let has_metadata = reader.read_u32(&format!("{path}.HasMetaData"))?;
+    if has_metadata == 0 {
+        return Ok(None);
+    }
+    let count = reader.read_i32(&format!("{path}.MetaData.Count"))?;
+    if count < 0 {
+        return Err(AssetError::new(
+            AssetErrorKind::MalformedData,
+            format!("negative struct field metadata count {count}"),
+        ));
+    }
+    let mut display_name = None;
+    for index in 0..count {
+        let key = reader.read_name_ref(&format!("{path}.MetaData[{index}].Key"))?;
+        let value = reader.read_fstring(&format!("{path}.MetaData[{index}].Value"))?;
+        if context.package.resolve_name(key).as_deref() == Some("DisplayName") {
+            display_name = Some(value);
+        }
+    }
+    Ok(display_name)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct UObjectDecoder;
 
 impl AssetDecoder for UObjectDecoder {
@@ -851,6 +1129,9 @@ pub fn decode_export(
     }
     if EnumDecoder.supports(class_path) {
         return EnumDecoder.decode(export, context).map(Some);
+    }
+    if StructDecoder.supports(class_path) {
+        return StructDecoder.decode(export, context).map(Some);
     }
     if UObjectDecoder.supports(class_path) {
         return UObjectDecoder.decode(export, context).map(Some);
@@ -1705,6 +1986,131 @@ mod tests {
             .expect_err("unsupported cpp form");
         assert_eq!(error.kind(), AssetErrorKind::MalformedData);
         assert!(error.message().contains("CppForm"));
+    }
+
+    /// Writes one `FProperty` as `UStruct::SerializeProperties` does: type FName,
+    /// `FField` (name + flags + empty metadata), `FProperty` base, plus an
+    /// optional type-specific tail. Field widths mirror the real `S_E2EFixture`.
+    fn write_struct_field(
+        bytes: &mut Vec<u8>,
+        type_index: i32,
+        name_index: i32,
+        element_size: i32,
+        tail: &[u8],
+    ) {
+        push_i32(bytes, type_index); // PropertyTypeName FName index
+        push_i32(bytes, 0); // ... number
+        push_i32(bytes, name_index); // FField NamePrivate index
+        push_i32(bytes, 0); // ... number
+        push_i32(bytes, 0); // FlagsPrivate (u32)
+        push_i32(bytes, 0); // bHasMetaData (archive bool = u32) -> 0
+        push_i32(bytes, 1); // ArrayDim
+        push_i32(bytes, element_size); // ElementSize
+        push_i32(bytes, 0); // PropertyFlags low 32
+        push_i32(bytes, 0); // PropertyFlags high 32
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // RepIndex (u16)
+        push_i32(bytes, 0); // RepNotifyFunc FName index (None)
+        push_i32(bytes, 0); // ... number
+        bytes.push(0); // BlueprintReplicationCondition (u8)
+        bytes.extend_from_slice(tail);
+    }
+
+    fn write_userdefinedstruct_export(
+        none_name_index: i32,
+        fields: &[u8],
+        field_count: i32,
+        struct_flags: u32,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(0); // class serialization-control extensions
+        write_property_terminator(&mut bytes, none_name_index); // struct object tagged props
+        push_i32(&mut bytes, 0); // UObject export footer
+        push_i32(&mut bytes, 0); // SuperStruct (null)
+        push_i32(&mut bytes, 0); // Children count
+        push_i32(&mut bytes, field_count); // ChildProperties count
+        bytes.extend_from_slice(fields);
+        push_i32(&mut bytes, 0); // ScriptBytecodeSize
+        push_i32(&mut bytes, 0); // ScriptStorageSize
+        bytes.extend_from_slice(&struct_flags.to_le_bytes()); // StructFlags (u32)
+        write_property_terminator(&mut bytes, none_name_index); // empty default instance
+        bytes
+    }
+
+    fn decode_struct(export_bytes: Vec<u8>, package: Package, export: Export) -> DecodedStruct {
+        let schemas = EmptySchemas;
+        let context = AssetDecodeContext {
+            source: &export_bytes,
+            package: &package,
+            schemas: &schemas,
+        };
+        let DecodedAsset::Struct(decoded) = StructDecoder
+            .decode(&export, &context)
+            .expect("decode struct")
+        else {
+            panic!("expected Struct decode");
+        };
+        decoded
+    }
+
+    #[test]
+    fn decodes_user_defined_struct_fields() {
+        // names: 0 None, 1 IntProperty, 2 IntValue, 3 BoolProperty, 4 BoolValue
+        let package = test_package(vec![
+            "None".into(),
+            "IntProperty".into(),
+            "IntValue".into(),
+            "BoolProperty".into(),
+            "BoolValue".into(),
+        ]);
+        let mut fields = Vec::new();
+        write_struct_field(&mut fields, 1, 2, 4, &[]);
+        // BoolProperty tail: FieldSize, ByteOffset, ByteMask, FieldMask, BoolSize, NativeBool.
+        write_struct_field(&mut fields, 3, 4, 1, &[1, 0, 1, 1, 1, 0]);
+        let export_bytes = write_userdefinedstruct_export(0, &fields, 2, 0);
+        let export = test_export(
+            export_bytes.len() as u64,
+            "/Game/Test/S_Test.S_Test",
+            USERDEFINEDSTRUCT_CLASS,
+        );
+
+        let decoded = decode_struct(export_bytes, package, export);
+
+        assert_eq!(decoded.object_path.as_str(), "/Game/Test/S_Test.S_Test");
+        assert_eq!(decoded.struct_flags, 0);
+        assert_eq!(decoded.fields.len(), 2);
+        assert_eq!(decoded.fields[0].name, name_ref(2, 0));
+        assert_eq!(decoded.fields[0].type_name, name_ref(1, 0));
+        assert_eq!(decoded.fields[1].name, name_ref(4, 0));
+        assert_eq!(decoded.fields[1].type_name, name_ref(3, 0));
+        assert!(decoded.default_values.records.is_empty());
+    }
+
+    #[test]
+    fn rejects_unsupported_struct_field_type() {
+        let package = test_package(vec![
+            "None".into(),
+            "DelegateProperty".into(),
+            "OnFire".into(),
+        ]);
+        let mut fields = Vec::new();
+        write_struct_field(&mut fields, 1, 2, 16, &[]);
+        let export_bytes = write_userdefinedstruct_export(0, &fields, 1, 0);
+        let export = test_export(
+            export_bytes.len() as u64,
+            "/Game/Test/S_Test.S_Test",
+            USERDEFINEDSTRUCT_CLASS,
+        );
+        let schemas = EmptySchemas;
+        let context = AssetDecodeContext {
+            source: &export_bytes,
+            package: &package,
+            schemas: &schemas,
+        };
+
+        let error = StructDecoder
+            .decode(&export, &context)
+            .expect_err("unsupported field type");
+        assert_eq!(error.kind(), AssetErrorKind::UnsupportedCapability);
     }
 
     #[test]

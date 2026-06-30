@@ -10,7 +10,8 @@ use uasset_parser::asset::{
     AssetDecodeContext, AssetDecoder, COMPOSITE_DATATABLE_CLASS, CURVETABLE_CLASS,
     CurveTableDecoder, DATATABLE_CLASS, DataAssetDecoder, DataTableDecoder, DataTableKind,
     DataTableRow, DecodedAsset, DecodedCurveTable, DecodedDataAsset, DecodedDataTable,
-    DecodedStringTable, DecodedUObject, STRINGTABLE_CLASS, StringTableDecoder, decode_export,
+    DecodedStringTable, DecodedStruct, DecodedUObject, STRINGTABLE_CLASS, StringTableDecoder,
+    StructDecoder, USERDEFINEDSTRUCT_CLASS, decode_export,
 };
 use uasset_parser::package::{Package, PackageIndex};
 use uasset_parser::property::{PropertyStream, PropertyValue};
@@ -418,6 +419,7 @@ fn with_decoded_datatable(
         DecodedAsset::StringTable(_) => panic!("expected DataTable in {}", path.display()),
         DecodedAsset::UObject(_) => panic!("expected DataTable in {}", path.display()),
         DecodedAsset::Enum(_) => panic!("expected DataTable in {}", path.display()),
+        DecodedAsset::Struct(_) => panic!("expected DataTable in {}", path.display()),
     };
     check(&package, &datatable);
 }
@@ -458,6 +460,7 @@ fn with_decoded_data_asset(
         DecodedAsset::StringTable(_) => panic!("expected DataAsset in {}", path.display()),
         DecodedAsset::UObject(_) => panic!("expected DataAsset in {}", path.display()),
         DecodedAsset::Enum(_) => panic!("expected DataAsset in {}", path.display()),
+        DecodedAsset::Struct(_) => panic!("expected DataAsset in {}", path.display()),
     };
     check(&package, &data_asset);
 }
@@ -498,6 +501,7 @@ fn with_decoded_curve_table(
         DecodedAsset::DataAsset(_) => panic!("expected CurveTable in {}", path.display()),
         DecodedAsset::UObject(_) => panic!("expected CurveTable in {}", path.display()),
         DecodedAsset::Enum(_) => panic!("expected CurveTable in {}", path.display()),
+        DecodedAsset::Struct(_) => panic!("expected CurveTable in {}", path.display()),
     };
     check(&package, &curve_table);
 }
@@ -538,8 +542,107 @@ fn with_decoded_string_table(
         DecodedAsset::DataAsset(_) => panic!("expected StringTable in {}", path.display()),
         DecodedAsset::UObject(_) => panic!("expected StringTable in {}", path.display()),
         DecodedAsset::Enum(_) => panic!("expected StringTable in {}", path.display()),
+        DecodedAsset::Struct(_) => panic!("expected StringTable in {}", path.display()),
     };
     check(&package, &string_table);
+}
+
+fn with_decoded_struct(root: &Path, relative: &str, check: impl FnOnce(&Package, &DecodedStruct)) {
+    let path = root.join(relative);
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let package = Package::parse(&bytes)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()));
+    let export = package
+        .exports
+        .iter()
+        .find(|export| {
+            export
+                .class_path
+                .as_ref()
+                .is_some_and(|class| class.as_str() == USERDEFINEDSTRUCT_CLASS)
+        })
+        .unwrap_or_else(|| panic!("no UserDefinedStruct export in {}", path.display()));
+    let schemas = EmptySchemas;
+    let context = AssetDecodeContext {
+        source: &bytes,
+        package: &package,
+        schemas: &schemas,
+    };
+    let DecodedAsset::Struct(decoded) = StructDecoder
+        .decode(export, &context)
+        .unwrap_or_else(|error| panic!("failed to decode {}: {error}", path.display()))
+    else {
+        panic!("expected Struct in {}", path.display());
+    };
+    check(&package, &decoded);
+}
+
+/// Ground-truth check of the `S_E2EFixture` UserDefinedStruct against its real
+/// on-disk bytes: field order, friendly names, property types, the struct-typed
+/// field's referenced row struct, and decoded default values.
+#[test]
+fn shared_fixture_user_defined_struct_decodes() {
+    let contract = contract();
+    let Some(root) = fixture_root(&contract) else {
+        return;
+    };
+    let relative = "Content/E2EFixture/Data/S_E2EFixture.uasset";
+    if skip_missing_fixture_asset(&root, Path::new(relative)) {
+        return;
+    }
+    with_decoded_struct(&root, relative, |package, decoded| {
+        assert_eq!(
+            decoded.object_path.as_str(),
+            "/Game/E2EFixture/Data/S_E2EFixture.S_E2EFixture"
+        );
+        assert_eq!(decoded.struct_flags, 0);
+
+        // Friendly name, on-disk property type, referenced struct (if any).
+        let schema: Vec<(Option<String>, Option<String>, Option<String>)> = decoded
+            .fields
+            .iter()
+            .map(|field| {
+                (
+                    field.display_name.clone(),
+                    package.resolve_name(field.type_name),
+                    field.referenced_path.as_ref().map(ToString::to_string),
+                )
+            })
+            .collect();
+        assert_eq!(
+            schema,
+            vec![
+                (Some("IntValue".into()), Some("IntProperty".into()), None),
+                (Some("StringValue".into()), Some("StrProperty".into()), None),
+                (Some("BoolValue".into()), Some("BoolProperty".into()), None),
+                (
+                    Some("EnumValue".into()),
+                    Some("StructProperty".into()),
+                    Some("/Script/E2EFixtures.E2EFixtureEnumsRow".into()),
+                ),
+            ]
+        );
+
+        // Default-instance values decode through the normal property pipeline.
+        let default = |name_prefix: &str| -> PropertyValue {
+            decoded
+                .default_values
+                .records
+                .iter()
+                .find(|record| {
+                    package
+                        .resolve_name(record.name)
+                        .is_some_and(|name| name.starts_with(name_prefix))
+                })
+                .unwrap_or_else(|| panic!("missing default for {name_prefix}"))
+                .value
+                .clone()
+        };
+        assert_eq!(default("IntValue"), PropertyValue::Int(0));
+        assert_eq!(default("StringValue"), PropertyValue::String(String::new()));
+        assert_eq!(default("BoolValue"), PropertyValue::Bool(false));
+    });
 }
 
 fn row<'a>(package: &Package, datatable: &'a DecodedDataTable, name: &str) -> &'a DataTableRow {
@@ -641,6 +744,7 @@ fn with_decoded_uobject(
         Some(DecodedAsset::StringTable(_)) => panic!("expected UObject in {}", path.display()),
         Some(DecodedAsset::DataAsset(_)) => panic!("expected UObject in {}", path.display()),
         Some(DecodedAsset::Enum(_)) => panic!("expected UObject in {}", path.display()),
+        Some(DecodedAsset::Struct(_)) => panic!("expected UObject in {}", path.display()),
         None => panic!("no decoder matched export in {}", path.display()),
     };
     check(&package, &object);
@@ -860,6 +964,7 @@ fn shared_fixture_datatables_decode_row_names() {
             DecodedAsset::StringTable(_) => panic!("expected DataTable in {}", path.display()),
             DecodedAsset::UObject(_) => panic!("expected DataTable in {}", path.display()),
             DecodedAsset::Enum(_) => panic!("expected DataTable in {}", path.display()),
+            DecodedAsset::Struct(_) => panic!("expected DataTable in {}", path.display()),
         };
 
         let Some(row_struct_path) = datatable.row_struct.as_ref() else {

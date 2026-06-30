@@ -1,16 +1,36 @@
 ---
 name: userdefinedstruct-fixture-spec
-description: v17 UUserDefinedStruct decoder is blocked on authoring a ground-truth fixture; this is the field spec
+description: v17 UUserDefinedStruct decoder — DONE, validated against the S_E2EFixture ground-truth asset
 metadata:
   type: project
 ---
 
 `UUserDefinedStruct` decoding (v17, the asset after [[userdefinedenum-decoder]])
-is **blocked on a ground-truth fixture**. Decision (2026-06-30): author the
-fixture FIRST, then build the parser validated byte-exact against real bytes —
-because the format is large (a full `FField`/`FProperty` definition parser) and
-synthetic-only tests are self-referential (they'd encode my reading of the UE
-source and pass even with a wrong field width).
+is **DONE** — `StructDecoder` in `src/asset.rs`, validated byte-exact against the
+real `S_E2EFixture.uasset` (in `Content/E2EFixture/Data/`, authored 2026-06-30).
+Ground-truth test: `shared_fixture_user_defined_struct_decodes` in
+`tests/fixture_project.rs`; synthetic unit tests `decodes_user_defined_struct_fields`
+and `rejects_unsupported_struct_field_type` in `src/asset.rs`.
+
+**Validated wire-format facts (these differ from the UE-source research summary —
+the real asset caught the errors):**
+- `FProperty::RepIndex` is a **`uint16`** (2 bytes), NOT `int32`. This was the
+  one width that broke parsing until corrected against real bytes.
+- `FBoolProperty` tail is **6 × `u8`** (FieldSize, ByteOffset, ByteMask,
+  FieldMask, BoolSize, NativeBool) — `u8`, not `int32`.
+- `FField::Serialize` metadata: `bHasMetaData` is an **archive bool = `u32`**
+  (4 bytes), then `TMap<FName,FString>` (i32 count + key FName + value FString).
+  Field friendly names live under metadata key `DisplayName`; default values
+  under `MakeStructureDefaultValue`.
+- There **is** a zero-`i32` UObject footer between the struct object's tagged
+  stream and the `UStruct` tail (same footer the enum/datatable decoders read).
+- Field NAMES on disk are GUID-mangled (`IntValue_2_<hex>`); the friendly names
+  also appear in the sibling `UserDefinedStructEditorData` export's
+  `VariablesDescriptions` array.
+
+Original decision (2026-06-30): author the fixture FIRST, then build validated —
+because synthetic-only tests are self-referential. That paid off: the RepIndex
+width error would have passed a synthetic-only suite.
 
 **Why no fixture exists:** the E2E corpus (`D:\Perforce\Arif_Fixtures`, the only
 source in our supported UE 5.7.2 uncooked "complete type names" format) has no

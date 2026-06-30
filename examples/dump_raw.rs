@@ -77,6 +77,15 @@ fn main() {
                     &decoded_enum.properties.records,
                 );
             }
+            DecodedAsset::Struct(decoded_struct) => {
+                dump_properties(
+                    &package,
+                    &bytes,
+                    filter.as_deref(),
+                    "<defaults>",
+                    &decoded_struct.default_values.records,
+                );
+            }
             DecodedAsset::DataAsset(data_asset) => {
                 dump_properties(
                     &package,
