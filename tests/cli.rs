@@ -43,7 +43,7 @@ fn json_success_is_machine_readable_and_stderr_is_empty() {
     assert!(output.stderr.is_empty());
 
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
     assert_eq!(json["status"], "ok");
     assert_eq!(json["package"]["version"]["ue4"], 522);
     assert_eq!(json["package"]["version"]["ue5"], 1006);
@@ -61,7 +61,7 @@ fn json_io_error_uses_stderr_and_exit_code_four() {
     assert!(output.stdout.is_empty());
 
     let json: Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
     assert_eq!(json["status"], "error");
     assert_eq!(json["kind"], "io");
 }

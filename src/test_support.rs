@@ -49,7 +49,10 @@ pub struct TypeParam {
 pub fn write_type_name(bytes: &mut Vec<u8>, param: &TypeParam) {
     push_i32(bytes, param.type_index);
     push_i32(bytes, 0);
-    push_i32(bytes, i32::try_from(param.parameters.len()).expect("fits in i32"));
+    push_i32(
+        bytes,
+        i32::try_from(param.parameters.len()).expect("fits in i32"),
+    );
     for inner in &param.parameters {
         write_type_name(bytes, inner);
     }
@@ -96,7 +99,10 @@ pub fn write_object_array_property_tag(
     indices: &[i32],
 ) {
     let mut payload = Vec::new();
-    push_i32(&mut payload, i32::try_from(indices.len()).expect("fits in i32"));
+    push_i32(
+        &mut payload,
+        i32::try_from(indices.len()).expect("fits in i32"),
+    );
     for index in indices {
         push_i32(&mut payload, *index);
     }
@@ -115,7 +121,12 @@ pub fn write_object_array_property_tag(
     );
 }
 
-pub fn write_object_property_tag(bytes: &mut Vec<u8>, name_index: i32, type_index: i32, index: i32) {
+pub fn write_object_property_tag(
+    bytes: &mut Vec<u8>,
+    name_index: i32,
+    type_index: i32,
+    index: i32,
+) {
     write_property_tag(
         bytes,
         name_index,

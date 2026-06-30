@@ -1,5 +1,7 @@
 /target
 Cargo.lock
-tests/fixtures/
+tests/fixtures/*
+!tests/fixtures/
+!tests/fixtures/electroswag-v15.json
 *.exe
 tmp_*.txt

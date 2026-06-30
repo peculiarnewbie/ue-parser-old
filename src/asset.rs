@@ -22,6 +22,8 @@ pub const COMPOSITE_DATATABLE_CLASS: &str = "/Script/Engine.CompositeDataTable";
 pub const CURVETABLE_CLASS: &str = "/Script/Engine.CurveTable";
 pub const DATA_ASSET_CLASS: &str = "/Script/Engine.DataAsset";
 pub const PRIMARY_DATA_ASSET_CLASS: &str = "/Script/Engine.PrimaryDataAsset";
+pub const STRINGTABLE_CLASS: &str = "/Script/Engine.StringTable";
+pub const USERDEFINEDENUM_CLASS: &str = "/Script/Engine.UserDefinedEnum";
 
 /// Package/meta exports that share the package file but are not inspectable assets.
 const SKIP_UOBJECT_DECODE_CLASSES: &[&str] = &[
@@ -46,6 +48,8 @@ pub fn is_data_asset_class(class_path: &str) -> bool {
 pub fn is_generic_uobject_class(class_path: &str) -> bool {
     !DataTableDecoder::supports_class(class_path)
         && class_path != CURVETABLE_CLASS
+        && class_path != STRINGTABLE_CLASS
+        && class_path != USERDEFINEDENUM_CLASS
         && !is_data_asset_class(class_path)
         && !SKIP_UOBJECT_DECODE_CLASSES.contains(&class_path)
 }
@@ -60,8 +64,10 @@ pub enum DataTableKind {
 pub enum DecodedAsset {
     DataTable(DecodedDataTable),
     CurveTable(DecodedCurveTable),
+    StringTable(DecodedStringTable),
     DataAsset(DecodedDataAsset),
     UObject(DecodedUObject),
+    Enum(DecodedEnum),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,6 +110,48 @@ pub struct DecodedCurveTable {
     pub rows: Vec<CurveTableRow>,
 }
 
+/// A decoded `UUserDefinedEnum` export.
+///
+/// The `DisplayNameMap` (`TMap<FName, FText>`) rides in the tagged-property
+/// stream and is retained in `properties`; each entry's `display_name` is the
+/// resolved value from that map, when present.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedEnum {
+    pub object_path: ObjectPath,
+    pub cpp_form: EnumCppForm,
+    pub properties: PropertyStream,
+    pub entries: Vec<EnumEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnumEntry {
+    /// Qualified `FName` for the entry, e.g. `MyEnum::Entry0`.
+    pub name: NameRef,
+    pub value: i64,
+    pub display_name: Option<String>,
+}
+
+/// How a `UEnum` was originally declared (`UEnum::ECppForm`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnumCppForm {
+    Regular,
+    Namespaced,
+    EnumClass,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedStringTable {
+    pub object_path: ObjectPath,
+    pub namespace: String,
+    pub entries: Vec<StringTableEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StringTableEntry {
+    pub key: String,
+    pub source: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CurveTableMode {
     Empty,
@@ -114,13 +162,50 @@ pub enum CurveTableMode {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CurveTableRow {
     pub name: NameRef,
-    pub keys: Vec<SimpleCurveKey>,
+    pub keys: Vec<CurveKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CurveKey {
+    Simple(SimpleCurveKey),
+    Rich(RichCurveKey),
+}
+
+impl CurveKey {
+    #[must_use]
+    pub const fn time(self) -> f32 {
+        match self {
+            Self::Simple(key) => key.time,
+            Self::Rich(key) => key.time,
+        }
+    }
+
+    #[must_use]
+    pub const fn value(self) -> f32 {
+        match self {
+            Self::Simple(key) => key.value,
+            Self::Rich(key) => key.value,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SimpleCurveKey {
     pub time: f32,
     pub value: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RichCurveKey {
+    pub interp_mode: u8,
+    pub tangent_mode: u8,
+    pub tangent_weight_mode: u8,
+    pub time: f32,
+    pub value: f32,
+    pub arrive_tangent: f32,
+    pub arrive_tangent_weight: f32,
+    pub leave_tangent: f32,
+    pub leave_tangent_weight: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -401,13 +486,6 @@ impl AssetDecoder for CurveTableDecoder {
                 ));
             }
         };
-        if mode != CurveTableMode::SimpleCurves && row_count > 0 {
-            return Err(AssetError::new(
-                AssetErrorKind::UnsupportedCapability,
-                format!("CurveTable mode {mode:?} is not supported yet"),
-            ));
-        }
-
         let mut rows = Vec::with_capacity(usize::try_from(row_count).expect("i32 fits in usize"));
         for index in 0..row_count {
             let row_path = format!("{}.Rows[{index}]", export.object_path);
@@ -418,8 +496,15 @@ impl AssetDecoder for CurveTableDecoder {
                 &context.package.names,
                 &format!("{row_path}.Curve"),
             )?;
-            let keys =
-                decode_simple_curve_keys(context.source, context.package, &stream, &row_path)?;
+            let keys = match mode {
+                CurveTableMode::Empty => Vec::new(),
+                CurveTableMode::SimpleCurves => {
+                    decode_simple_curve_keys(context.source, context.package, &stream, &row_path)?
+                }
+                CurveTableMode::RichCurves => {
+                    decode_rich_curve_keys(context.source, context.package, &stream, &row_path)?
+                }
+            };
             rows.push(CurveTableRow { name, keys });
         }
 
@@ -482,6 +567,223 @@ impl AssetDecoder for DataAssetDecoder {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub struct StringTableDecoder;
+
+impl AssetDecoder for StringTableDecoder {
+    fn supports(&self, class_path: &ObjectPath) -> bool {
+        class_path.as_str() == STRINGTABLE_CLASS
+    }
+
+    fn decode(
+        &self,
+        export: &Export,
+        context: &AssetDecodeContext<'_>,
+    ) -> Result<DecodedAsset, AssetError> {
+        let Some(class_path) = export.class_path.as_ref() else {
+            return Err(AssetError::new(
+                AssetErrorKind::UnsupportedFormat,
+                format!("export {} has no resolved class", export.object_path),
+            ));
+        };
+        if class_path.as_str() != STRINGTABLE_CLASS {
+            return Err(AssetError::new(
+                AssetErrorKind::UnsupportedFormat,
+                format!("unsupported asset class {class_path}"),
+            ));
+        }
+
+        let (_properties, mut reader) = decode_uobject_properties(export, context)?;
+        let footer_offset = reader.tell();
+        let footer = reader.read_i32(&format!("{}.ExportFooter", export.object_path))?;
+        if footer != 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::MalformedData,
+                format!(
+                    "expected zero StringTable UObject footer at byte {footer_offset}, got {footer}"
+                ),
+            ));
+        }
+
+        let namespace = reader.read_fstring(&format!("{}.Namespace", export.object_path))?;
+        let entry_count_offset = reader.tell();
+        let entry_count = reader.read_i32(&format!("{}.Entries.Count", export.object_path))?;
+        if entry_count < 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::MalformedData,
+                format!(
+                    "negative StringTable entry count {entry_count} at byte {entry_count_offset}"
+                ),
+            ));
+        }
+        let mut entries =
+            Vec::with_capacity(usize::try_from(entry_count).expect("i32 fits in usize"));
+        for index in 0..entry_count {
+            let entry_path = format!("{}.Entries[{index}]", export.object_path);
+            let key = reader.read_fstring(&format!("{entry_path}.Key"))?;
+            let source = reader.read_fstring(&format!("{entry_path}.SourceString"))?;
+            entries.push(StringTableEntry { key, source });
+        }
+
+        let metadata_count = reader.read_i32(&format!("{}.MetaData.Count", export.object_path))?;
+        if metadata_count != 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::UnsupportedCapability,
+                format!(
+                    "StringTable metadata map with {metadata_count} entries is not supported yet"
+                ),
+            ));
+        }
+
+        if reader.remaining() != 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::MalformedData,
+                format!(
+                    "StringTable export {} left {} trailing bytes",
+                    export.object_path,
+                    reader.remaining()
+                ),
+            ));
+        }
+
+        Ok(DecodedAsset::StringTable(DecodedStringTable {
+            object_path: export.object_path.clone(),
+            namespace,
+            entries,
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EnumDecoder;
+
+impl AssetDecoder for EnumDecoder {
+    fn supports(&self, class_path: &ObjectPath) -> bool {
+        class_path.as_str() == USERDEFINEDENUM_CLASS
+    }
+
+    fn decode(
+        &self,
+        export: &Export,
+        context: &AssetDecodeContext<'_>,
+    ) -> Result<DecodedAsset, AssetError> {
+        let Some(class_path) = export.class_path.as_ref() else {
+            return Err(AssetError::new(
+                AssetErrorKind::UnsupportedFormat,
+                format!("export {} has no resolved class", export.object_path),
+            ));
+        };
+        if class_path.as_str() != USERDEFINEDENUM_CLASS {
+            return Err(AssetError::new(
+                AssetErrorKind::UnsupportedFormat,
+                format!("unsupported asset class {class_path}"),
+            ));
+        }
+
+        let (properties, mut reader) = decode_uobject_properties(export, context)?;
+        let footer_offset = reader.tell();
+        let footer = reader.read_i32(&format!("{}.ExportFooter", export.object_path))?;
+        if footer != 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::MalformedData,
+                format!("expected zero Enum UObject footer at byte {footer_offset}, got {footer}"),
+            ));
+        }
+
+        // `UEnum::Serialize` writes the names as `int32 Num` followed by
+        // `Num` × (`FName`, `int64`) pairs, then a `uint8 CppForm`.
+        let count_offset = reader.tell();
+        let count = reader.read_i32(&format!("{}.Names.Count", export.object_path))?;
+        if count < 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::MalformedData,
+                format!("negative Enum name count {count} at byte {count_offset}"),
+            ));
+        }
+        let mut raw_entries =
+            Vec::with_capacity(usize::try_from(count).expect("i32 fits in usize"));
+        for index in 0..count {
+            let entry_path = format!("{}.Names[{index}]", export.object_path);
+            let name = reader.read_name_ref(&format!("{entry_path}.Name"))?;
+            let value = reader.read_i64(&format!("{entry_path}.Value"))?;
+            raw_entries.push((name, value));
+        }
+
+        let cpp_form_offset = reader.tell();
+        let raw_form = reader.read_u8(&format!("{}.CppForm", export.object_path))?;
+        let cpp_form = match raw_form {
+            0 => EnumCppForm::Regular,
+            1 => EnumCppForm::Namespaced,
+            2 => EnumCppForm::EnumClass,
+            value => {
+                return Err(AssetError::new(
+                    AssetErrorKind::MalformedData,
+                    format!("unsupported Enum CppForm {value} at byte {cpp_form_offset}"),
+                ));
+            }
+        };
+
+        if reader.remaining() != 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::MalformedData,
+                format!(
+                    "Enum export {} left {} trailing bytes",
+                    export.object_path,
+                    reader.remaining()
+                ),
+            ));
+        }
+
+        let display_names = display_name_map(context.package, &properties);
+        let entries = raw_entries
+            .into_iter()
+            .map(|(name, value)| EnumEntry {
+                name,
+                value,
+                display_name: display_names
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, source)| source.clone()),
+            })
+            .collect();
+
+        Ok(DecodedAsset::Enum(DecodedEnum {
+            object_path: export.object_path.clone(),
+            cpp_form,
+            properties,
+            entries,
+        }))
+    }
+}
+
+/// Collects the `DisplayNameMap` (`TMap<FName, FText>`) entries from a decoded
+/// `UUserDefinedEnum` property stream as `(qualified name, display string)`
+/// pairs. Returns empty when the map is absent or carries unexpected value types.
+fn display_name_map(package: &Package, properties: &PropertyStream) -> Vec<(NameRef, String)> {
+    let Some(record) = properties
+        .records
+        .iter()
+        .find(|record| package.resolve_name(record.name).as_deref() == Some("DisplayNameMap"))
+    else {
+        return Vec::new();
+    };
+    let PropertyValue::Map(entries) = &record.value else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let PropertyValue::Name(name) = entry.key else {
+                return None;
+            };
+            let PropertyValue::Text(text) = &entry.value else {
+                return None;
+            };
+            Some((name, text.source.clone()))
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct UObjectDecoder;
 
 impl AssetDecoder for UObjectDecoder {
@@ -541,8 +843,14 @@ pub fn decode_export(
     if CurveTableDecoder.supports(class_path) {
         return CurveTableDecoder.decode(export, context).map(Some);
     }
+    if StringTableDecoder.supports(class_path) {
+        return StringTableDecoder.decode(export, context).map(Some);
+    }
     if DataAssetDecoder.supports(class_path) {
         return DataAssetDecoder.decode(export, context).map(Some);
+    }
+    if EnumDecoder.supports(class_path) {
+        return EnumDecoder.decode(export, context).map(Some);
     }
     if UObjectDecoder.supports(class_path) {
         return UObjectDecoder.decode(export, context).map(Some);
@@ -639,7 +947,7 @@ fn decode_simple_curve_keys(
     package: &Package,
     stream: &PropertyStream,
     path: &str,
-) -> Result<Vec<SimpleCurveKey>, AssetError> {
+) -> Result<Vec<CurveKey>, AssetError> {
     let Some(record) = stream
         .records
         .iter()
@@ -667,16 +975,76 @@ fn decode_simple_curve_keys(
     }
     let mut keys = Vec::with_capacity(usize::try_from(count).expect("i32 fits in usize"));
     for index in 0..count {
-        keys.push(SimpleCurveKey {
+        keys.push(CurveKey::Simple(SimpleCurveKey {
             time: payload.read_f32(&format!("{path}.Keys[{index}].Time"))?,
             value: payload.read_f32(&format!("{path}.Keys[{index}].Value"))?,
-        });
+        }));
     }
     if payload.remaining() != 0 {
         return Err(AssetError::new(
             AssetErrorKind::MalformedData,
             format!(
                 "{path}.Keys left {} trailing bytes after SimpleCurve key decode",
+                payload.remaining()
+            ),
+        ));
+    }
+    Ok(keys)
+}
+
+fn decode_rich_curve_keys(
+    source: &[u8],
+    package: &Package,
+    stream: &PropertyStream,
+    path: &str,
+) -> Result<Vec<CurveKey>, AssetError> {
+    let Some(record) = stream
+        .records
+        .iter()
+        .find(|record| package.resolve_name(record.name).as_deref() == Some("Keys"))
+    else {
+        return Ok(Vec::new());
+    };
+    if package.resolve_name(record.type_name.name).as_deref() != Some("ArrayProperty") {
+        return Err(AssetError::new(
+            AssetErrorKind::MalformedData,
+            format!("{path}.Keys is not an ArrayProperty"),
+        ));
+    }
+
+    let reader = crate::archive::Reader::new(source);
+    let mut payload = reader
+        .bounded(record.payload, &format!("{path}.Keys.Payload"))
+        .map_err(AssetError::from)?;
+    let count = payload.read_i32(&format!("{path}.Keys.Count"))?;
+    if count < 0 {
+        return Err(AssetError::new(
+            AssetErrorKind::MalformedData,
+            format!("negative RichCurve key count {count}"),
+        ));
+    }
+    let mut keys = Vec::with_capacity(usize::try_from(count).expect("i32 fits in usize"));
+    for index in 0..count {
+        keys.push(CurveKey::Rich(RichCurveKey {
+            interp_mode: payload.read_u8(&format!("{path}.Keys[{index}].InterpMode"))?,
+            tangent_mode: payload.read_u8(&format!("{path}.Keys[{index}].TangentMode"))?,
+            tangent_weight_mode: payload
+                .read_u8(&format!("{path}.Keys[{index}].TangentWeightMode"))?,
+            time: payload.read_f32(&format!("{path}.Keys[{index}].Time"))?,
+            value: payload.read_f32(&format!("{path}.Keys[{index}].Value"))?,
+            arrive_tangent: payload.read_f32(&format!("{path}.Keys[{index}].ArriveTangent"))?,
+            arrive_tangent_weight: payload
+                .read_f32(&format!("{path}.Keys[{index}].ArriveTangentWeight"))?,
+            leave_tangent: payload.read_f32(&format!("{path}.Keys[{index}].LeaveTangent"))?,
+            leave_tangent_weight: payload
+                .read_f32(&format!("{path}.Keys[{index}].LeaveTangentWeight"))?,
+        }));
+    }
+    if payload.remaining() != 0 {
+        return Err(AssetError::new(
+            AssetErrorKind::MalformedData,
+            format!(
+                "{path}.Keys left {} trailing bytes after RichCurve key decode",
                 payload.remaining()
             ),
         ));
@@ -732,8 +1100,9 @@ mod tests {
     use crate::property::PropertyValue;
     use crate::schema::{ClassSchema, SchemaProvider, StructSchema};
     use crate::test_support::{
-        name_ref, write_datatable_export, write_int_property_tag, write_object_array_property_tag,
-        write_object_property_tag, write_uobject_export,
+        TypeParam, name_ref, push_f32, push_fstring, push_i32, write_datatable_export,
+        write_int_property_tag, write_object_array_property_tag, write_object_property_tag,
+        write_property_tag, write_property_terminator, write_uobject_export,
     };
 
     struct EmptySchemas;
@@ -763,6 +1132,8 @@ mod tests {
             "DT_Scalars".into(),
             "DT_Scalars2".into(),
             "Game/E2EFixture/Data".into(),
+            "ArrayProperty".into(),
+            "Keys".into(),
         ]
     }
 
@@ -784,6 +1155,179 @@ mod tests {
             panic!("expected DataTable decode");
         };
         datatable
+    }
+
+    fn write_curvetable_export(
+        none_name_index: i32,
+        root_properties: &[u8],
+        mode: u8,
+        rows: &[(i32, &[u8])],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(0); // class serialization-control extensions
+        bytes.extend_from_slice(root_properties);
+        write_property_terminator(&mut bytes, none_name_index);
+        push_i32(&mut bytes, 0); // UObject export footer
+        push_i32(&mut bytes, i32::try_from(rows.len()).expect("fits in i32"));
+        bytes.push(mode);
+        for (name_index, row_properties) in rows {
+            push_i32(&mut bytes, *name_index);
+            push_i32(&mut bytes, 0);
+            bytes.extend_from_slice(row_properties);
+            write_property_terminator(&mut bytes, none_name_index);
+        }
+        bytes
+    }
+
+    fn decode_curve_table(
+        export_bytes: Vec<u8>,
+        package: Package,
+        export: Export,
+    ) -> DecodedCurveTable {
+        let schemas = EmptySchemas;
+        let context = AssetDecodeContext {
+            source: &export_bytes,
+            package: &package,
+            schemas: &schemas,
+        };
+        let DecodedAsset::CurveTable(curve_table) = CurveTableDecoder
+            .decode(&export, &context)
+            .expect("decode curve table")
+        else {
+            panic!("expected CurveTable decode");
+        };
+        curve_table
+    }
+
+    fn write_stringtable_export(
+        none_name_index: i32,
+        namespace: &str,
+        entries: &[(&str, &str)],
+        metadata_count: i32,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(0); // class serialization-control extensions
+        write_property_terminator(&mut bytes, none_name_index);
+        push_i32(&mut bytes, 0); // UObject export footer
+        push_fstring(&mut bytes, namespace);
+        push_i32(
+            &mut bytes,
+            i32::try_from(entries.len()).expect("fits in i32"),
+        );
+        for (key, source) in entries {
+            push_fstring(&mut bytes, key);
+            push_fstring(&mut bytes, source);
+        }
+        push_i32(&mut bytes, metadata_count);
+        bytes
+    }
+
+    fn decode_string_table(
+        export_bytes: Vec<u8>,
+        package: Package,
+        export: Export,
+    ) -> DecodedStringTable {
+        let schemas = EmptySchemas;
+        let context = AssetDecodeContext {
+            source: &export_bytes,
+            package: &package,
+            schemas: &schemas,
+        };
+        let DecodedAsset::StringTable(string_table) = StringTableDecoder
+            .decode(&export, &context)
+            .expect("decode string table")
+        else {
+            panic!("expected StringTable decode");
+        };
+        string_table
+    }
+
+    /// Builds a `DisplayNameMap` (`TMap<FName, FText>`) tagged property whose
+    /// keys are qualified enum-entry FNames and values are display strings.
+    fn write_display_name_map_property(
+        bytes: &mut Vec<u8>,
+        name_index: i32,
+        map_type_index: i32,
+        name_type_index: i32,
+        text_type_index: i32,
+        entries: &[(i32, &str)],
+    ) {
+        let mut payload = Vec::new();
+        push_i32(&mut payload, 0); // KeysToRemove
+        push_i32(
+            &mut payload,
+            i32::try_from(entries.len()).expect("fits in i32"),
+        );
+        for (entry_name_index, display_name) in entries {
+            push_i32(&mut payload, *entry_name_index); // FName index
+            push_i32(&mut payload, 0); // FName number
+            push_i32(&mut payload, 0); // FText flags
+            payload.push(0); // FText history type (Base)
+            push_fstring(&mut payload, ""); // namespace
+            push_fstring(&mut payload, ""); // key
+            push_fstring(&mut payload, display_name); // source string
+        }
+        write_property_tag(
+            bytes,
+            name_index,
+            &TypeParam {
+                type_index: map_type_index,
+                parameters: vec![
+                    TypeParam {
+                        type_index: name_type_index,
+                        parameters: Vec::new(),
+                    },
+                    TypeParam {
+                        type_index: text_type_index,
+                        parameters: Vec::new(),
+                    },
+                ],
+            },
+            0,
+            &payload,
+        );
+    }
+
+    /// Builds a synthetic `UUserDefinedEnum` export: extensions byte, optional
+    /// tagged properties, terminator, zero UObject footer, then the `UEnum` tail
+    /// (`int32 Num`, `Num` × (`FName`, `int64`), `uint8 CppForm`).
+    fn write_userdefinedenum_export(
+        none_name_index: i32,
+        properties: &[u8],
+        entries: &[(i32, i64)],
+        cpp_form: u8,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(0); // class serialization-control extensions
+        bytes.extend_from_slice(properties);
+        write_property_terminator(&mut bytes, none_name_index);
+        push_i32(&mut bytes, 0); // UObject export footer
+        push_i32(
+            &mut bytes,
+            i32::try_from(entries.len()).expect("fits in i32"),
+        );
+        for (name_index, value) in entries {
+            push_i32(&mut bytes, *name_index); // FName index
+            push_i32(&mut bytes, 0); // FName number
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.push(cpp_form);
+        bytes
+    }
+
+    fn decode_enum(export_bytes: Vec<u8>, package: Package, export: Export) -> DecodedEnum {
+        let schemas = EmptySchemas;
+        let context = AssetDecodeContext {
+            source: &export_bytes,
+            package: &package,
+            schemas: &schemas,
+        };
+        let DecodedAsset::Enum(decoded_enum) =
+            EnumDecoder.decode(&export, &context).expect("decode enum")
+        else {
+            panic!("expected Enum decode");
+        };
+        decoded_enum
     }
 
     #[test]
@@ -946,6 +1490,221 @@ mod tests {
             "expected DT_Scalars2 parent, got {:?}",
             datatable.parent_tables
         );
+    }
+
+    #[test]
+    fn decodes_rich_curve_table_keys() {
+        let mut keys_payload = Vec::new();
+        push_i32(&mut keys_payload, 1);
+        keys_payload.push(3); // RCIM_Cubic
+        keys_payload.push(2); // RCTM_Break
+        keys_payload.push(3); // RCTWM_WeightedBoth
+        push_f32(&mut keys_payload, 1.5);
+        push_f32(&mut keys_payload, 42.25);
+        push_f32(&mut keys_payload, -0.5);
+        push_f32(&mut keys_payload, 0.25);
+        push_f32(&mut keys_payload, 0.75);
+        push_f32(&mut keys_payload, 0.5);
+
+        let mut curve_properties = Vec::new();
+        write_property_tag(
+            &mut curve_properties,
+            14,
+            &TypeParam {
+                type_index: 13,
+                parameters: Vec::new(),
+            },
+            0,
+            &keys_payload,
+        );
+
+        let export_bytes = write_curvetable_export(0, &[], 2, &[(3, curve_properties.as_slice())]);
+        let package = test_package(names());
+        let export = test_export(
+            export_bytes.len() as u64,
+            "/Game/Test/CT_Test.CT_Test",
+            CURVETABLE_CLASS,
+        );
+
+        let curve_table = decode_curve_table(export_bytes, package, export);
+
+        assert_eq!(curve_table.mode, CurveTableMode::RichCurves);
+        assert_eq!(curve_table.rows.len(), 1);
+        assert_eq!(curve_table.rows[0].name, name_ref(3, 0));
+        assert_eq!(
+            curve_table.rows[0].keys,
+            vec![CurveKey::Rich(RichCurveKey {
+                interp_mode: 3,
+                tangent_mode: 2,
+                tangent_weight_mode: 3,
+                time: 1.5,
+                value: 42.25,
+                arrive_tangent: -0.5,
+                arrive_tangent_weight: 0.25,
+                leave_tangent: 0.75,
+                leave_tangent_weight: 0.5,
+            })]
+        );
+    }
+
+    #[test]
+    fn decodes_string_table_entries() {
+        let export_bytes = write_stringtable_export(
+            0,
+            "ST_Simple",
+            &[
+                ("HELLO", "Hello from string table"),
+                ("FAREWELL", "Goodbye from string table"),
+            ],
+            0,
+        );
+        let package = test_package(vec!["None".into()]);
+        let export = test_export(
+            export_bytes.len() as u64,
+            "/Game/Test/ST_Simple.ST_Simple",
+            STRINGTABLE_CLASS,
+        );
+
+        let string_table = decode_string_table(export_bytes, package, export);
+
+        assert_eq!(
+            string_table.object_path.as_str(),
+            "/Game/Test/ST_Simple.ST_Simple"
+        );
+        assert_eq!(string_table.namespace, "ST_Simple");
+        assert_eq!(
+            string_table.entries,
+            vec![
+                StringTableEntry {
+                    key: "HELLO".to_owned(),
+                    source: "Hello from string table".to_owned(),
+                },
+                StringTableEntry {
+                    key: "FAREWELL".to_owned(),
+                    source: "Goodbye from string table".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_string_table_metadata_until_supported() {
+        let export_bytes = write_stringtable_export(0, "ST_Simple", &[], 1);
+        let package = test_package(vec!["None".into()]);
+        let export = test_export(
+            export_bytes.len() as u64,
+            "/Game/Test/ST_Simple.ST_Simple",
+            STRINGTABLE_CLASS,
+        );
+        let schemas = EmptySchemas;
+        let context = AssetDecodeContext {
+            source: &export_bytes,
+            package: &package,
+            schemas: &schemas,
+        };
+
+        let error = StringTableDecoder
+            .decode(&export, &context)
+            .expect_err("metadata unsupported");
+        assert_eq!(error.kind(), AssetErrorKind::UnsupportedCapability);
+        assert!(error.message().contains("metadata"));
+    }
+
+    fn enum_names() -> Vec<String> {
+        vec![
+            "None".into(),                 // 0
+            "E_Color::Red".into(),         // 1
+            "E_Color::Green".into(),       // 2
+            "E_Color::E_Color_MAX".into(), // 3
+            "DisplayNameMap".into(),       // 4
+            "MapProperty".into(),          // 5
+            "NameProperty".into(),         // 6
+            "TextProperty".into(),         // 7
+        ]
+    }
+
+    #[test]
+    fn decodes_user_defined_enum_entries() {
+        let export_bytes = write_userdefinedenum_export(0, &[], &[(1, 0), (2, 1), (3, 2)], 2);
+        let package = test_package(enum_names());
+        let export = test_export(
+            export_bytes.len() as u64,
+            "/Game/Test/E_Color.E_Color",
+            USERDEFINEDENUM_CLASS,
+        );
+
+        let decoded = decode_enum(export_bytes, package, export);
+
+        assert_eq!(decoded.object_path.as_str(), "/Game/Test/E_Color.E_Color");
+        assert_eq!(decoded.cpp_form, EnumCppForm::EnumClass);
+        assert_eq!(
+            decoded.entries,
+            vec![
+                EnumEntry {
+                    name: name_ref(1, 0),
+                    value: 0,
+                    display_name: None,
+                },
+                EnumEntry {
+                    name: name_ref(2, 0),
+                    value: 1,
+                    display_name: None,
+                },
+                EnumEntry {
+                    name: name_ref(3, 0),
+                    value: 2,
+                    display_name: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn resolves_user_defined_enum_display_names() {
+        let mut properties = Vec::new();
+        write_display_name_map_property(&mut properties, 4, 5, 6, 7, &[(1, "Red"), (2, "Green")]);
+        let export_bytes =
+            write_userdefinedenum_export(0, &properties, &[(1, 0), (2, 1), (3, 2)], 2);
+        let package = test_package(enum_names());
+        let export = test_export(
+            export_bytes.len() as u64,
+            "/Game/Test/E_Color.E_Color",
+            USERDEFINEDENUM_CLASS,
+        );
+
+        let decoded = decode_enum(export_bytes, package, export);
+
+        assert_eq!(
+            decoded
+                .entries
+                .iter()
+                .map(|entry| entry.display_name.clone())
+                .collect::<Vec<_>>(),
+            vec![Some("Red".to_owned()), Some("Green".to_owned()), None],
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_enum_cpp_form() {
+        let export_bytes = write_userdefinedenum_export(0, &[], &[(1, 0)], 7);
+        let package = test_package(enum_names());
+        let export = test_export(
+            export_bytes.len() as u64,
+            "/Game/Test/E_Color.E_Color",
+            USERDEFINEDENUM_CLASS,
+        );
+        let schemas = EmptySchemas;
+        let context = AssetDecodeContext {
+            source: &export_bytes,
+            package: &package,
+            schemas: &schemas,
+        };
+
+        let error = EnumDecoder
+            .decode(&export, &context)
+            .expect_err("unsupported cpp form");
+        assert_eq!(error.kind(), AssetErrorKind::MalformedData);
+        assert!(error.message().contains("CppForm"));
     }
 
     #[test]

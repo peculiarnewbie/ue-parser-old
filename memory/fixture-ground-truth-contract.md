@@ -11,13 +11,19 @@ repo at `C:\Users\Ryzen\git\swag\electroswag\e2e\fixtures\unreal\contract.ts`
 (`DEFAULT_CONTRACT`). The C++ row structs are in
 `D:\Perforce\Arif_Fixtures\Source\E2EFixtures\E2EFixtureTypes.h`.
 
-The parser's own `tests/fixtures/electroswag-v14.json` is the mirror;
+The parser's own `tests/fixtures/electroswag-v15.json` is the mirror;
 generate from contract.ts when the upstream contract changes, or extend via
 `scripts/generate_electroswag_v12_json.py` for parser-only pins (v10: `DA_MapSet`;
 v11: `DT_MapSet`, `DA_Collections`, `DA_Localized`; v12: `UO_Plain` plain UObject;
-v13: `DA_WeakLazyRefs` weak/lazy object refs; v14: `CT_Simple` CurveTable).
+v13: `DA_WeakLazyRefs` weak/lazy object refs; v14: `CT_Simple` CurveTable;
+v15: empty `ST_Simple` StringTable).
 Its `datatables` section pins each DataTable's object path, ordered row names, columns, and typed cell
 values, asserted by `shared_fixture_datatables_match_contract_mirror`.
+
+`ST_Simple` is intentionally empty: UE Python exposes `StringTableFactory` and
+read-only `StringTableLibrary`, but not `UStringTable::GetMutableStringTable`
+or `FStringTable::SetSourceString`. Populated string-table entry decoding is
+pinned by parser unit tests against the `FStringTable::Serialize` wire format.
 
 Contract v8 adds: `emptyTable`, `wideScalarsTable`, `compositeEmptyTable`,
 `compositeNestedTable`, populated `DT_Localized` (`Loc_Row1`), and composite row pins

@@ -8,15 +8,15 @@ use std::process::ExitCode;
 
 use serde::Serialize;
 use uasset_parser::asset::{
-    AssetDecodeContext, AssetError, AssetErrorKind, DecodedAsset, decode_export,
+    AssetDecodeContext, AssetError, AssetErrorKind, DecodedAsset, EnumCppForm, decode_export,
 };
-use uasset_parser::asset::{DATA_ASSET_CLASS, PRIMARY_DATA_ASSET_CLASS};
+use uasset_parser::asset::{DATA_ASSET_CLASS, PRIMARY_DATA_ASSET_CLASS, USERDEFINEDENUM_CLASS};
 use uasset_parser::package::{PackageError, PackageErrorKind, PackageIndex, TableLocation};
 use uasset_parser::property::{PropertyRecord, PropertyValue, RawReason};
 use uasset_parser::schema::{ClassSchema, SchemaProvider, StructSchema};
 use uasset_parser::{Package, PackageSummary};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const EXIT_SUCCESS: u8 = 0;
 const EXIT_MALFORMED: u8 = 2;
 const EXIT_UNSUPPORTED: u8 = 3;
@@ -279,6 +279,23 @@ fn render_text_output(output: &InspectOutput) -> String {
         if let Some(class_path) = &asset.class_path {
             writeln!(rendered, "class: {class_path}").unwrap();
         }
+        if let Some(namespace) = &asset.string_table_namespace {
+            writeln!(rendered, "namespace: {namespace}").unwrap();
+        }
+        if let Some(cpp_form) = &asset.enum_cpp_form {
+            writeln!(rendered, "cpp_form: {cpp_form}").unwrap();
+        }
+        for entry in &asset.enum_entries {
+            match &entry.display_name {
+                Some(display_name) => writeln!(
+                    rendered,
+                    "  {} = {} ({display_name:?})",
+                    entry.name, entry.value
+                )
+                .unwrap(),
+                None => writeln!(rendered, "  {} = {}", entry.name, entry.value).unwrap(),
+            }
+        }
         for property in &asset.properties {
             writeln!(
                 rendered,
@@ -307,6 +324,9 @@ fn render_text_output(output: &InspectOutput) -> String {
             for key in &row.keys {
                 writeln!(rendered, "    {} => {}", key.time, key.value).unwrap();
             }
+        }
+        for entry in &asset.string_table_entries {
+            writeln!(rendered, "  {} = {}", entry.key, entry.source).unwrap();
         }
     }
     rendered
@@ -452,6 +472,10 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
                 .iter()
                 .map(|path| path.to_string())
                 .collect(),
+            string_table_namespace: None,
+            string_table_entries: Vec::new(),
+            enum_cpp_form: None,
+            enum_entries: Vec::new(),
             properties: Vec::new(),
             row_count: datatable.rows.len(),
             curve_rows: Vec::new(),
@@ -471,6 +495,10 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             object_guid: None,
             row_struct: None,
             parent_tables: Vec::new(),
+            string_table_namespace: None,
+            string_table_entries: Vec::new(),
+            enum_cpp_form: None,
+            enum_entries: Vec::new(),
             properties: property_outputs(package, &curve_table.properties),
             row_count: curve_table.rows.len(),
             curve_rows: curve_table
@@ -482,12 +510,35 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
                         .keys
                         .iter()
                         .map(|key| CurveKeyOutput {
-                            time: key.time,
-                            value: key.value,
+                            time: key.time(),
+                            value: key.value(),
                         })
                         .collect(),
                 })
                 .collect(),
+            rows: Vec::new(),
+        },
+        DecodedAsset::StringTable(string_table) => AssetOutput {
+            kind: "StringTable",
+            object_path: string_table.object_path.to_string(),
+            class_path: Some(uasset_parser::asset::STRINGTABLE_CLASS.to_owned()),
+            object_guid: None,
+            row_struct: None,
+            parent_tables: Vec::new(),
+            string_table_namespace: Some(string_table.namespace),
+            string_table_entries: string_table
+                .entries
+                .into_iter()
+                .map(|entry| StringTableEntryOutput {
+                    key: entry.key,
+                    source: entry.source,
+                })
+                .collect(),
+            enum_cpp_form: None,
+            enum_entries: Vec::new(),
+            properties: Vec::new(),
+            row_count: 0,
+            curve_rows: Vec::new(),
             rows: Vec::new(),
         },
         DecodedAsset::DataAsset(data_asset) => AssetOutput {
@@ -497,6 +548,10 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             object_guid: data_asset.object_guid.map(|guid| guid.to_string()),
             row_struct: None,
             parent_tables: Vec::new(),
+            string_table_namespace: None,
+            string_table_entries: Vec::new(),
+            enum_cpp_form: None,
+            enum_entries: Vec::new(),
             properties: property_outputs(package, &data_asset.properties),
             row_count: 0,
             curve_rows: Vec::new(),
@@ -509,11 +564,47 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             object_guid: object.object_guid.map(|guid| guid.to_string()),
             row_struct: None,
             parent_tables: Vec::new(),
+            string_table_namespace: None,
+            string_table_entries: Vec::new(),
+            enum_cpp_form: None,
+            enum_entries: Vec::new(),
             properties: property_outputs(package, &object.properties),
             row_count: 0,
             curve_rows: Vec::new(),
             rows: Vec::new(),
         },
+        DecodedAsset::Enum(decoded_enum) => AssetOutput {
+            kind: "Enum",
+            object_path: decoded_enum.object_path.to_string(),
+            class_path: Some(USERDEFINEDENUM_CLASS.to_owned()),
+            object_guid: None,
+            row_struct: None,
+            parent_tables: Vec::new(),
+            string_table_namespace: None,
+            string_table_entries: Vec::new(),
+            enum_cpp_form: Some(enum_cpp_form_name(decoded_enum.cpp_form)),
+            enum_entries: decoded_enum
+                .entries
+                .iter()
+                .map(|entry| EnumEntryOutput {
+                    name: resolve_name_or_placeholder(package, entry.name),
+                    value: entry.value,
+                    display_name: entry.display_name.clone(),
+                })
+                .collect(),
+            properties: Vec::new(),
+            row_count: decoded_enum.entries.len(),
+            curve_rows: Vec::new(),
+            rows: Vec::new(),
+        },
+    }
+}
+
+fn enum_cpp_form_name(cpp_form: EnumCppForm) -> &'static str {
+    match cpp_form {
+        EnumCppForm::Regular => "Regular",
+        EnumCppForm::Namespaced => "Namespaced",
+        EnumCppForm::EnumClass => "EnumClass",
     }
 }
 
@@ -581,12 +672,28 @@ struct AssetOutput {
     row_struct: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     parent_tables: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    string_table_namespace: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    string_table_entries: Vec<StringTableEntryOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enum_cpp_form: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    enum_entries: Vec<EnumEntryOutput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     properties: Vec<PropertyOutput>,
     row_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     curve_rows: Vec<CurveRowOutput>,
     rows: Vec<RowOutput>,
+}
+
+#[derive(Serialize)]
+struct EnumEntryOutput {
+    name: String,
+    value: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -605,6 +712,12 @@ struct CurveRowOutput {
 struct CurveKeyOutput {
     time: f32,
     value: f32,
+}
+
+#[derive(Serialize)]
+struct StringTableEntryOutput {
+    key: String,
+    source: String,
 }
 
 #[derive(Serialize)]

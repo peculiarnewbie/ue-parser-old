@@ -10,13 +10,13 @@ use uasset_parser::asset::{
     AssetDecodeContext, AssetDecoder, COMPOSITE_DATATABLE_CLASS, CURVETABLE_CLASS,
     CurveTableDecoder, DATATABLE_CLASS, DataAssetDecoder, DataTableDecoder, DataTableKind,
     DataTableRow, DecodedAsset, DecodedCurveTable, DecodedDataAsset, DecodedDataTable,
-    DecodedUObject, decode_export,
+    DecodedStringTable, DecodedUObject, STRINGTABLE_CLASS, StringTableDecoder, decode_export,
 };
 use uasset_parser::package::{Package, PackageIndex};
 use uasset_parser::property::{PropertyStream, PropertyValue};
 use uasset_parser::schema::{ClassSchema, SchemaProvider, StructSchema};
 
-const CONTRACT_JSON: &str = include_str!("fixtures/electroswag-v14.json");
+const CONTRACT_JSON: &str = include_str!("fixtures/electroswag-v15.json");
 
 #[derive(Deserialize)]
 struct FixtureContract {
@@ -32,6 +32,8 @@ struct FixtureContract {
     uobjects: Vec<FixtureUObject>,
     #[serde(default)]
     curve_tables: Vec<FixtureCurveTable>,
+    #[serde(default)]
+    string_tables: Vec<FixtureStringTable>,
 }
 
 /// Parser-owned mirror of one `contract.ts` DataTable: object path, ordered row
@@ -111,6 +113,20 @@ struct ExpectedCurveRow {
 struct ExpectedCurveKey {
     time: f32,
     value: f32,
+}
+
+#[derive(Deserialize)]
+struct FixtureStringTable {
+    file: PathBuf,
+    object_path: String,
+    namespace: String,
+    entries: Vec<ExpectedStringTableEntry>,
+}
+
+#[derive(Deserialize)]
+struct ExpectedStringTableEntry {
+    key: String,
+    source: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -399,7 +415,9 @@ fn with_decoded_datatable(
         DecodedAsset::DataTable(datatable) => datatable,
         DecodedAsset::DataAsset(_) => panic!("expected DataTable in {}", path.display()),
         DecodedAsset::CurveTable(_) => panic!("expected DataTable in {}", path.display()),
+        DecodedAsset::StringTable(_) => panic!("expected DataTable in {}", path.display()),
         DecodedAsset::UObject(_) => panic!("expected DataTable in {}", path.display()),
+        DecodedAsset::Enum(_) => panic!("expected DataTable in {}", path.display()),
     };
     check(&package, &datatable);
 }
@@ -437,7 +455,9 @@ fn with_decoded_data_asset(
         DecodedAsset::DataAsset(data_asset) => data_asset,
         DecodedAsset::DataTable(_) => panic!("expected DataAsset in {}", path.display()),
         DecodedAsset::CurveTable(_) => panic!("expected DataAsset in {}", path.display()),
+        DecodedAsset::StringTable(_) => panic!("expected DataAsset in {}", path.display()),
         DecodedAsset::UObject(_) => panic!("expected DataAsset in {}", path.display()),
+        DecodedAsset::Enum(_) => panic!("expected DataAsset in {}", path.display()),
     };
     check(&package, &data_asset);
 }
@@ -474,10 +494,52 @@ fn with_decoded_curve_table(
     {
         DecodedAsset::CurveTable(curve_table) => curve_table,
         DecodedAsset::DataTable(_) => panic!("expected CurveTable in {}", path.display()),
+        DecodedAsset::StringTable(_) => panic!("expected CurveTable in {}", path.display()),
         DecodedAsset::DataAsset(_) => panic!("expected CurveTable in {}", path.display()),
         DecodedAsset::UObject(_) => panic!("expected CurveTable in {}", path.display()),
+        DecodedAsset::Enum(_) => panic!("expected CurveTable in {}", path.display()),
     };
     check(&package, &curve_table);
+}
+
+fn with_decoded_string_table(
+    root: &Path,
+    relative: &str,
+    check: impl FnOnce(&Package, &DecodedStringTable),
+) {
+    let path = root.join(relative);
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let package = Package::parse(&bytes)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()));
+    let export = package
+        .exports
+        .iter()
+        .find(|export| {
+            export
+                .class_path
+                .as_ref()
+                .is_some_and(|class| class.as_str() == STRINGTABLE_CLASS)
+        })
+        .unwrap_or_else(|| panic!("no StringTable export in {}", path.display()));
+    let schemas = EmptySchemas;
+    let context = AssetDecodeContext {
+        source: &bytes,
+        package: &package,
+        schemas: &schemas,
+    };
+    let string_table = match StringTableDecoder
+        .decode(export, &context)
+        .unwrap_or_else(|error| panic!("failed to decode {}: {error}", path.display()))
+    {
+        DecodedAsset::StringTable(string_table) => string_table,
+        DecodedAsset::DataTable(_) => panic!("expected StringTable in {}", path.display()),
+        DecodedAsset::CurveTable(_) => panic!("expected StringTable in {}", path.display()),
+        DecodedAsset::DataAsset(_) => panic!("expected StringTable in {}", path.display()),
+        DecodedAsset::UObject(_) => panic!("expected StringTable in {}", path.display()),
+        DecodedAsset::Enum(_) => panic!("expected StringTable in {}", path.display()),
+    };
+    check(&package, &string_table);
 }
 
 fn row<'a>(package: &Package, datatable: &'a DecodedDataTable, name: &str) -> &'a DataTableRow {
@@ -576,7 +638,9 @@ fn with_decoded_uobject(
         Some(DecodedAsset::UObject(object)) => object,
         Some(DecodedAsset::DataTable(_)) => panic!("expected UObject in {}", path.display()),
         Some(DecodedAsset::CurveTable(_)) => panic!("expected UObject in {}", path.display()),
+        Some(DecodedAsset::StringTable(_)) => panic!("expected UObject in {}", path.display()),
         Some(DecodedAsset::DataAsset(_)) => panic!("expected UObject in {}", path.display()),
+        Some(DecodedAsset::Enum(_)) => panic!("expected UObject in {}", path.display()),
         None => panic!("no decoder matched export in {}", path.display()),
     };
     check(&package, &object);
@@ -793,7 +857,9 @@ fn shared_fixture_datatables_decode_row_names() {
             DecodedAsset::DataTable(datatable) => datatable,
             DecodedAsset::DataAsset(_) => panic!("expected DataTable in {}", path.display()),
             DecodedAsset::CurveTable(_) => panic!("expected DataTable in {}", path.display()),
+            DecodedAsset::StringTable(_) => panic!("expected DataTable in {}", path.display()),
             DecodedAsset::UObject(_) => panic!("expected DataTable in {}", path.display()),
+            DecodedAsset::Enum(_) => panic!("expected DataTable in {}", path.display()),
         };
 
         let Some(row_struct_path) = datatable.row_struct.as_ref() else {
@@ -1100,16 +1166,66 @@ fn shared_fixture_curve_tables_match_contract_mirror() {
                     .enumerate()
                 {
                     assert_eq!(
-                        actual.time, expected.time,
+                        actual.time(),
+                        expected.time,
                         "{context} {} key {index} time",
                         expected_row.name
                     );
                     assert_eq!(
-                        actual.value, expected.value,
+                        actual.value(),
+                        expected.value,
                         "{context} {} key {index} value",
                         expected_row.name
                     );
                 }
+            }
+        });
+    }
+}
+
+#[test]
+fn shared_fixture_string_tables_match_contract_mirror() {
+    let contract = contract();
+    let Some(root) = fixture_root(&contract) else {
+        return;
+    };
+    assert!(
+        !contract.string_tables.is_empty(),
+        "contract mirror must define StringTable fixtures"
+    );
+
+    for table in &contract.string_tables {
+        if skip_missing_fixture_asset(&root, &table.file) {
+            continue;
+        }
+        let relative = table.file.to_string_lossy().replace('\\', "/");
+        with_decoded_string_table(&root, &relative, |_package, string_table| {
+            let context = &table.object_path;
+            assert_eq!(
+                string_table.object_path.as_str(),
+                table.object_path,
+                "object path for {context}"
+            );
+            assert_eq!(
+                string_table.namespace, table.namespace,
+                "namespace for {context}"
+            );
+            assert_eq!(
+                string_table.entries.len(),
+                table.entries.len(),
+                "{context} entry count"
+            );
+            for expected in &table.entries {
+                let actual = string_table
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key == expected.key)
+                    .unwrap_or_else(|| panic!("{context} missing key {}", expected.key));
+                assert_eq!(
+                    actual.source, expected.source,
+                    "{context} source for {}",
+                    expected.key
+                );
             }
         });
     }
@@ -1230,7 +1346,7 @@ fn shared_fixture_corpus_matches_the_spawned_cli_contract() {
 
         let json: Value = serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|error| panic!("invalid JSON for {}: {error}", path.display()));
-        assert_eq!(json["schema_version"], 2, "{}", path.display());
+        assert_eq!(json["schema_version"], 3, "{}", path.display());
         assert_eq!(json["status"], "ok", "{}", path.display());
         assert_eq!(
             json["package"]["name"],

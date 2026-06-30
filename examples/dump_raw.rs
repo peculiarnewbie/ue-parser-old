@@ -67,6 +67,16 @@ fn main() {
                 }
             }
             DecodedAsset::CurveTable(_) => {}
+            DecodedAsset::StringTable(_) => {}
+            DecodedAsset::Enum(decoded_enum) => {
+                dump_properties(
+                    &package,
+                    &bytes,
+                    filter.as_deref(),
+                    "<root>",
+                    &decoded_enum.properties.records,
+                );
+            }
             DecodedAsset::DataAsset(data_asset) => {
                 dump_properties(
                     &package,

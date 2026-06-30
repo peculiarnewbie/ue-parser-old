@@ -319,7 +319,7 @@ impl Package {
         let summary = PackageSummary::parse(source)?;
         let mut reader = Reader::new(source);
         let names = read_name_map(&mut reader, &summary)?;
-        let soft_object_paths = read_soft_object_path_list(source, &summary)?;
+        let soft_object_paths = read_soft_object_path_list(source, &summary, &names)?;
         let mut imports = read_import_map(&mut reader, &summary, &names)?;
         let mut exports = read_export_map(&mut reader, &summary, &names)?;
 
@@ -870,6 +870,7 @@ fn read_table(reader: &mut Reader<'_>, path: &str) -> Result<TableLocation, Pack
 fn read_soft_object_path_list(
     source: &[u8],
     summary: &PackageSummary,
+    names: &[String],
 ) -> Result<Vec<String>, PackageError> {
     let Some(table) = summary.soft_object_paths.as_ref() else {
         return Ok(Vec::new());
@@ -887,14 +888,53 @@ fn read_soft_object_path_list(
         )
     })?;
 
+    // Each entry is an `FSoftObjectPath`: an `FTopLevelAssetPath`
+    // (`FName` PackageName + `FName` AssetName, each a name-map index pair)
+    // followed by the `FString` SubPathString.
     let mut reader = Reader::new(source);
     reader.seek(table.offset.get(), "Summary.SoftObjectPaths")?;
     let mut paths = Vec::with_capacity(count);
     for index in 0..count {
-        let path = reader.read_soft_object_path(&format!("Summary.SoftObjectPaths[{index}]"))?;
-        paths.push(sanitize_soft_object_path_table_entry(path));
+        let entry_path = format!("Summary.SoftObjectPaths[{index}]");
+        let package = reader.read_name_ref(&format!("{entry_path}.PackageName"))?;
+        let asset = reader.read_name_ref(&format!("{entry_path}.AssetName"))?;
+        let sub_path = reader.read_fstring(&format!("{entry_path}.SubPath"))?;
+        let formatted = format_top_level_asset_path(names, package, asset, &sub_path);
+        paths.push(sanitize_soft_object_path_table_entry(formatted));
     }
     Ok(paths)
+}
+
+/// Formats an `FSoftObjectPath` from its `FTopLevelAssetPath` name parts and
+/// subpath. An unset/`None` package yields the empty string (an unset ref);
+/// otherwise the result is `PackageName.AssetName[:SubPath]`. Name references
+/// that fail to resolve degrade to empty rather than failing the package parse,
+/// matching the header table's tolerance for placeholder entries.
+fn format_top_level_asset_path(
+    names: &[String],
+    package: crate::archive::NameRef,
+    asset: crate::archive::NameRef,
+    sub_path: &str,
+) -> String {
+    let resolve = |name| match resolve_name_ref(names, name) {
+        Ok(name) if name != "None" => name,
+        _ => String::new(),
+    };
+    let package = resolve(package);
+    if package.is_empty() {
+        return String::new();
+    }
+    let asset = resolve(asset);
+    let base = if asset.is_empty() {
+        package
+    } else {
+        format!("{package}.{asset}")
+    };
+    if sub_path.is_empty() {
+        base
+    } else {
+        format!("{base}:{sub_path}")
+    }
 }
 
 /// Editor packages should only store `/Package/Asset` literals (or empty) in the
@@ -1761,7 +1801,10 @@ mod tests {
             .as_ref()
             .expect("fixture has soft object path table");
         assert_eq!(package.soft_object_paths.len(), table.count as usize);
-        assert_eq!(package.soft_object_paths[0], "");
+        assert_eq!(
+            package.soft_object_paths[0],
+            "/Engine/EngineResources/DefaultTexture.DefaultTexture"
+        );
     }
 
     #[test]

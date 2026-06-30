@@ -41,8 +41,11 @@ Phases 1 through 6 are implemented:
 - Per-row property names, types, and decoded values are surfaced in both the
   text and JSON `inspect` output; unsupported property types are reported as
   raw with their type and payload byte length
+- `UUserDefinedEnum` decoding: the `UEnum` name/value pairs and `CppForm`
+  from the export tail, with per-entry display names resolved from the
+  `DisplayNameMap` carried in the tagged-property stream
 - `uasset inspect` command with text and schema-versioned JSON output
-  (current `schema_version` is 2)
+  (current `schema_version` is 3)
 - File and stdin input
 - Stable stdout/stderr and exit-code behavior
 
@@ -90,10 +93,10 @@ file-to-module map lives in `memory/ue-source-reference.md`.
 ## Shared Unreal fixture project
 
 The parser reuses Electroswag's UE 5.7 fixture project rather than maintaining
-a second Unreal project. The parser-owned mirror of fixture contract v7 is:
+a second Unreal project. The parser-owned mirror of the current fixture contract is:
 
 ```text
-tests/fixtures/electroswag-v7.json
+tests/fixtures/electroswag-v15.json
 ```
 
 Its upstream source of truth is Electroswag's
