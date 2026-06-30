@@ -33,12 +33,13 @@ state machine (`Engine.cpp: FMagicStage → FMetadataStage? → FEstablishTransp
 writes little-endian platforms in practice.
 
 ### 1. Magic (4 bytes) — `FMagicStage` (Engine.cpp:5312)
-- `0x32435254` `'TRC2'` — modern files: magic then a metadata block.
-- `0x54524345` `'TRCE'` — older files: magic, then directly the transport header (no metadata).
+- Raw bytes `2CRT` — modern TRC2 files: magic then a metadata block. The writer
+  stores `FHandshake.Magic = '2' | ('C' << 8) | ('R' << 16) | ('T' << 24)`.
+- Raw bytes `ECRT` — older TRCE files: magic, then directly the transport header (no metadata).
 - `0x00000001` — pre-magic legacy: bytes are already `{TransportVersion=0, ProtocolVersion=1}` interpreted directly.
-- `'2CRT'` / `'ECRT'` — big-endian variants; analysis rejects them ("Big endian traces are currently not supported").
+- Raw bytes `TRC2` / `TRCE` — swapped-endian variants; analysis rejects them ("Big endian traces are currently not supported").
 
-### 2. Metadata (only after `'TRC2'`) — `FMetadataStage` (Engine.cpp:5255)
+### 2. Metadata (only after raw bytes `2CRT`) — `FMetadataStage` (Engine.cpp:5255)
 A length-prefixed blob:
 ```
 uint16 MetadataSize;
@@ -149,22 +150,74 @@ double StartDateTime;   // seconds since epoch as a double
 ```
 This is the source of the cycle→time conversion and the platform pointer width that an analyzer needs to interpret the rest of the stream. There is no separate "trace header" — the prologue is just the first Important `NewEvent`-typed event in the Events stream.
 
-## Designing a standalone `utrace` parser binary
+## Dashboard-critical event families
+
+The source-code deep dive confirms a small useful subset for performance
+dashboard extraction. This subset is enough to summarize CPU timing by
+frame/thread and still preserve a path back to the original trace for deep
+dives.
+
+| Data needed | Events | UE source |
+|-------------|--------|-----------|
+| Trace clock/base date | `$Trace.NewTrace` | `Runtime/TraceLog/Private/Trace/Writer.cpp:77` and `:963` |
+| Thread labels | `$Trace.ThreadInfo`, `$Trace.ThreadGroupBegin/End` | `Runtime/TraceLog/Private/Trace/Trace.cpp:261` |
+| Frame intervals | `Misc.BeginFrame`, `Misc.EndFrame` | `Runtime/Core/Private/ProfilingDebugging/MiscTrace.cpp:50`; analyzer in `MiscTraceAnalysis.cpp` |
+| Regions | `Misc.RegionBegin[WithId]`, `Misc.RegionEnd[WithId]` | `MiscTrace.cpp:28`; analyzer in `MiscTraceAnalysis.cpp` |
+| Bookmarks | `Misc.BookmarkSpec`, `Misc.Bookmark` | `MiscTrace.cpp:14`; analyzer in `BookmarksTraceAnalysis.cpp` |
+| CPU timer names | `CpuProfiler.EventSpec` | `Runtime/Core/Private/ProfilingDebugging/CpuProfilerTrace.cpp:26`; analyzer `OnEventSpec` |
+| CPU scope intervals | `CpuProfiler.EventBatchV3` | `CpuProfilerTrace.cpp:48`/`:154`; analyzer `ProcessBufferV2` |
+
+`EventSpec` carries `Id`, `Name`, and, when enabled, `File` and `Line`. The
+dashboard parser should keep those fields as provenance for any scope summary.
+`EventBatchV3` uses the thread carrying the event as the timing thread; Unreal's
+analyzer reads it via `Context.ThreadInfo.GetId()`.
+
+### `CpuProfiler.EventBatchV3` encoding
+
+`EventBatchV3` has one `uint8[] Data` field. The writer appends compact records
+to a small per-thread buffer and flushes it as an event. The normal CPU scope
+records are unsigned 7-bit varints, not zigzag values:
+
+```
+first = Decode7bit()
+cycle_delta = first >> 2
+opcode = first & 0b11
+```
+
+Opcodes used by UE 5.7:
+
+- `0b01`: begin regular/metadata scope. Followed by another 7-bit varint. In
+  V3, payload bit 0 means metadata id; otherwise `payload >> 1` is the
+  `EventSpec.Id`.
+- `0b00`: end scope. No following id.
+- `0b11`: coroutine resume. Followed by coroutine id and timer-scope depth.
+- `0b10`: coroutine suspend. Followed by timer-scope depth.
+
+Cycle reconstruction mirrors `FCpuProfilerAnalyzer::ProcessBufferV2`: the
+decoded cycle is a delta from the previous event on that thread, with a
+late-connect correction against the enclosing event's base cycle. Convert cycles
+to seconds using `$Trace.NewTrace.CycleFrequency` and start cycle/base event
+time. Metadata records can be recognized and preserved later, but the dashboard
+MVP can start with plain scope ids plus a clear "metadata scope unresolved"
+fallback.
+
+## Designing the `utrace` parser CLI
 
 The analysis engine is deliberately decoupled from the rest of Unreal:
 - `TraceAnalysis.Build.cs` only depends on `TraceLog` (for `Protocol*` headers + `Decode`), `Core`, and `JsonUtilities` (for `EventToCbor.cpp`). The `Decode` function is standalone LZ4.
 - `TraceLog` ships `create_standalone.py` which inlines the writer into a single header pair (`standalone_prologue.h.src` / `standalone_epilogue.h.src`) for embedding in non-UE programs — proof that the wire format is self-contained.
 
-A Rust `utrace`-only binary following this repo's conventions would need:
+A Rust `utrace` parser following this repo's conventions would need:
 
-1. **Header parse** — read 4-byte magic; branch on `'TRC2'`/`'TRCE'`/`0x00000001`. For `'TRC2'`, skip the metadata block (`u16 size` + bytes).
+1. **Header parse** — read 4-byte magic; branch on raw bytes `2CRT`/`ECRT`/`0x00000001`. For `2CRT`, skip the metadata block (`u16 size` + bytes); reject swapped `TRC2`/`TRCE`.
 2. **Transport/protocol byte pair** — `u8 transport, u8 protocol`. Reject `transport != 4` (TidPacketSync is the only one written today; Raw/Packet/TidPacket are present for historical reasons) and `protocol > 7`.
 3. **Packet loop** — `FTidPacketBase { u16 packet_size, u16 thread_id }`; apply the three marker bits; on `EncodedMarker`, read `u16 decoded_size` and `LZ4_decompress_safe` the next `packet_size - 6` bytes. Demultiplex by `thread_id`: tid 0 → important/new-events stream, tid 1 → internal (alias), tid `0x3fff` → sync marker (bump sync counter, no payload), `2..0x3ffe` → per-thread event streams.
 4. **Per-thread event framing** — selected by protocol. For P5/6/7: read uid byte (extend to u16 if `Flag_TwoByteUid`), shift by 1; if uid is a well-known (`EnterScope`, `LeaveScope`, `AuxData`, `AuxDataTerminal`, `EnterScope_TA/TB`, `LeaveScope_TA/TB`) use the fixed size from `SetSizeIfKnownEvent`; otherwise look up `EventUid` in the registry built from `NewEvent` declarations and read `TypeInfo->EventSize` bytes. Sync'd events additionally carry a 24-bit serial in the 3 bytes after the uid.
 5. **`NewEvent` decoding** — parse `FNewEventEvent` per protocol 4 or 6; build a `TypeRegistry` (`EventUid → {logger, event, fields[]}`). Field `TypeInfo` byte decodes via the Protocol0 masks. This must complete before any user event with that uid can be interpreted.
 6. **Field value decode** — for each field, `EventDataPtr + Field.Offset` gives the raw bytes; sign/float/string/array is decided by `SizeAndType` and `Class` exactly as `IAnalyzer::FEventData::GetValue/GetString/GetArray` does. Strings/arrays pull from the following aux blobs by `FieldIndex`.
+7. **Dashboard subset decode** — decode `$Trace.NewTrace`, `$Trace.ThreadInfo`, `Misc` frame/region/bookmark events, `CpuProfiler.EventSpec`, and `CpuProfiler.EventBatchV3`. Emit stable dashboard JSON with frame/thread/scope summaries and provenance, while retaining `inspect` output for parser debugging and raw unknown events.
 
-The repo already has the right primitives: `src/archive.rs` (bounded LE reader, checked cursor), `src/codec.rs` (soft-object-path byte handling — analogous to trace string decode), and a `bin/` layout used by `uasset`. A second binary — e.g. `src/bin/utrace.rs` with an `inspect` subcommand — fits the existing CLI contract (schema-versioned JSON, stderr diagnostics, the same exit-code ladder). The only new dependency required is an LZ4 block crate (e.g. `lz4_flex` or `lz4` with block-mode).
+The repo already has the right primitives: `src/archive.rs` (bounded LE reader, checked cursor), `src/codec.rs` (soft-object-path byte handling — analogous to trace string decode), and a `bin/` layout used by `uasset`. The roadmap currently favors one CLI entrypoint with `utrace inspect` and `utrace dashboard` subcommands, not a separate public binary. The only new dependency required is an LZ4 block crate (e.g. `lz4_flex` or `lz4` with block-mode).
 
 Recommended phasing that mirrors how this repo rolled out `uasset`:
 1. Header + magic + transport/protocol + packet walking with raw hex dump per thread (no decode).
@@ -172,7 +225,7 @@ Recommended phasing that mirrors how this repo rolled out `uasset`:
 3. `NewEvent` parsing → type registry dump (logger, event, fields with decoded types).
 4. Important-event decode (prologue `$Trace.NewTrace`, thread specs).
 5. Normal-event decode + serial-ordered dispatch with sync-point gap detection.
-6. JSON schema-versioned `inspect` output for a chosen subset (timing scopes, thread names, frame markers).
+6. Dashboard MVP: schema-versioned `utrace dashboard --format json` for CPU timing scopes, thread names, frame markers, regions/bookmarks, and provenance. Keep `utrace inspect` as the broader parser/debug surface.
 
 ## Legacy `.ue4stats` files — still present in 5.7
 
@@ -202,4 +255,7 @@ Net: UE 5.7 can still *write* `.ue4stats` files for backward compatibility with 
 | field value decode (int/float/string/array/reference) | `Engine.cpp` `IAnalyzer::FEventFieldInfo::GetType` (675), `FEventData::GetValueImpl` (862), `GetString` (879/907), `GetArrayImpl` (844) |
 | serial ordering + sync gaps | `Engine.cpp` `FProtocol5Stage::OnDataNormal` (3854), `DispatchNormalEvents` (4092), `DetectSerialGaps` (4689) |
 | `$Trace.NewTrace` prologue | `Writer.cpp:77` (event decl), `Writer.cpp:952` (prologue emit) |
+| `$Trace.ThreadInfo` and thread groups | `Trace.cpp:261` (`ThreadInfo` declaration), `Trace.cpp:283` (emit) |
+| frame, region, bookmark events | `MiscTrace.cpp:14` (`BookmarkSpec`), `:28` (`RegionBegin`), `:50` (`BeginFrame`); `MiscTraceAnalysis.cpp`; `BookmarksTraceAnalysis.cpp` |
+| CPU profiler event specs and batches | `CpuProfilerTrace.cpp:26` (`EventSpec`), `:48` (`EventBatchV3`), `:154` (batch emit); `CpuProfilerTraceAnalysis.cpp:391` (`ProcessBufferV2`) |
 | legacy `.ue4stats` | `Runtime/Core/Public/Stats/StatsFile.h`, `Runtime/Core/Private/Stats/StatsFile.cpp`, `StatsCommand.cpp:2052` |

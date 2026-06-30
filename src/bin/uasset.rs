@@ -8,22 +8,29 @@ use std::process::ExitCode;
 
 use serde::Serialize;
 use uasset_parser::asset::{
-    AssetDecodeContext, AssetError, AssetErrorKind, DecodedAsset, EnumCppForm, decode_export,
+    AssetDecodeContext, AssetErrorKind, DecodedAsset, EnumCppForm, decode_export,
 };
 use uasset_parser::asset::{
-    DATA_ASSET_CLASS, PRIMARY_DATA_ASSET_CLASS, USERDEFINEDENUM_CLASS, USERDEFINEDSTRUCT_CLASS,
+    DATA_ASSET_CLASS, PRIMARY_DATA_ASSET_CLASS, SKELETON_CLASS, USERDEFINEDENUM_CLASS,
+    USERDEFINEDSTRUCT_CLASS,
 };
 use uasset_parser::package::{PackageError, PackageErrorKind, PackageIndex, TableLocation};
 use uasset_parser::property::{PropertyRecord, PropertyValue, RawReason};
 use uasset_parser::schema::{ClassSchema, SchemaProvider, StructSchema};
+#[cfg(feature = "utrace")]
+use uasset_parser::utrace::{TraceDashboard, TraceError, TraceErrorKind, TraceInspect};
 use uasset_parser::{Package, PackageSummary};
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 6;
+#[cfg(feature = "utrace")]
+const UTRACE_SCHEMA_VERSION: u32 = 1;
 const EXIT_SUCCESS: u8 = 0;
 const EXIT_MALFORMED: u8 = 2;
 const EXIT_UNSUPPORTED: u8 = 3;
 const EXIT_IO: u8 = 4;
 const EXIT_INTERNAL: u8 = 5;
+/// At least one export failed to decode but the package and other exports parsed.
+const EXIT_PARTIAL: u8 = 6;
 const EXIT_USAGE: u8 = 64;
 
 fn main() -> ExitCode {
@@ -37,6 +44,7 @@ fn run(arguments: Vec<OsString>) -> u8 {
             write_stdout(format!("uasset {}\n", env!("CARGO_PKG_VERSION")).as_bytes())
         }
         Ok(Command::Inspect(options)) => inspect(&options),
+        Ok(Command::Utrace(command)) => run_utrace(command),
         Err(error) => {
             eprintln!("uasset: {error}\n\n{USAGE}");
             EXIT_USAGE
@@ -74,8 +82,15 @@ impl Input {
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
     Inspect(InspectOptions),
+    Utrace(UtraceCommand),
     Help,
     Version,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum UtraceCommand {
+    Inspect(InspectOptions),
+    Dashboard(InspectOptions),
 }
 
 impl Command {
@@ -86,6 +101,7 @@ impl Command {
         };
         match command.to_str() {
             Some("inspect") => Self::parse_inspect(arguments.collect()),
+            Some("utrace") => Self::parse_utrace(arguments.collect()),
             Some("-h" | "--help" | "help") => {
                 reject_trailing_arguments(arguments)?;
                 Ok(Self::Help)
@@ -96,6 +112,25 @@ impl Command {
             }
             Some(command) => Err(format!("unknown command {command:?}")),
             None => Err("command is not valid UTF-8".to_owned()),
+        }
+    }
+
+    fn parse_utrace(arguments: Vec<OsString>) -> Result<Self, String> {
+        let mut arguments = arguments.into_iter();
+        let Some(command) = arguments.next() else {
+            return Err("utrace requires a command".to_owned());
+        };
+        match command.to_str() {
+            Some("inspect") => match Self::parse_inspect(arguments.collect())? {
+                Self::Inspect(options) => Ok(Self::Utrace(UtraceCommand::Inspect(options))),
+                _ => unreachable!("parse_inspect only returns Inspect"),
+            },
+            Some("dashboard") => match Self::parse_inspect(arguments.collect())? {
+                Self::Inspect(options) => Ok(Self::Utrace(UtraceCommand::Dashboard(options))),
+                _ => unreachable!("parse_inspect only returns Inspect"),
+            },
+            Some(command) => Err(format!("unknown utrace command {command:?}")),
+            None => Err("utrace command is not valid UTF-8".to_owned()),
         }
     }
 
@@ -178,18 +213,107 @@ fn inspect(options: &InspectOptions) -> u8 {
         }
     };
 
-    let output = match InspectOutput::from_package(input_name.clone(), &bytes, &package) {
-        Ok(output) => output,
-        Err(error) => {
-            let exit_code = exit_code_for_asset_error(&error);
-            write_error(options.format, ErrorOutput::asset(input_name, &error));
-            return exit_code;
-        }
-    };
+    let output = InspectOutput::from_package(input_name, &bytes, &package);
+    let partial = !output.decode_errors.is_empty();
     let rendered = match render_output(options.format, &output) {
         Ok(rendered) => rendered,
         Err(error) => {
             eprintln!("uasset: failed to serialize output: {error}");
+            return EXIT_INTERNAL;
+        }
+    };
+    let exit = write_stdout(&rendered);
+    if exit == EXIT_SUCCESS && partial {
+        EXIT_PARTIAL
+    } else {
+        exit
+    }
+}
+
+#[cfg(feature = "utrace")]
+fn run_utrace(command: UtraceCommand) -> u8 {
+    match command {
+        UtraceCommand::Inspect(options) => inspect_utrace(&options),
+        UtraceCommand::Dashboard(options) => dashboard_utrace(&options),
+    }
+}
+
+#[cfg(not(feature = "utrace"))]
+fn run_utrace(_command: UtraceCommand) -> u8 {
+    eprintln!("uasset: utrace support was not enabled at build time");
+    EXIT_UNSUPPORTED
+}
+
+#[cfg(feature = "utrace")]
+fn inspect_utrace(options: &InspectOptions) -> u8 {
+    let input_name = options.input.display_name();
+    let bytes = match read_input(&options.input) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            write_utrace_error(
+                options.format,
+                UtraceErrorOutput::io(input_name, error.to_string()),
+            );
+            return EXIT_IO;
+        }
+    };
+
+    let trace = match uasset_parser::utrace::inspect(&bytes) {
+        Ok(trace) => trace,
+        Err(error) => {
+            let exit_code = exit_code_for_trace_error(&error);
+            write_utrace_error(options.format, UtraceErrorOutput::trace(input_name, &error));
+            return exit_code;
+        }
+    };
+    let output = UtraceInspectOutput {
+        schema_version: UTRACE_SCHEMA_VERSION,
+        status: "ok",
+        path: input_name,
+        trace,
+    };
+    let rendered = match render_utrace_output(options.format, &output) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            eprintln!("uasset: failed to serialize utrace output: {error}");
+            return EXIT_INTERNAL;
+        }
+    };
+    write_stdout(&rendered)
+}
+
+#[cfg(feature = "utrace")]
+fn dashboard_utrace(options: &InspectOptions) -> u8 {
+    let input_name = options.input.display_name();
+    let bytes = match read_input(&options.input) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            write_utrace_error(
+                options.format,
+                UtraceErrorOutput::io(input_name, error.to_string()),
+            );
+            return EXIT_IO;
+        }
+    };
+
+    let dashboard = match uasset_parser::utrace::dashboard(&bytes) {
+        Ok(dashboard) => dashboard,
+        Err(error) => {
+            let exit_code = exit_code_for_trace_error(&error);
+            write_utrace_error(options.format, UtraceErrorOutput::trace(input_name, &error));
+            return exit_code;
+        }
+    };
+    let output = UtraceDashboardOutput {
+        schema_version: UTRACE_SCHEMA_VERSION,
+        status: "ok",
+        path: input_name,
+        dashboard,
+    };
+    let rendered = match render_utrace_dashboard_output(options.format, &output) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            eprintln!("uasset: failed to serialize utrace dashboard output: {error}");
             return EXIT_INTERNAL;
         }
     };
@@ -219,6 +343,208 @@ fn render_output(
             Ok(rendered)
         }
     }
+}
+
+#[cfg(feature = "utrace")]
+fn render_utrace_output(
+    format: OutputFormat,
+    output: &UtraceInspectOutput,
+) -> Result<Vec<u8>, serde_json::Error> {
+    match format {
+        OutputFormat::Text => Ok(render_utrace_text_output(output).into_bytes()),
+        OutputFormat::Json => {
+            let mut rendered = serde_json::to_vec(output)?;
+            rendered.push(b'\n');
+            Ok(rendered)
+        }
+    }
+}
+
+#[cfg(feature = "utrace")]
+fn render_utrace_dashboard_output(
+    format: OutputFormat,
+    output: &UtraceDashboardOutput,
+) -> Result<Vec<u8>, serde_json::Error> {
+    match format {
+        OutputFormat::Text => Ok(render_utrace_dashboard_text_output(output).into_bytes()),
+        OutputFormat::Json => {
+            let mut rendered = serde_json::to_vec(output)?;
+            rendered.push(b'\n');
+            Ok(rendered)
+        }
+    }
+}
+
+#[cfg(feature = "utrace")]
+fn render_utrace_dashboard_text_output(output: &UtraceDashboardOutput) -> String {
+    let mut rendered = String::new();
+    writeln!(rendered, "path: {}", output.path).unwrap();
+    if let Some(prologue) = &output.dashboard.prologue {
+        writeln!(
+            rendered,
+            "prologue: start_cycle={} cycle_frequency={}",
+            prologue.start_cycle, prologue.cycle_frequency
+        )
+        .unwrap();
+    }
+    writeln!(
+        rendered,
+        "threads: {} frames: {} cpu_specs: {} cpu_batches: {} cpu_intervals: {}",
+        output.dashboard.thread_info.len(),
+        output.dashboard.frames.len(),
+        output.dashboard.cpu.specs.len(),
+        output.dashboard.cpu.batches.count,
+        output.dashboard.cpu.batches.intervals
+    )
+    .unwrap();
+    for scope in output.dashboard.cpu.scopes.iter().take(20) {
+        match scope.total_seconds {
+            Some(seconds) => writeln!(
+                rendered,
+                "scope {} {:?}: count={} total_cycles={} total_seconds={}",
+                scope.spec_id, scope.name, scope.count, scope.total_cycles, seconds
+            )
+            .unwrap(),
+            None => writeln!(
+                rendered,
+                "scope {} {:?}: count={} total_cycles={}",
+                scope.spec_id, scope.name, scope.count, scope.total_cycles
+            )
+            .unwrap(),
+        }
+    }
+    for thread in output.dashboard.cpu.threads.iter().take(10) {
+        match thread.total_seconds {
+            Some(seconds) => writeln!(
+                rendered,
+                "thread {} {:?}: count={} total_cycles={} total_seconds={}",
+                thread.thread_id, thread.name, thread.count, thread.total_cycles, seconds
+            )
+            .unwrap(),
+            None => writeln!(
+                rendered,
+                "thread {} {:?}: count={} total_cycles={}",
+                thread.thread_id, thread.name, thread.count, thread.total_cycles
+            )
+            .unwrap(),
+        }
+        for scope in thread.scopes.iter().take(5) {
+            writeln!(
+                rendered,
+                "  scope {} {:?}: count={} total_cycles={}",
+                scope.spec_id, scope.name, scope.count, scope.total_cycles
+            )
+            .unwrap();
+        }
+    }
+    rendered
+}
+
+#[cfg(feature = "utrace")]
+fn render_utrace_text_output(output: &UtraceInspectOutput) -> String {
+    let mut rendered = String::new();
+    writeln!(rendered, "path: {}", output.path).unwrap();
+    writeln!(rendered, "magic: {:?}", output.trace.header.magic).unwrap();
+    writeln!(
+        rendered,
+        "transport: {} protocol: {} packet_stream_offset: {}",
+        output.trace.header.transport,
+        output.trace.header.protocol,
+        output.trace.header.packet_stream_offset
+    )
+    .unwrap();
+    if let Some(metadata_size) = output.trace.header.metadata_size {
+        writeln!(rendered, "metadata_size: {metadata_size}").unwrap();
+    }
+    writeln!(
+        rendered,
+        "packets: count={} sync={} threads={}",
+        output.trace.packets.count,
+        output.trace.packets.sync_count,
+        output.trace.packets.thread_count
+    )
+    .unwrap();
+    writeln!(
+        rendered,
+        "bytes: raw={} decoded={} compressed_payload={} compressed_decoded={}",
+        output.trace.packets.raw_bytes,
+        output.trace.packets.decoded_bytes,
+        output.trace.packets.compressed_payload_bytes,
+        output.trace.packets.compressed_decoded_bytes
+    )
+    .unwrap();
+    for thread in &output.trace.packets.threads {
+        writeln!(
+            rendered,
+            "thread {}: packets={} raw={} decoded={} compressed_payload={} compressed_decoded={}",
+            thread.thread_id,
+            thread.packet_count,
+            thread.raw_bytes,
+            thread.decoded_bytes,
+            thread.compressed_payload_bytes,
+            thread.compressed_decoded_bytes
+        )
+        .unwrap();
+    }
+    if let Some(prologue) = &output.trace.prologue {
+        writeln!(
+            rendered,
+            "prologue: start_cycle={} cycle_frequency={} endian=0x{:04x} pointer_size={} start_date_time={}",
+            prologue.start_cycle,
+            prologue.cycle_frequency,
+            prologue.endian,
+            prologue.pointer_size,
+            prologue.start_date_time
+        )
+        .unwrap();
+    }
+    writeln!(
+        rendered,
+        "thread_info: count={}",
+        output.trace.thread_info.len()
+    )
+    .unwrap();
+    for thread in &output.trace.thread_info {
+        writeln!(
+            rendered,
+            "thread_info {}: system_id={} sort_hint={} name={:?}",
+            thread.thread_id, thread.system_id, thread.sort_hint, thread.name
+        )
+        .unwrap();
+    }
+    writeln!(rendered, "events: count={}", output.trace.events.len()).unwrap();
+    for event in &output.trace.events {
+        writeln!(
+            rendered,
+            "event {}.{} uid={} fields={} important={} no_sync={} maybe_has_aux={} definition={}",
+            event.logger,
+            event.event,
+            event.uid,
+            event.fields.len(),
+            event.flags.important,
+            event.flags.no_sync,
+            event.flags.maybe_has_aux,
+            event.flags.definition
+        )
+        .unwrap();
+        for field in &event.fields {
+            match field.ref_uid {
+                Some(ref_uid) => writeln!(
+                    rendered,
+                    "  {}: {} {:?} offset={} size={} ref_uid={}",
+                    field.name, field.type_name, field.family, field.offset, field.size, ref_uid
+                )
+                .unwrap(),
+                None => writeln!(
+                    rendered,
+                    "  {}: {} {:?} offset={} size={}",
+                    field.name, field.type_name, field.family, field.offset, field.size
+                )
+                .unwrap(),
+            }
+        }
+    }
+    rendered
 }
 
 fn render_text_output(output: &InspectOutput) -> String {
@@ -343,6 +669,22 @@ fn render_text_output(output: &InspectOutput) -> String {
         for entry in &asset.string_table_entries {
             writeln!(rendered, "  {} = {}", entry.key, entry.source).unwrap();
         }
+        if !asset.bones.is_empty() {
+            writeln!(rendered, "  bones: {}", asset.bones.len()).unwrap();
+            for bone in &asset.bones {
+                writeln!(rendered, "    {} parent={}", bone.name, bone.parent_index).unwrap();
+            }
+        }
+    }
+    for error in &output.decode_errors {
+        writeln!(
+            rendered,
+            "decode_error: {} [{}] {}",
+            error.object_path,
+            error.kind,
+            error.message
+        )
+        .unwrap();
     }
     rendered
 }
@@ -384,6 +726,35 @@ fn write_error(format: OutputFormat, error: ErrorOutput) {
     }
 }
 
+#[cfg(feature = "utrace")]
+fn write_utrace_error(format: OutputFormat, error: UtraceErrorOutput) {
+    match format {
+        OutputFormat::Text => {
+            let location = match (error.offset, error.field.as_deref()) {
+                (Some(offset), Some(field)) => format!(" at byte {offset} ({field})"),
+                (Some(offset), None) => format!(" at byte {offset}"),
+                (None, Some(field)) => format!(" ({field})"),
+                (None, None) => String::new(),
+            };
+            eprintln!(
+                "uasset: {} error for {}{location}: {}",
+                error.kind, error.path, error.message
+            );
+        }
+        OutputFormat::Json => match serde_json::to_vec(&error) {
+            Ok(mut rendered) => {
+                rendered.push(b'\n');
+                if let Err(write_error) = io::stderr().lock().write_all(&rendered) {
+                    eprintln!("uasset: failed to write utrace error output: {write_error}");
+                }
+            }
+            Err(serialization_error) => {
+                eprintln!("uasset: failed to serialize utrace error: {serialization_error}");
+            }
+        },
+    }
+}
+
 fn exit_code_for_package_error(error: &PackageError) -> u8 {
     match error.kind() {
         PackageErrorKind::MalformedData => EXIT_MALFORMED,
@@ -393,12 +764,11 @@ fn exit_code_for_package_error(error: &PackageError) -> u8 {
     }
 }
 
-fn exit_code_for_asset_error(error: &AssetError) -> u8 {
+#[cfg(feature = "utrace")]
+fn exit_code_for_trace_error(error: &TraceError) -> u8 {
     match error.kind() {
-        AssetErrorKind::MalformedData => EXIT_MALFORMED,
-        AssetErrorKind::UnsupportedFormat
-        | AssetErrorKind::UnsupportedVersion
-        | AssetErrorKind::UnsupportedCapability => EXIT_UNSUPPORTED,
+        TraceErrorKind::MalformedData => EXIT_MALFORMED,
+        TraceErrorKind::UnsupportedFormat => EXIT_UNSUPPORTED,
     }
 }
 
@@ -409,6 +779,36 @@ struct InspectOutput {
     path: String,
     package: PackageOutput,
     assets: Vec<AssetOutput>,
+    /// Exports that failed to decode. Non-empty implies `status: "partial"`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    decode_errors: Vec<DecodeErrorOutput>,
+}
+
+#[derive(Serialize)]
+struct DecodeErrorOutput {
+    object_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class_path: Option<String>,
+    kind: &'static str,
+    message: String,
+}
+
+#[cfg(feature = "utrace")]
+#[derive(Serialize)]
+struct UtraceInspectOutput {
+    schema_version: u32,
+    status: &'static str,
+    path: String,
+    trace: TraceInspect,
+}
+
+#[cfg(feature = "utrace")]
+#[derive(Serialize)]
+struct UtraceDashboardOutput {
+    schema_version: u32,
+    status: &'static str,
+    path: String,
+    dashboard: TraceDashboard,
 }
 
 impl InspectOutput {
@@ -441,10 +841,14 @@ impl InspectOutput {
                 exports: TableOutput::from(summary.exports),
             },
             assets: Vec::new(),
+            decode_errors: Vec::new(),
         }
     }
 
-    fn from_package(path: String, source: &[u8], package: &Package) -> Result<Self, AssetError> {
+    /// Decodes every export, collecting per-export failures instead of aborting.
+    /// A single unsupported or malformed export no longer blanks the whole file;
+    /// callers report `status: "partial"` when `decode_errors` is non-empty.
+    fn from_package(path: String, source: &[u8], package: &Package) -> Self {
         let mut output = Self::from_summary(path, &package.summary);
         if let Some(table) = &mut output.package.soft_object_paths {
             table.parsed_count = package.soft_object_paths.len();
@@ -463,17 +867,37 @@ impl InspectOutput {
                         .push(asset_output_from_decoded(package, decoded));
                 }
                 Ok(None) => {}
-                Err(error) if error.kind() == AssetErrorKind::UnsupportedCapability => {}
-                Err(error) => return Err(error),
+                Err(error) => {
+                    output.decode_errors.push(DecodeErrorOutput {
+                        object_path: export.object_path.to_string(),
+                        class_path: export.class_path.as_ref().map(ToString::to_string),
+                        kind: asset_error_kind_name(error.kind()),
+                        message: error.message().to_owned(),
+                    });
+                }
             }
         }
-        Ok(output)
+        if !output.decode_errors.is_empty() {
+            output.status = "partial";
+        }
+        output
+    }
+}
+
+fn asset_error_kind_name(kind: AssetErrorKind) -> &'static str {
+    match kind {
+        AssetErrorKind::MalformedData => "malformed_data",
+        AssetErrorKind::UnsupportedFormat => "unsupported_format",
+        AssetErrorKind::UnsupportedVersion => "unsupported_version",
+        AssetErrorKind::UnsupportedCapability => "unsupported_capability",
     }
 }
 
 fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetOutput {
     match decoded {
         DecodedAsset::DataTable(datatable) => AssetOutput {
+            tail_bytes: 0,
+            bones: Vec::new(),
             kind: match datatable.kind {
                 uasset_parser::asset::DataTableKind::Plain => "DataTable",
                 uasset_parser::asset::DataTableKind::Composite => "CompositeDataTable",
@@ -506,6 +930,8 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
                 .collect(),
         },
         DecodedAsset::CurveTable(curve_table) => AssetOutput {
+            tail_bytes: 0,
+            bones: Vec::new(),
             kind: "CurveTable",
             object_path: curve_table.object_path.to_string(),
             class_path: Some(uasset_parser::asset::CURVETABLE_CLASS.to_owned()),
@@ -538,6 +964,8 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             rows: Vec::new(),
         },
         DecodedAsset::StringTable(string_table) => AssetOutput {
+            tail_bytes: 0,
+            bones: Vec::new(),
             kind: "StringTable",
             object_path: string_table.object_path.to_string(),
             class_path: Some(uasset_parser::asset::STRINGTABLE_CLASS.to_owned()),
@@ -563,6 +991,8 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             rows: Vec::new(),
         },
         DecodedAsset::DataAsset(data_asset) => AssetOutput {
+            tail_bytes: 0,
+            bones: Vec::new(),
             kind: data_asset_kind(data_asset.class_path.as_str()),
             object_path: data_asset.object_path.to_string(),
             class_path: Some(data_asset.class_path.to_string()),
@@ -594,11 +1024,42 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             struct_flags: None,
             struct_fields: Vec::new(),
             properties: property_outputs(package, &object.properties),
+            tail_bytes: object.tail.len(),
+            bones: Vec::new(),
+            row_count: 0,
+            curve_rows: Vec::new(),
+            rows: Vec::new(),
+        },
+        DecodedAsset::Skeleton(skeleton) => AssetOutput {
+            kind: "Skeleton",
+            object_path: skeleton.object_path.to_string(),
+            class_path: Some(SKELETON_CLASS.to_owned()),
+            object_guid: skeleton.object_guid.map(|guid| guid.to_string()),
+            row_struct: None,
+            parent_tables: Vec::new(),
+            string_table_namespace: None,
+            string_table_entries: Vec::new(),
+            enum_cpp_form: None,
+            enum_entries: Vec::new(),
+            struct_flags: None,
+            struct_fields: Vec::new(),
+            properties: property_outputs(package, &skeleton.properties),
+            tail_bytes: 0,
+            bones: skeleton
+                .bones
+                .iter()
+                .map(|bone| BoneOutput {
+                    name: resolve_name_or_placeholder(package, bone.name),
+                    parent_index: bone.parent_index,
+                })
+                .collect(),
             row_count: 0,
             curve_rows: Vec::new(),
             rows: Vec::new(),
         },
         DecodedAsset::Enum(decoded_enum) => AssetOutput {
+            tail_bytes: 0,
+            bones: Vec::new(),
             kind: "Enum",
             object_path: decoded_enum.object_path.to_string(),
             class_path: Some(USERDEFINEDENUM_CLASS.to_owned()),
@@ -625,6 +1086,8 @@ fn asset_output_from_decoded(package: &Package, decoded: DecodedAsset) -> AssetO
             rows: Vec::new(),
         },
         DecodedAsset::Struct(decoded_struct) => AssetOutput {
+            tail_bytes: 0,
+            bones: Vec::new(),
             kind: "Struct",
             object_path: decoded_struct.object_path.to_string(),
             class_path: Some(USERDEFINEDSTRUCT_CLASS.to_owned()),
@@ -740,10 +1203,27 @@ struct AssetOutput {
     struct_fields: Vec<StructFieldOutput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     properties: Vec<PropertyOutput>,
+    /// Count of unparsed class-specific bytes retained after the property stream
+    /// (e.g. a `StaticMesh`/`Texture2D` binary tail). Omitted when zero.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    tail_bytes: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    bones: Vec<BoneOutput>,
     row_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     curve_rows: Vec<CurveRowOutput>,
     rows: Vec<RowOutput>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Serialize)]
+struct BoneOutput {
+    name: String,
+    parent_index: i32,
 }
 
 #[derive(Serialize)]
@@ -1075,6 +1555,18 @@ struct ErrorOutput {
     offset: Option<u64>,
 }
 
+#[cfg(feature = "utrace")]
+#[derive(Serialize)]
+struct UtraceErrorOutput {
+    schema_version: u32,
+    status: &'static str,
+    path: String,
+    kind: &'static str,
+    message: String,
+    field: Option<String>,
+    offset: Option<u64>,
+}
+
 impl ErrorOutput {
     fn io(path: String, message: String) -> Self {
         Self {
@@ -1106,21 +1598,35 @@ impl ErrorOutput {
         }
     }
 
-    fn asset(path: String, error: &AssetError) -> Self {
+}
+
+#[cfg(feature = "utrace")]
+impl UtraceErrorOutput {
+    fn io(path: String, message: String) -> Self {
+        Self {
+            schema_version: UTRACE_SCHEMA_VERSION,
+            status: "error",
+            path,
+            kind: "io",
+            message,
+            field: None,
+            offset: None,
+        }
+    }
+
+    fn trace(path: String, error: &TraceError) -> Self {
         let kind = match error.kind() {
-            AssetErrorKind::MalformedData => "malformed_data",
-            AssetErrorKind::UnsupportedFormat => "unsupported_format",
-            AssetErrorKind::UnsupportedVersion => "unsupported_version",
-            AssetErrorKind::UnsupportedCapability => "unsupported_capability",
+            TraceErrorKind::MalformedData => "malformed_data",
+            TraceErrorKind::UnsupportedFormat => "unsupported_format",
         };
         Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: UTRACE_SCHEMA_VERSION,
             status: "error",
             path,
             kind,
-            message: error.message().to_owned(),
-            field: None,
-            offset: None,
+            message: error.detail().to_owned(),
+            field: Some(error.path().to_owned()),
+            offset: Some(error.offset()),
         }
     }
 }
@@ -1132,11 +1638,14 @@ uasset - inspect classic Unreal Engine asset packages
 
 Usage:
   uasset inspect <path|-> [--format text|json]
+  uasset utrace inspect <path|-> [--format text|json]
+  uasset utrace dashboard <path|-> [--format text|json]
   uasset help
   uasset version
 
 Commands:
   inspect    Parse one package summary. Use `-` to read package bytes from stdin.
+  utrace     Inspect or summarize Unreal Trace (`.utrace`) files when built with `--features utrace`.
 
 Output contract:
   stdout     Successful result only.
@@ -1188,5 +1697,39 @@ mod tests {
     fn rejects_multiple_inputs() {
         let error = Command::parse(vec!["inspect".into(), "one".into(), "two".into()]).unwrap_err();
         assert_eq!(error, "inspect accepts exactly one input");
+    }
+
+    #[test]
+    fn parses_utrace_inspect_contract() {
+        assert_eq!(
+            Command::parse(vec![
+                "utrace".into(),
+                "inspect".into(),
+                "trace.utrace".into(),
+                "--format=json".into()
+            ])
+            .unwrap(),
+            Command::Utrace(UtraceCommand::Inspect(InspectOptions {
+                input: Input::File(PathBuf::from("trace.utrace")),
+                format: OutputFormat::Json,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_utrace_dashboard_contract() {
+        assert_eq!(
+            Command::parse(vec![
+                "utrace".into(),
+                "dashboard".into(),
+                "trace.utrace".into(),
+                "--format=json".into()
+            ])
+            .unwrap(),
+            Command::Utrace(UtraceCommand::Dashboard(InspectOptions {
+                input: Input::File(PathBuf::from("trace.utrace")),
+                format: OutputFormat::Json,
+            }))
+        );
     }
 }

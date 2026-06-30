@@ -9,6 +9,10 @@ versioned tagged properties.
 
 ## Current status
 
+Per-class decode coverage and the prioritized backlog are tracked in
+[`docs/asset-coverage.md`](docs/asset-coverage.md). The feature changelog below
+records how the parser got here.
+
 Phases 1 through 6 are implemented:
 
 - Downward-only module skeleton
@@ -51,8 +55,14 @@ Phases 1 through 6 are implemented:
 - Package `SoftObjectPaths` summary table parsed as `FTopLevelAssetPath`
   (PackageName + AssetName name-map pairs) + subpath, so indexed soft-object
   references resolve to real paths
+- Generic exports decode as `UObject` (tagged properties + retained binary
+  `tail_bytes`); `*ImportData` sub-objects skip their leading JSON blob so
+  imported assets (StaticMesh, Texture2D, …) decode
+- Per-export resilient `inspect`: a single undecodable export no longer aborts the
+  file — decoded assets are emitted with failures in `decode_errors` and
+  `status: "partial"` (exit `6`)
 - `uasset inspect` command with text and schema-versioned JSON output
-  (current `schema_version` is 3)
+  (current `schema_version` is 5)
 - File and stdin input
 - Stable stdout/stderr and exit-code behavior
 
@@ -64,6 +74,18 @@ uasset inspect Asset.uasset --format json
 uasset inspect - --format json
 ```
 
+With `--features utrace`, the same binary also exposes preliminary UTrace
+inspection and dashboard summaries:
+
+```text
+uasset utrace inspect Trace.utrace
+uasset utrace inspect Trace.utrace --format json
+uasset utrace dashboard Trace.utrace --format json
+```
+
+UTrace parser coverage notes for future agents live in
+[`memory/utrace-coverage-matrix.md`](memory/utrace-coverage-matrix.md).
+
 Successful output is written only to stdout. Errors and diagnostics are written
 only to stderr.
 
@@ -74,6 +96,9 @@ Exit codes:
 - `3`: unsupported format, version, or capability
 - `4`: input/output failure
 - `5`: internal output failure
+- `6`: partial success — the package parsed but one or more exports failed to
+  decode; decoded assets are still emitted and the failures are listed in
+  `decode_errors` (JSON) with `status: "partial"`
 - `64`: invalid command-line usage
 
 Run checks with:
@@ -81,6 +106,13 @@ Run checks with:
 ```text
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
+```
+
+For UTrace work, include the feature:
+
+```text
+cargo test --all-targets --features utrace
+cargo clippy --all-targets --features utrace -- -D warnings
 ```
 
 ## Unreal Engine source
@@ -125,4 +157,21 @@ make absence a test failure in fixture-backed CI:
 
 ```text
 UASSET_REQUIRE_FIXTURE=1 cargo test --test fixture_project
+```
+
+## UTrace fixture
+
+The preliminary `.utrace` e2e tests are feature-gated and skip unless a real
+trace is provided. They cover both parser inspection and the CPU dashboard
+summary. Resolution order:
+
+1. `UTRACE_FIXTURE`
+2. first `*.utrace` in `UTRACE_FIXTURE_DIR`
+3. first `*.utrace` in studio default `D:\Perforce\Arif_Fixtures\Traces`
+
+When no fixture exists, the test skips so normal builds remain portable. To make
+absence a failure:
+
+```text
+UTRACE_REQUIRE_FIXTURE=1 cargo test --test utrace_fixture --features utrace
 ```

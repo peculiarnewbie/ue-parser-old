@@ -140,7 +140,16 @@ fn decode_typed_value(
         "Int64Property" => Ok(Some(PropertyValue::Int(
             payload.read_i64(&format!("{path}.Int64"))?,
         ))),
-        "ByteProperty" | "UInt8Property" => Ok(Some(PropertyValue::UInt(u64::from(
+        "UInt8Property" => Ok(Some(PropertyValue::UInt(u64::from(
+            payload.read_u8(&format!("{path}.UInt8"))?,
+        )))),
+        // A `ByteProperty` backed by a `UEnum` serializes its value as the enum
+        // entry `FName` (8 bytes); a plain byte serializes as a single `u8`
+        // (`UByteProperty::SerializeItem`). The payload size disambiguates.
+        "ByteProperty" if payload.remaining() != 1 => Ok(Some(PropertyValue::Enum(
+            payload.read_name_ref(&format!("{path}.Enum"))?,
+        ))),
+        "ByteProperty" => Ok(Some(PropertyValue::UInt(u64::from(
             payload.read_u8(&format!("{path}.UInt8"))?,
         )))),
         "UInt16Property" => Ok(Some(PropertyValue::UInt(u64::from(
@@ -847,6 +856,28 @@ mod tests {
                 reason: RawReason::DecoderRejected(_),
             }
         ));
+    }
+
+    #[test]
+    fn decodes_enum_backed_byte_property_as_name() {
+        // An enum-backed ByteProperty serializes its value as an 8-byte FName.
+        let names = vec!["ByteProperty".into(), "TC_Masks".into()];
+        let mut payload = Vec::new();
+        push_i32(&mut payload, 1); // name index -> names[1]
+        push_i32(&mut payload, 0); // name number
+
+        let value = decode_record(names, 0, Vec::new(), PropertyTagFlags(0), &payload);
+        assert_eq!(value, PropertyValue::Enum(crate::test_support::name_ref(1, 0)));
+    }
+
+    #[test]
+    fn decodes_plain_byte_property_as_uint() {
+        // A ByteProperty with no underlying enum serializes as a single u8.
+        let names = vec!["ByteProperty".into()];
+        let payload = vec![0x2A];
+
+        let value = decode_record(names, 0, Vec::new(), PropertyTagFlags(0), &payload);
+        assert_eq!(value, PropertyValue::UInt(0x2A));
     }
 
     #[test]

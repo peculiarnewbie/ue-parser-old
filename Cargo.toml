@@ -15,8 +15,14 @@ name = "uasset"
 path = "src/bin/uasset.rs"
 
 [dependencies]
+lz4_flex = { version = "0.11", optional = true, default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+[features]
+default = ["uasset"]
+uasset = []
+utrace = ["dep:lz4_flex"]
 
 [lints.rust]
 unsafe_code = "forbid"

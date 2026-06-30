@@ -9,6 +9,8 @@ pub mod codec;
 pub mod package;
 pub mod property;
 pub mod schema;
+#[cfg(feature = "utrace")]
+pub mod utrace;
 pub mod version;
 
 #[cfg(test)]

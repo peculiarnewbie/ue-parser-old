@@ -898,7 +898,7 @@ fn read_soft_object_path_list(
         let entry_path = format!("Summary.SoftObjectPaths[{index}]");
         let package = reader.read_name_ref(&format!("{entry_path}.PackageName"))?;
         let asset = reader.read_name_ref(&format!("{entry_path}.AssetName"))?;
-        let sub_path = reader.read_fstring(&format!("{entry_path}.SubPath"))?;
+        let sub_path = reader.read_soft_object_subpath(&format!("{entry_path}.SubPath"))?;
         let formatted = format_top_level_asset_path(names, package, asset, &sub_path);
         paths.push(sanitize_soft_object_path_table_entry(formatted));
     }

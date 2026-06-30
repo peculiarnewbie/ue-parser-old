@@ -465,6 +465,7 @@ impl<'a> Reader<'a> {
                 u32::try_from(signed_length).expect("positive i32 always fits in u32"),
                 length_offset,
                 path,
+                true,
             ),
             i32::MIN => Err(ArchiveError::new(
                 ArchiveErrorKind::InvalidCount,
@@ -472,7 +473,36 @@ impl<'a> Reader<'a> {
                 format!("{path}.Length"),
                 "wide string length cannot be i32::MIN",
             )),
-            _ => self.read_wide_string(signed_length.unsigned_abs(), length_offset, path),
+            _ => self.read_wide_string(signed_length.unsigned_abs(), length_offset, path, true),
+        }
+    }
+
+    /// Reads an `FSoftObjectPath` subpath string from the package summary table.
+    ///
+    /// Unlike a standard `FString`, this `FUtf8String`/workaround framing
+    /// (`FSoftObjectPath::SerializePathWithoutFixup`, UE `SoftObjectPath.cpp`)
+    /// stores an `i32` code-unit count followed by exactly that many units with
+    /// **no guaranteed null terminator** — older saves stripped trailing nulls
+    /// entirely. Read exactly `count` units and trim trailing nulls, which
+    /// tolerates both the unterminated and null-terminated forms.
+    pub(crate) fn read_soft_object_subpath(&mut self, path: &str) -> Result<String, ArchiveError> {
+        let length_offset = self.position;
+        let signed_length = self.read_i32(&format!("{path}.Length"))?;
+        match signed_length {
+            0 => Ok(String::new()),
+            1.. => self.read_ansi_string(
+                u32::try_from(signed_length).expect("positive i32 always fits in u32"),
+                length_offset,
+                path,
+                false,
+            ),
+            i32::MIN => Err(ArchiveError::new(
+                ArchiveErrorKind::InvalidCount,
+                length_offset,
+                format!("{path}.Length"),
+                "wide string length cannot be i32::MIN",
+            )),
+            _ => self.read_wide_string(signed_length.unsigned_abs(), length_offset, path, false),
         }
     }
 
@@ -567,9 +597,23 @@ impl<'a> Reader<'a> {
         code_units: u32,
         length_offset: u64,
         path: &str,
+        require_terminator: bool,
     ) -> Result<String, ArchiveError> {
         let code_units = self.validate_string_length(code_units, 1, length_offset, path)?;
         let bytes = self.read_bytes(code_units, &format!("{path}.Data"))?;
+
+        // Unreal's serialized ANSI form is an 8-bit code-unit string. This
+        // one-to-one mapping is lossless for byte values and avoids assuming UTF-8.
+        let to_string = |content: &[u8]| content.iter().map(|byte| char::from(*byte)).collect();
+
+        if !require_terminator {
+            let end = bytes
+                .iter()
+                .rposition(|&byte| byte != 0)
+                .map_or(0, |i| i + 1);
+            return Ok(to_string(&bytes[..end]));
+        }
+
         let Some((&terminator, content)) = bytes.split_last() else {
             return Err(ArchiveError::new(
                 ArchiveErrorKind::MissingNullTerminator,
@@ -586,10 +630,7 @@ impl<'a> Reader<'a> {
                 "ANSI FString does not end in a null byte",
             ));
         }
-
-        // Unreal's serialized ANSI form is an 8-bit code-unit string. This
-        // one-to-one mapping is lossless for byte values and avoids assuming UTF-8.
-        Ok(content.iter().map(|byte| char::from(*byte)).collect())
+        Ok(to_string(content))
     }
 
     fn read_wide_string(
@@ -597,12 +638,32 @@ impl<'a> Reader<'a> {
         code_units: u32,
         length_offset: u64,
         path: &str,
+        require_terminator: bool,
     ) -> Result<String, ArchiveError> {
         let code_units = self.validate_string_length(code_units, 2, length_offset, path)?;
         let mut units = Vec::with_capacity(code_units);
         for index in 0..code_units {
             units.push(self.read_u16(&format!("{path}.Data[{index}]"))?);
         }
+        let decode = |content: &[u16]| {
+            String::from_utf16(content).map_err(|error| {
+                ArchiveError::new(
+                    ArchiveErrorKind::InvalidString,
+                    length_offset,
+                    path,
+                    format!("wide FString is invalid UTF-16: {error}"),
+                )
+            })
+        };
+
+        if !require_terminator {
+            let end = units
+                .iter()
+                .rposition(|&unit| unit != 0)
+                .map_or(0, |i| i + 1);
+            return decode(&units[..end]);
+        }
+
         let Some((&terminator, content)) = units.split_last() else {
             return Err(ArchiveError::new(
                 ArchiveErrorKind::MissingNullTerminator,
@@ -619,14 +680,7 @@ impl<'a> Reader<'a> {
                 "wide FString does not end in a null code unit",
             ));
         }
-        String::from_utf16(content).map_err(|error| {
-            ArchiveError::new(
-                ArchiveErrorKind::InvalidString,
-                length_offset,
-                path,
-                format!("wide FString is invalid UTF-16: {error}"),
-            )
-        })
+        decode(content)
     }
 
     fn validate_string_length(
@@ -812,6 +866,55 @@ mod tests {
 
         let error = Reader::new(&bytes).read_fstring("Text").unwrap_err();
         assert_eq!(error.kind(), ArchiveErrorKind::InvalidString);
+    }
+
+    #[test]
+    fn reads_soft_object_subpath_without_trailing_null() {
+        // Real `FSoftObjectPath` summary entries store the subpath as an
+        // `FUtf8String`/workaround string whose `i32` count covers exactly the
+        // content bytes, with no null terminator (e.g. Blueprint
+        // `:UserConstructionScript`). A strict FString reader rejects these and
+        // killed the whole package parse; the tolerant reader must accept them.
+        let subpath = b"UserConstructionScript";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(subpath.len() as i32).to_le_bytes());
+        bytes.extend_from_slice(subpath);
+        // A second, empty entry confirms the cursor stopped exactly after 22 bytes.
+        bytes.extend_from_slice(&0_i32.to_le_bytes());
+
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            reader.read_soft_object_subpath("Sub").unwrap(),
+            "UserConstructionScript"
+        );
+        assert_eq!(reader.read_soft_object_subpath("Empty").unwrap(), "");
+        assert_eq!(reader.remaining(), 0);
+
+        // The strict reader must still reject the same unterminated bytes, so we
+        // did not weaken normal FString parsing.
+        let strict = Reader::new(&bytes).read_fstring("Sub").unwrap_err();
+        assert_eq!(strict.kind(), ArchiveErrorKind::MissingNullTerminator);
+    }
+
+    #[test]
+    fn reads_soft_object_subpath_tolerating_trailing_nulls() {
+        // Newer saves include the null in the count; trimming trailing nulls
+        // yields the same string from either framing. Also exercises the wide form.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&11_i32.to_le_bytes());
+        bytes.extend_from_slice(b"EventGraph\0");
+        bytes.extend_from_slice(&(-2_i32).to_le_bytes());
+        for unit in "猫\0".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            reader.read_soft_object_subpath("Ansi").unwrap(),
+            "EventGraph"
+        );
+        assert_eq!(reader.read_soft_object_subpath("Wide").unwrap(), "猫");
+        assert_eq!(reader.remaining(), 0);
     }
 
     #[test]

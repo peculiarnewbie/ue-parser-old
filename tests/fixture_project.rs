@@ -420,6 +420,7 @@ fn with_decoded_datatable(
         DecodedAsset::UObject(_) => panic!("expected DataTable in {}", path.display()),
         DecodedAsset::Enum(_) => panic!("expected DataTable in {}", path.display()),
         DecodedAsset::Struct(_) => panic!("expected DataTable in {}", path.display()),
+        DecodedAsset::Skeleton(_) => panic!("expected DataTable in {}", path.display()),
     };
     check(&package, &datatable);
 }
@@ -461,6 +462,7 @@ fn with_decoded_data_asset(
         DecodedAsset::UObject(_) => panic!("expected DataAsset in {}", path.display()),
         DecodedAsset::Enum(_) => panic!("expected DataAsset in {}", path.display()),
         DecodedAsset::Struct(_) => panic!("expected DataAsset in {}", path.display()),
+        DecodedAsset::Skeleton(_) => panic!("expected DataAsset in {}", path.display()),
     };
     check(&package, &data_asset);
 }
@@ -502,6 +504,7 @@ fn with_decoded_curve_table(
         DecodedAsset::UObject(_) => panic!("expected CurveTable in {}", path.display()),
         DecodedAsset::Enum(_) => panic!("expected CurveTable in {}", path.display()),
         DecodedAsset::Struct(_) => panic!("expected CurveTable in {}", path.display()),
+        DecodedAsset::Skeleton(_) => panic!("expected CurveTable in {}", path.display()),
     };
     check(&package, &curve_table);
 }
@@ -543,6 +546,7 @@ fn with_decoded_string_table(
         DecodedAsset::UObject(_) => panic!("expected StringTable in {}", path.display()),
         DecodedAsset::Enum(_) => panic!("expected StringTable in {}", path.display()),
         DecodedAsset::Struct(_) => panic!("expected StringTable in {}", path.display()),
+        DecodedAsset::Skeleton(_) => panic!("expected StringTable in {}", path.display()),
     };
     check(&package, &string_table);
 }
@@ -745,6 +749,7 @@ fn with_decoded_uobject(
         Some(DecodedAsset::DataAsset(_)) => panic!("expected UObject in {}", path.display()),
         Some(DecodedAsset::Enum(_)) => panic!("expected UObject in {}", path.display()),
         Some(DecodedAsset::Struct(_)) => panic!("expected UObject in {}", path.display()),
+        Some(DecodedAsset::Skeleton(_)) => panic!("expected UObject in {}", path.display()),
         None => panic!("no decoder matched export in {}", path.display()),
     };
     check(&package, &object);
@@ -965,6 +970,7 @@ fn shared_fixture_datatables_decode_row_names() {
             DecodedAsset::UObject(_) => panic!("expected DataTable in {}", path.display()),
             DecodedAsset::Enum(_) => panic!("expected DataTable in {}", path.display()),
             DecodedAsset::Struct(_) => panic!("expected DataTable in {}", path.display()),
+            DecodedAsset::Skeleton(_) => panic!("expected DataTable in {}", path.display()),
         };
 
         let Some(row_struct_path) = datatable.row_struct.as_ref() else {
@@ -1451,7 +1457,7 @@ fn shared_fixture_corpus_matches_the_spawned_cli_contract() {
 
         let json: Value = serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|error| panic!("invalid JSON for {}: {error}", path.display()));
-        assert_eq!(json["schema_version"], 3, "{}", path.display());
+        assert_eq!(json["schema_version"], 6, "{}", path.display());
         assert_eq!(json["status"], "ok", "{}", path.display());
         assert_eq!(
             json["package"]["name"],

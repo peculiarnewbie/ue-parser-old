@@ -50,6 +50,28 @@ path; see [[fixture-ground-truth-contract]].
 
 See also [[swag-datatable-plugin-roadmap]] for plugin-side improvements.
 
-## Still open
+## SubPath has NO trailing null terminator — FIXED 2026-07-01
 
-- (none for the header table parse)
+The summary table entry's SubPathString is serialized as `FUtf8String` /
+`SoftObjectPathLoadSubPathWorkaround` (`SoftObjectPath.cpp:452/539`): an `i32`
+count followed by exactly `count` bytes (ANSI) or `count*2` (wide), with **no
+null terminator** and trailing nulls stripped. The old `read_fstring` required a
+null byte, so any entry with a **non-empty** subpath failed with "ANSI FString
+does not end in a null byte", killing the whole package parse.
+
+- Empty subpaths (len 0) parsed fine → why the fixture (asset-level refs) and most
+  assets worked; the bug only bit refs into sub-objects (Blueprint
+  `UserConstructionScript`/`EventGraph`/named anchors).
+- Impact: **791 / 6625 (~12%) of `MBPrototype/Content/Mana` failed entirely** on
+  this alone.
+- Fix (landed): added `Reader::read_soft_object_subpath` (`src/archive.rs`) — a
+  tolerant reader that reads exactly `count` units and trims trailing nulls,
+  handling both unterminated and null-included framings. `read_soft_object_path_list`
+  (`src/package.rs`) now uses it for the SubPath. The general `read_fstring` is
+  unchanged (still requires the null) via a new `require_terminator` flag on the
+  ansi/wide readers — a regression test asserts the strict reader still rejects the
+  same bytes. The `AssetPath` FName-pair framing was already correct.
+- Verified: catalog re-run shows **6625/6625 parse OK (0 package failures)**;
+  decoded primaries rose 1120 → 1892. Tests:
+  `reads_soft_object_subpath_without_trailing_null`,
+  `reads_soft_object_subpath_tolerating_trailing_nulls`.

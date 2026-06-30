@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::archive::{ArchiveError, ArchiveErrorKind, Guid, NameRef};
+use crate::archive::{ArchiveError, ArchiveErrorKind, Guid, NameRef, Span};
 use crate::codec::{DecodeContext, decode_property_stream_values};
 use crate::package::{Export, ObjectPath, Package, PackageError, PackageIndex};
 use crate::property::{
@@ -25,6 +25,7 @@ pub const PRIMARY_DATA_ASSET_CLASS: &str = "/Script/Engine.PrimaryDataAsset";
 pub const STRINGTABLE_CLASS: &str = "/Script/Engine.StringTable";
 pub const USERDEFINEDENUM_CLASS: &str = "/Script/Engine.UserDefinedEnum";
 pub const USERDEFINEDSTRUCT_CLASS: &str = "/Script/CoreUObject.UserDefinedStruct";
+pub const SKELETON_CLASS: &str = "/Script/Engine.Skeleton";
 
 /// Package/meta exports that share the package file but are not inspectable assets.
 const SKIP_UOBJECT_DECODE_CLASSES: &[&str] = &[
@@ -71,6 +72,25 @@ pub enum DecodedAsset {
     UObject(DecodedUObject),
     Enum(DecodedEnum),
     Struct(DecodedStruct),
+    Skeleton(DecodedSkeleton),
+}
+
+/// A decoded `USkeleton` export: its tagged properties plus the
+/// `FReferenceSkeleton` bone hierarchy parsed from the export tail.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedSkeleton {
+    pub object_path: ObjectPath,
+    pub object_guid: Option<Guid>,
+    pub properties: PropertyStream,
+    pub bones: Vec<SkeletonBone>,
+}
+
+/// One bone from a `USkeleton`'s `FReferenceSkeleton` (`FMeshBoneInfo`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkeletonBone {
+    pub name: NameRef,
+    /// Index into the bone array of this bone's parent; `-1` for the root.
+    pub parent_index: i32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -87,6 +107,11 @@ pub struct DecodedUObject {
     pub class_path: ObjectPath,
     pub object_guid: Option<Guid>,
     pub properties: PropertyStream,
+    /// Unparsed class-specific bytes after the tagged-property stream (and any
+    /// object-guid footer). Empty when the export is a plain property object.
+    /// Retained rather than decoded so classes with a binary tail (e.g.
+    /// `StaticMesh`, `SkeletalMesh`, `Texture2D`) still surface their properties.
+    pub tail: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1062,6 +1087,99 @@ fn read_field_metadata(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub struct SkeletonDecoder;
+
+impl AssetDecoder for SkeletonDecoder {
+    fn supports(&self, class_path: &ObjectPath) -> bool {
+        class_path.as_str() == SKELETON_CLASS
+    }
+
+    fn decode(
+        &self,
+        export: &Export,
+        context: &AssetDecodeContext<'_>,
+    ) -> Result<DecodedAsset, AssetError> {
+        let Some(class_path) = export.class_path.as_ref() else {
+            return Err(AssetError::new(
+                AssetErrorKind::UnsupportedFormat,
+                format!("export {} has no resolved class", export.object_path),
+            ));
+        };
+        if class_path.as_str() != SKELETON_CLASS {
+            return Err(AssetError::new(
+                AssetErrorKind::UnsupportedFormat,
+                format!("unsupported asset class {class_path}"),
+            ));
+        }
+
+        let (properties, mut reader) = decode_uobject_properties(export, context)?;
+        // `USkeleton::Serialize` runs `Super::Serialize` (properties + object-guid
+        // footer) then `Ar << ReferenceSkeleton`.
+        let object_guid = consume_inline_object_guid_footer(&mut reader, &export.object_path)?;
+
+        // `FReferenceSkeleton`: `TArray<FMeshBoneInfo>` (FName Name, i32 ParentIndex,
+        // and an editor-only FString ExportName) — the bone pose array and the rest
+        // of the tail are left unparsed.
+        let editor_data_present = !context
+            .package
+            .summary
+            .versions
+            .package_flags
+            .contains(crate::version::PackageFlags::FILTER_EDITOR_ONLY);
+        let count_offset = reader.tell();
+        let count = reader.read_i32(&format!("{}.ReferenceSkeleton.Num", export.object_path))?;
+        if count < 0 {
+            return Err(AssetError::new(
+                AssetErrorKind::MalformedData,
+                format!("negative reference-skeleton bone count {count} at byte {count_offset}"),
+            ));
+        }
+        let mut bones = Vec::with_capacity(usize::try_from(count).expect("i32 fits in usize"));
+        for index in 0..count {
+            let path = format!("{}.ReferenceSkeleton.Bones[{index}]", export.object_path);
+            let name = reader.read_name_ref(&format!("{path}.Name"))?;
+            let parent_index = reader.read_i32(&format!("{path}.ParentIndex"))?;
+            if editor_data_present {
+                reader.read_fstring(&format!("{path}.ExportName"))?;
+            }
+            bones.push(SkeletonBone { name, parent_index });
+        }
+
+        Ok(DecodedAsset::Skeleton(DecodedSkeleton {
+            object_path: export.object_path.clone(),
+            object_guid,
+            properties,
+            bones,
+        }))
+    }
+}
+
+/// Consumes a UObject object-guid footer that is followed by more class-specific
+/// data (so [`consume_uobject_export_footer`]'s end-of-stream sizing cannot be
+/// used). The footer is a `0` `i32` (no guid) or a `1` marker plus an `FGuid`.
+fn consume_inline_object_guid_footer(
+    reader: &mut crate::archive::Reader<'_>,
+    object_path: &ObjectPath,
+) -> Result<Option<Guid>, AssetError> {
+    let offset = reader.tell();
+    let marker = reader
+        .read_i32(&format!("{object_path}.ExportFooter.HasObjectGuid"))
+        .map_err(AssetError::from)?;
+    match marker {
+        0 => Ok(None),
+        1 => Ok(Some(
+            reader
+                .read_guid(&format!("{object_path}.ExportFooter.ObjectGuid"))
+                .map_err(AssetError::from)?,
+        )),
+        other => Err(AssetError::new(
+            AssetErrorKind::MalformedData,
+            format!("unexpected object-guid footer marker {other} at byte {offset}"),
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct UObjectDecoder;
 
 impl AssetDecoder for UObjectDecoder {
@@ -1087,14 +1205,16 @@ impl AssetDecoder for UObjectDecoder {
             ));
         }
 
-        let (properties, class_path, object_guid) =
-            decode_uobject_asset_properties(export, context)?;
+        let (properties, mut reader) = decode_uobject_properties(export, context)?;
+        let (object_guid, tail) =
+            consume_uobject_export_footer_lenient(&mut reader, &export.object_path)?;
 
         Ok(DecodedAsset::UObject(DecodedUObject {
             object_path: export.object_path.clone(),
-            class_path,
+            class_path: class_path.clone(),
             object_guid,
             properties,
+            tail,
         }))
     }
 }
@@ -1133,6 +1253,9 @@ pub fn decode_export(
     if StructDecoder.supports(class_path) {
         return StructDecoder.decode(export, context).map(Some);
     }
+    if SkeletonDecoder.supports(class_path) {
+        return SkeletonDecoder.decode(export, context).map(Some);
+    }
     if UObjectDecoder.supports(class_path) {
         return UObjectDecoder.decode(export, context).map(Some);
     }
@@ -1154,11 +1277,41 @@ fn decode_uobject_asset_properties(
     Ok((properties, class_path, object_guid))
 }
 
+/// `UAssetImportData::Serialize` writes a JSON `FString` *before* its parent's
+/// tagged-property stream when editor data is present (uncooked packages). Every
+/// `*ImportData` sub-object (`FbxStaticMeshImportData`, `InterchangeAssetImportData`,
+/// …) inherits this, so the property stream does not start at byte 0 of the export.
+fn is_asset_import_data_class(class_path: &str) -> bool {
+    class_path
+        .rsplit('.')
+        .next()
+        .is_some_and(|leaf| leaf.ends_with("ImportData"))
+}
+
 fn decode_uobject_properties<'a>(
     export: &'a Export,
     context: &'a AssetDecodeContext<'a>,
 ) -> Result<(PropertyStream, crate::archive::Reader<'a>), AssetError> {
     let mut reader = context.package.export_reader(context.source, export)?;
+
+    // Consume the leading `UAssetImportData` JSON blob before the property stream.
+    let editor_data_present = !context
+        .package
+        .summary
+        .versions
+        .package_flags
+        .contains(crate::version::PackageFlags::FILTER_EDITOR_ONLY);
+    if editor_data_present
+        && export
+            .class_path
+            .as_ref()
+            .is_some_and(|class| is_asset_import_data_class(class.as_str()))
+    {
+        reader
+            .read_fstring(&format!("{}.AssetImportData.Json", export.object_path))
+            .map_err(AssetError::from)?;
+    }
+
     let mut properties = read_uobject_tagged_property_stream(
         &mut reader,
         &context.package.summary.versions,
@@ -1221,6 +1374,46 @@ fn consume_uobject_export_footer(
         ));
     }
     Ok(None)
+}
+
+/// Like [`consume_uobject_export_footer`], but never fails on unexpected trailing
+/// bytes: classes with a binary tail (`StaticMesh`, `Texture2D`, …) keep
+/// arbitrary data after their properties. A canonical object-guid footer (a zero
+/// `i32`, or a `1` marker + `FGuid`) is consumed and reported; anything else is
+/// returned verbatim as a raw tail [`Span`] for callers to surface or ignore.
+fn consume_uobject_export_footer_lenient(
+    reader: &mut crate::archive::Reader<'_>,
+    object_path: &ObjectPath,
+) -> Result<(Option<Guid>, Span), AssetError> {
+    let start = reader.tell();
+    let empty = Span::new(start, 0).map_err(AssetError::from)?;
+    match reader.remaining() {
+        0 => Ok((None, empty)),
+        4 => {
+            let footer = reader
+                .read_i32(&format!("{object_path}.ExportFooter"))
+                .map_err(AssetError::from)?;
+            if footer == 0 {
+                Ok((None, empty))
+            } else {
+                Ok((None, Span::new(start, 4).map_err(AssetError::from)?))
+            }
+        }
+        20 => {
+            let has_guid = reader
+                .read_i32(&format!("{object_path}.ExportFooter.HasObjectGuid"))
+                .map_err(AssetError::from)?;
+            if has_guid == 1 {
+                let guid = reader
+                    .read_guid(&format!("{object_path}.ExportFooter.ObjectGuid"))
+                    .map_err(AssetError::from)?;
+                Ok((Some(guid), empty))
+            } else {
+                Ok((None, Span::new(start, 20).map_err(AssetError::from)?))
+            }
+        }
+        remaining => Ok((None, Span::new(start, remaining).map_err(AssetError::from)?)),
+    }
 }
 
 fn decode_simple_curve_keys(
@@ -1634,6 +1827,150 @@ mod tests {
         assert_eq!(row.name, name_ref(3, 0));
         let value = &row.properties.records[0].value;
         assert_eq!(value, &PropertyValue::Int(4243));
+    }
+
+    #[test]
+    fn generic_uobject_retains_binary_tail_instead_of_failing() {
+        // A class with a binary tail after its tagged properties (e.g. StaticMesh)
+        // must still decode: properties surfaced, tail retained as a raw span.
+        let mut properties = Vec::new();
+        write_int_property_tag(&mut properties, 2, 1, 7);
+        let mut export_bytes = write_uobject_export(0, &properties);
+        let tail = [0xAB_u8; 94];
+        export_bytes.extend_from_slice(&tail);
+
+        let package = test_package(names());
+        let export = test_export(
+            export_bytes.len() as u64,
+            "/Game/Test/SM_Test.SM_Test",
+            "/Script/Engine.StaticMesh",
+        );
+        let schemas = EmptySchemas;
+        let context = AssetDecodeContext {
+            source: &export_bytes,
+            package: &package,
+            schemas: &schemas,
+        };
+
+        let Some(DecodedAsset::UObject(object)) =
+            decode_export(&export, &context).expect("decode should not fail on a binary tail")
+        else {
+            panic!("expected a generic UObject decode");
+        };
+        assert_eq!(object.tail.len(), 94);
+        assert!(object.object_guid.is_none());
+        assert_eq!(object.class_path.as_str(), "/Script/Engine.StaticMesh");
+        assert_eq!(object.properties.records[0].value, PropertyValue::Int(7));
+    }
+
+    #[test]
+    fn skeleton_decoder_parses_reference_skeleton_bones() {
+        // USkeleton tail = object-guid footer, then FReferenceSkeleton:
+        // i32 count, then per bone (FName Name, i32 ParentIndex, FString ExportName).
+        let bone_names = vec!["None".to_string(), "root".to_string(), "child".to_string()];
+        let mut export_bytes = write_uobject_export(0, &[]);
+        push_i32(&mut export_bytes, 0); // object-guid footer (no guid)
+        push_i32(&mut export_bytes, 2); // bone count
+        push_i32(&mut export_bytes, 1); // bone[0].Name -> "root"
+        push_i32(&mut export_bytes, 0); // bone[0].Name.Number
+        push_i32(&mut export_bytes, -1); // bone[0].ParentIndex (root)
+        push_fstring(&mut export_bytes, "root");
+        push_i32(&mut export_bytes, 2); // bone[1].Name -> "child"
+        push_i32(&mut export_bytes, 0);
+        push_i32(&mut export_bytes, 0); // bone[1].ParentIndex -> root
+        push_fstring(&mut export_bytes, "child");
+
+        let package = test_package(bone_names);
+        let export = test_export(
+            export_bytes.len() as u64,
+            "/Game/Test/SKEL_Test.SKEL_Test",
+            SKELETON_CLASS,
+        );
+        let schemas = EmptySchemas;
+        let context = AssetDecodeContext {
+            source: &export_bytes,
+            package: &package,
+            schemas: &schemas,
+        };
+
+        let Some(DecodedAsset::Skeleton(skeleton)) =
+            decode_export(&export, &context).expect("skeleton should decode")
+        else {
+            panic!("expected a Skeleton decode");
+        };
+        assert_eq!(skeleton.bones.len(), 2);
+        assert_eq!(skeleton.bones[0].parent_index, -1);
+        assert_eq!(skeleton.bones[1].parent_index, 0);
+        assert_eq!(
+            package.resolve_name(skeleton.bones[0].name).as_deref(),
+            Some("root")
+        );
+        assert_eq!(
+            package.resolve_name(skeleton.bones[1].name).as_deref(),
+            Some("child")
+        );
+    }
+
+    #[test]
+    fn asset_import_data_skips_leading_json_before_property_stream() {
+        // UAssetImportData subclasses serialize a JSON FString before their tagged
+        // properties. The decoder must consume it so the property stream aligns.
+        let mut properties = Vec::new();
+        write_int_property_tag(&mut properties, 2, 1, 9);
+        let mut export_bytes = Vec::new();
+        push_fstring(&mut export_bytes, "{\"SourceData\":[]}");
+        export_bytes.extend_from_slice(&write_uobject_export(0, &properties));
+
+        let package = test_package(names());
+        let export = test_export(
+            export_bytes.len() as u64,
+            "/Game/Test/SM_Test.SM_Test.FbxStaticMeshImportData_0",
+            "/Script/UnrealEd.FbxStaticMeshImportData",
+        );
+        let schemas = EmptySchemas;
+        let context = AssetDecodeContext {
+            source: &export_bytes,
+            package: &package,
+            schemas: &schemas,
+        };
+
+        let Some(DecodedAsset::UObject(object)) = decode_export(&export, &context)
+            .expect("import-data export with a leading JSON blob should decode")
+        else {
+            panic!("expected a generic UObject decode");
+        };
+        assert_eq!(object.properties.records[0].value, PropertyValue::Int(9));
+    }
+
+    #[test]
+    fn generic_uobject_consumes_zero_footer_without_tail() {
+        // A plain property object (no class tail) still consumes its canonical
+        // zero object-guid footer and reports an empty tail.
+        let mut properties = Vec::new();
+        write_int_property_tag(&mut properties, 2, 1, 7);
+        let mut export_bytes = write_uobject_export(0, &properties);
+        push_i32(&mut export_bytes, 0); // canonical zero object-guid footer
+
+        let package = test_package(names());
+        let export = test_export(
+            export_bytes.len() as u64,
+            "/Game/Test/O_Test.O_Test",
+            "/Script/Engine.SomePlainObject",
+        );
+        let schemas = EmptySchemas;
+        let context = AssetDecodeContext {
+            source: &export_bytes,
+            package: &package,
+            schemas: &schemas,
+        };
+
+        let Some(DecodedAsset::UObject(object)) =
+            decode_export(&export, &context).expect("decode")
+        else {
+            panic!("expected a generic UObject decode");
+        };
+        assert_eq!(object.tail.len(), 0);
+        assert!(object.object_guid.is_none());
     }
 
     #[test]

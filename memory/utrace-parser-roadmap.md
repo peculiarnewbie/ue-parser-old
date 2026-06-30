@@ -5,10 +5,25 @@ metadata:
   type: plan
 ---
 
-Goal: add a `utrace inspect` subcommand to the existing `uasset` CLI that
-parses `.utrace` files produced by UE 5.7's `TraceLog` runtime, using the
-same integration contract (schema-versioned JSON on stdout, diagnostics on
-stderr, shared exit-code ladder). Format reference: [[utrace-format-deepdive]].
+Goal: add UTrace (`.utrace`) parsing to the existing `uasset` CLI so tools can
+quickly extract dashboard-grade performance facts from Unreal Insights traces,
+while preserving enough identity to deep-dive in the original trace file.
+Format reference: [[utrace-format-deepdive]].
+
+The first product milestone is **not** a full Unreal Insights replacement. It is
+a fast extraction layer:
+
+- `utrace inspect`: parser/debug surface for headers, packets, event registry,
+  decoded core events, and raw fallbacks.
+- `utrace dashboard --format json`: stable, curated dashboard contract for
+  frame timings, CPU scope summaries, thread names, regions/bookmarks, and trace
+  provenance.
+
+Both commands follow the repo's existing integration rules: schema-versioned
+JSON on stdout, diagnostics on stderr, shared exit-code ladder. Dashboard rows
+must carry enough provenance to reopen/correlate with the source trace: trace
+path/id where available, thread id/name, frame index, scope/event ids, cycles,
+seconds, and source file/line when `CpuProfiler.EventSpec` provides it.
 
 ## Decision: one binary, feature-gated LZ4
 
@@ -52,9 +67,9 @@ verifiable against the local UE 5.7 tree.
 - `src/bin/main.rs` (or existing entrypoint) dispatches on the first arg:
   `uasset` (default) vs `utrace`.
 - Bounded LE reader reused from `src/archive.rs`.
-- Parse: 4-byte magic → `'TRC2'` (skip `u16`-prefixed metadata) / `'TRCE'`
-  (no metadata) / `0x00000001` (legacy, protocol 0/transport 1) / reject
-  `'2CRT'`/`'ECRT'` (big-endian). Read `{u8 transport, u8 protocol}`; reject
+- Parse raw 4-byte magic → `2CRT` (modern TRC2; skip `u16`-prefixed metadata)
+  / `ECRT` (TRCE, no metadata) / `0x00000001` (legacy, protocol 0/transport 1)
+  / reject swapped `TRC2`/`TRCE` (big-endian). Read `{u8 transport, u8 protocol}`; reject
   `transport != 4` and `protocol > 7` with exit code 3 (unsupported format).
 - CLI output: a `header` summary (magic variant, transport, protocol,
   metadata blob length if present). Schema-versioned JSON.
@@ -86,8 +101,9 @@ verifiable against the local UE 5.7 tree.
   prologue (`Writer.cpp:77`/`952`): `StartCycle`, `CycleFrequency`,
   `Endian=0x524d`, `PointerSize`, `StartDateTime`. Surface these in
   `inspect` output.
-- Decode thread-spec / thread-name events as the registry matures (these are
-  the other important event most files declare early).
+- Decode `$Trace.ThreadInfo` / `$Trace.ThreadGroupBegin/End` as the registry
+  matures. These are important events and provide the thread id/name/system id
+  data needed for dashboard grouping.
 
 ### Phase 5 — Normal events + serial-ordered dispatch
 - Per-thread event framing per protocol (P5/6/7 share): 1-2 byte uid
@@ -101,18 +117,26 @@ verifiable against the local UE 5.7 tree.
   and Protocol7 `EnterScope_TA/TB`/`LeaveScope_TA/TB` known events
   (`Engine.cpp:5045`/`5062`).
 
-### Phase 6a — Core field decode (supported subset + raw fallback)
+### Phase 6a — Dashboard MVP (core subset + raw fallback)
 - Per-field value decode matching `IAnalyzer::FEventData::GetValue/GetString/GetArray`
   (`Engine.cpp:862`/`879`/`844`). Integer/float/pointer from `SizeAndType`
   sign and width; ansi/wide strings; arrays from aux blobs keyed by
   `FieldIndex`; Protocol6 reference fields resolved to their target event uid.
-- **Decode a supported subset of event families; report everything else as
+- **Decode only the dashboard-critical subset first; report everything else as
   raw `{uid, logger, event, size, hex}`.** This bounds Phase 6 to a known
-  surface. The supported subset is chosen by what's fundamental + what a
-  timing-profile inspection needs.
-- Finalize `utrace inspect` JSON output, schema-versioned (start at 1).
-  Text output for human consumption, `--format json` for the integration
-  contract.
+  surface and gets useful performance data before broad event-family coverage.
+- Implement the CPU timing path end-to-end:
+  - `$Trace.NewTrace` for cycle-to-seconds conversion and base date.
+  - `$Trace.ThreadInfo` / thread groups for thread labels.
+  - `Misc.BeginFrame/EndFrame` for frame intervals.
+  - `Misc.RegionBegin[WithId]` / `RegionEnd[WithId]` and
+    `Misc.BookmarkSpec` / `Bookmark` for annotations.
+  - `CpuProfiler.EventSpec` for `SpecId -> {name, file, line}`.
+  - `CpuProfiler.EventBatchV3` for per-thread scope begin/end intervals.
+- Add `utrace dashboard --format json` with schema version 1. This is the
+  stable dashboard contract and should emit aggregated frame/thread/scope facts
+  plus provenance. Keep `utrace inspect --format json` as the broader parser
+  inspection/debug contract.
 - Fixture test against a `.utrace` captured from the local UE 5.7 tree.
   Resolution order mirrors `uasset`: `UTRACE_FIXTURE_DIR` env var, then a
   studio default; skip when no fixture exists so portable builds stay green.
@@ -122,6 +146,10 @@ verifiable against the local UE 5.7 tree.
 Each family is a self-contained module that can be added independently
 behind its own feature flag or `--event-family=<name>` CLI opt-in. No
 family in 6b blocks 6a from shipping.
+
+Candidates after the dashboard MVP: `Counters`, `GpuProfiler`, `Memory`/`LLM`,
+`LoadTime`/`IoDispatcher`, `PlatformFile`, `Logging`, `CsvProfiler`, `Tasks`,
+and `NetTrace`.
 
 ## Event family discovery — where the schemas live
 
@@ -178,17 +206,28 @@ The one event in the 6a subset that needs family-specific decode logic.
 `EventBatchV3` carries a single `uint8[] Data` field (an aux blob) containing
 a variable-length-encoded stream of timer scope enter/leave events. The
 encoding (from `CpuProfilerTrace.cpp` and `CpuProfilerTraceAnalysis.cpp`):
-- Each entry is a varint-encoded `uid` (the `EventSpec` id) followed by a
-  zigzag-encoded delta cycle count, with enter/leave distinguished by a bit
-  in the uid or a separate opcode.
+- Each entry starts with an unsigned 7-bit varint. The upper bits are a cycle
+  delta (`decoded >> 2`); the low two bits are an opcode.
+- Opcode `01`: begin scope. The next unsigned 7-bit varint is the id payload.
+  In V3, payload bit 0 selects metadata id vs plain spec id; plain spec id is
+  `payload >> 1` and maps through `CpuProfiler.EventSpec`.
+- Opcode `00`: end scope. No following id payload.
+- Opcode `11`: coroutine resume. Followed by coroutine id and timer-scope
+  depth varints.
+- Opcode `10`: coroutine suspend. Followed by timer-scope depth varint.
+- `ActualCycle` is reconstructed like UE's analyzer: start with the current
+  thread `LastCycle`; add the decoded delta when needed, and use the event
+  context's base cycle to recover late-connect streams.
 - The analyzer (`CpuProfilerTraceAnalysis.cpp`, ~40KB) decodes this into
   scope enter/leave pairs with timestamps. This is the most complex single
   decoder in the 6a subset but it's self-contained — no dependency on other
   families beyond `EventSpec` (which provides the timer name → id mapping).
 
-7-bit varint and zigzag encoding helpers already exist conceptually in
-`MiscTrace.h:37` (`FTraceUtils::Encode7bit` / `EncodeZigZag`) — the Rust
-port is trivial (`varint` crate or hand-rolled, ~20 lines).
+7-bit varint and zigzag helpers both exist in `MiscTrace.h:37`, but normal
+`EventBatchV3` CPU scope timing uses unsigned 7-bit varints, not zigzag.
+Zigzag remains relevant to other encoded payloads only if a later family uses
+it. The Rust 7-bit varint decoder should be hand-rolled with bounds checks
+rather than pulling a crate for this small format.
 
 ### Retired events (still routed for old files)
 
@@ -216,3 +255,7 @@ retired forms.
 - LZ4 verification serial handling: leave `UE_TRACE_PACKET_VERIFICATION` off
   initially (matches the default write path). Add a `--strict` flag later if
   we ever want to validate packet serials.
+- Dashboard aggregation shape: decide during Phase 6a whether schema v1 emits
+  raw scope intervals only, pre-aggregated per-frame/per-thread summaries, or
+  both. Lean: both, with intervals behind an explicit flag or bounded top-N
+  list so normal dashboard ingestion stays small.

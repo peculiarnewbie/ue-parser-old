@@ -104,6 +104,15 @@ fn main() {
                     &object.properties.records,
                 );
             }
+            DecodedAsset::Skeleton(skeleton) => {
+                dump_properties(
+                    &package,
+                    &bytes,
+                    filter.as_deref(),
+                    "<root>",
+                    &skeleton.properties.records,
+                );
+            }
         }
     }
 }
