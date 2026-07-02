@@ -21,7 +21,9 @@ the upper layers use the same safety, typing, and testing standards.
   - checked allocations
   - legacy-version `unreachable!`
 - Still address:
-  - strict UTF-16 failure policy in `utrace.rs`
+  - [x] strict UTF-16 failure policy in `utrace.rs`
+    - Completed: wide trace sample decoding now rejects invalid UTF-16 instead
+      of silently surfacing it as a raw sample.
   - error taxonomy for `ArchiveErrorKind::AllocationLimit` versus malformed data
 - Add corrupt and truncated input tests for package parse and utrace parse paths.
 

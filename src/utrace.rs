@@ -1210,9 +1210,10 @@ pub fn inventory(source: &[u8]) -> Result<TraceInventory, TraceError> {
             let samples = samples_by_uid
                 .get(&event.uid)
                 .map(|sample| decode_event_sample(&event, sample))
+                .transpose()?
                 .into_iter()
                 .collect();
-            EventInventoryEntry {
+            Ok(EventInventoryEntry {
                 decode_status: decode_status_for(&event),
                 uid: event.uid,
                 logger: event.logger,
@@ -1221,9 +1222,9 @@ pub fn inventory(source: &[u8]) -> Result<TraceInventory, TraceError> {
                 fields: event.fields,
                 observed_count,
                 samples,
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, TraceError>>()?;
     inventory_events.sort_by(|left, right| {
         right
             .observed_count
@@ -1719,23 +1720,27 @@ struct RawSample {
     data: Vec<u8>,
 }
 
-fn decode_event_sample(event: &EventTypeInfo, sample: &RawSample) -> EventSample {
+fn decode_event_sample(
+    event: &EventTypeInfo,
+    sample: &RawSample,
+) -> Result<EventSample, TraceError> {
     let aux = parse_protocol5_aux(&sample.data, event_data_size(event), 0).unwrap_or_default();
     let mut fields = BTreeMap::new();
     for (index, field) in event.fields.iter().enumerate() {
         let value = if field.size == 0 {
             aux.get(&(index as u8))
-                .map(|bytes| decode_variable_field(field, bytes))
+                .map(|bytes| decode_variable_field(event, field, bytes))
+                .transpose()?
                 .unwrap_or_else(|| raw_value("missing_aux", &[]))
         } else {
             decode_fixed_sample_field(field, &sample.data)
         };
         fields.insert(field.name.clone(), value);
     }
-    EventSample {
+    Ok(EventSample {
         thread_id: sample.thread_id,
         fields,
-    }
+    })
 }
 
 fn decode_fixed_sample_field(field: &FieldInfo, data: &[u8]) -> SampleValue {
@@ -1778,20 +1783,31 @@ fn decode_fixed_sample_field(field: &FieldInfo, data: &[u8]) -> SampleValue {
     }
 }
 
-fn decode_variable_field(field: &FieldInfo, bytes: &[u8]) -> SampleValue {
+fn decode_variable_field(
+    event: &EventTypeInfo,
+    field: &FieldInfo,
+    bytes: &[u8],
+) -> Result<SampleValue, TraceError> {
     match field.type_name.as_str() {
-        "ansi_string" => SampleValue::String(decode_ansi_bytes(bytes)),
+        "ansi_string" => Ok(SampleValue::String(decode_ansi_bytes(bytes))),
         "wide_string" => decode_wide_bytes(bytes)
             .map(SampleValue::String)
-            .unwrap_or_else(|| raw_value("wide_string", bytes)),
-        "array" => raw_value("array", bytes),
-        _ => raw_value("raw", bytes),
+            .map_err(|detail| {
+                TraceError::new(
+                    TraceErrorKind::MalformedData,
+                    0,
+                    format!("{}.{}", event.event, field.name),
+                    detail,
+                )
+            }),
+        "array" => Ok(raw_value("array", bytes)),
+        _ => Ok(raw_value("raw", bytes)),
     }
 }
 
-fn decode_wide_bytes(bytes: &[u8]) -> Option<String> {
+fn decode_wide_bytes(bytes: &[u8]) -> Result<String, String> {
     if bytes.len() % 2 != 0 {
-        return None;
+        return Err("wide string has an odd byte length".to_owned());
     }
     let mut words = bytes
         .chunks_exact(2)
@@ -1800,7 +1816,7 @@ fn decode_wide_bytes(bytes: &[u8]) -> Option<String> {
     if words.last() == Some(&0) {
         words.pop();
     }
-    String::from_utf16(&words).ok()
+    String::from_utf16(&words).map_err(|error| format!("wide string is invalid UTF-16: {error}"))
 }
 
 fn raw_value(kind: &'static str, bytes: &[u8]) -> SampleValue {
@@ -2263,7 +2279,7 @@ fn read_dashboard_events(
                 unmodeled_events
                     .entry((event.logger.clone(), event.event.clone()))
                     .or_default()
-                    .record(event, raw_event.data, thread_id);
+                    .record(event, raw_event.data, thread_id)?;
                 continue;
             }
             match (event.logger.as_str(), event.event.as_str()) {
@@ -2450,7 +2466,7 @@ fn read_dashboard_events(
                 unmodeled_events
                     .entry((event.logger.clone(), event.event.clone()))
                     .or_default()
-                    .record(event, &raw_event.data, *thread_id);
+                    .record(event, &raw_event.data, *thread_id)?;
                 continue;
             }
             if (event.logger.as_str(), event.event.as_str()) == ("CpuProfiler", "EventBatchV3") {
@@ -2488,7 +2504,7 @@ fn read_dashboard_events(
                 cpu_named_events
                     .entry(event.event.clone())
                     .or_default()
-                    .record(event, &raw_event.data, *thread_id);
+                    .record(event, &raw_event.data, *thread_id)?;
             } else if event.logger.as_str() == "GpuProfiler" {
                 decode_gpu_normal_event(
                     event,
@@ -5246,7 +5262,12 @@ struct CpuNamedEventState {
 }
 
 impl CpuNamedEventState {
-    fn record(&mut self, event: &EventTypeInfo, data: &[u8], thread_id: u16) {
+    fn record(
+        &mut self,
+        event: &EventTypeInfo,
+        data: &[u8],
+        thread_id: u16,
+    ) -> Result<(), TraceError> {
         self.observed_count += 1;
         if self.sample.is_none() {
             self.sample = Some(decode_event_sample(
@@ -5255,8 +5276,9 @@ impl CpuNamedEventState {
                     thread_id,
                     data: data.to_vec(),
                 },
-            ));
+            )?);
         }
+        Ok(())
     }
 }
 
@@ -5287,7 +5309,12 @@ struct GenericEventState {
 }
 
 impl GenericEventState {
-    fn record(&mut self, event: &EventTypeInfo, data: &[u8], thread_id: u16) {
+    fn record(
+        &mut self,
+        event: &EventTypeInfo,
+        data: &[u8],
+        thread_id: u16,
+    ) -> Result<(), TraceError> {
         self.observed_count += 1;
         if self.sample.is_none() {
             self.sample = Some(decode_event_sample(
@@ -5296,8 +5323,9 @@ impl GenericEventState {
                     thread_id,
                     data: data.to_vec(),
                 },
-            ));
+            )?);
         }
+        Ok(())
     }
 }
 
@@ -6736,12 +6764,12 @@ fn optional_aux_text(
     };
     match field.type_name.as_str() {
         "ansi_string" => Ok(Some(decode_ansi_bytes(bytes))),
-        "wide_string" => decode_wide_bytes(bytes).map(Some).ok_or_else(|| {
+        "wide_string" => decode_wide_bytes(bytes).map(Some).map_err(|detail| {
             TraceError::new(
                 TraceErrorKind::MalformedData,
                 0,
                 format!("{}.{}", event.event, name),
-                "invalid UTF-16 aux string",
+                detail,
             )
         }),
         _ => Ok(Some(decode_ansi_bytes(bytes))),
@@ -8015,15 +8043,18 @@ mod tests {
         states
             .entry(frame_event.event.clone())
             .or_insert_with(CpuNamedEventState::default)
-            .record(&frame_event, &frame_data, 2);
+            .record(&frame_event, &frame_data, 2)
+            .unwrap();
         states
             .entry(frame_event.event.clone())
             .or_insert_with(CpuNamedEventState::default)
-            .record(&frame_event, &frame_data, 2);
+            .record(&frame_event, &frame_data, 2)
+            .unwrap();
         states
             .entry(buffer_event.event.clone())
             .or_insert_with(CpuNamedEventState::default)
-            .record(&buffer_event, &buffer_data, 64);
+            .record(&buffer_event, &buffer_data, 64)
+            .unwrap();
 
         let summaries = cpu_named_event_summaries(states);
         assert_eq!(summaries.len(), 2);
@@ -8046,6 +8077,26 @@ mod tests {
             buffer.sample.as_ref().unwrap().fields["SizeInBytes"],
             SampleValue::Unsigned(65516)
         );
+    }
+
+    #[test]
+    fn rejects_invalid_utf16_wide_event_samples() {
+        let event = test_event_type(
+            26,
+            "Cpu",
+            "Frame",
+            &[regular_field(0, 0, WIDE_STRING, "Name")],
+        );
+        let mut data = Vec::new();
+        data.extend_from_slice(&aux(0, &0xd800_u16.to_le_bytes()));
+        data.push(3);
+
+        let error = decode_event_sample(&event, &RawSample { thread_id: 2, data })
+            .expect_err("invalid UTF-16 should be rejected");
+
+        assert_eq!(error.kind(), TraceErrorKind::MalformedData);
+        assert_eq!(error.path(), "Frame.Name");
+        assert!(error.detail().contains("invalid UTF-16"));
     }
 
     #[test]
