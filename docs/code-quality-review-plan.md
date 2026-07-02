@@ -74,7 +74,10 @@ the upper layers use the same safety, typing, and testing standards.
 
 ## 4. Add Lazy Error Context
 
-- Design a small path/context abstraction for `Reader`.
+- [x] Design a small path/context abstraction for `Reader`.
+  - Completed: `Reader` and `ArchiveError` path inputs now accept
+    `Display`, allowing lazy `format_args!` path construction without allocating
+    on successful reads.
 - Avoid eager `format!` on successful reads.
 - Migrate hot loops first:
   - name map

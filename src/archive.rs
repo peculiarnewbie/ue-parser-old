@@ -87,13 +87,13 @@ impl ArchiveError {
     fn new(
         kind: ArchiveErrorKind,
         offset: u64,
-        path: impl Into<String>,
+        path: impl fmt::Display,
         detail: impl Into<String>,
     ) -> Self {
         Self {
             kind,
             offset,
-            path: path.into(),
+            path: path.to_string(),
             detail: detail.into(),
         }
     }
@@ -252,7 +252,11 @@ impl<'a> Reader<'a> {
         self.span.end() - self.position
     }
 
-    pub fn seek(&mut self, absolute_offset: u64, path: &str) -> Result<(), ArchiveError> {
+    pub fn seek(
+        &mut self,
+        absolute_offset: u64,
+        path: &(impl fmt::Display + ?Sized),
+    ) -> Result<(), ArchiveError> {
         if absolute_offset < self.span.offset || absolute_offset > self.span.end() {
             return Err(ArchiveError::new(
                 ArchiveErrorKind::InvalidSeek,
@@ -269,7 +273,11 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    pub fn skip(&mut self, byte_count: u64, path: &str) -> Result<(), ArchiveError> {
+    pub fn skip(
+        &mut self,
+        byte_count: u64,
+        path: &(impl fmt::Display + ?Sized),
+    ) -> Result<(), ArchiveError> {
         let target = self.position.checked_add(byte_count).ok_or_else(|| {
             ArchiveError::new(
                 ArchiveErrorKind::IntegerOverflow,
@@ -282,7 +290,11 @@ impl<'a> Reader<'a> {
     }
 
     /// Creates an independently positioned child reader inside this reader's region.
-    pub fn bounded(&self, span: Span, path: &str) -> Result<Self, ArchiveError> {
+    pub fn bounded(
+        &self,
+        span: Span,
+        path: &(impl fmt::Display + ?Sized),
+    ) -> Result<Self, ArchiveError> {
         if span.offset < self.span.offset || span.end() > self.span.end() {
             return Err(ArchiveError::new(
                 ArchiveErrorKind::OutOfBounds,
@@ -306,14 +318,22 @@ impl<'a> Reader<'a> {
     }
 
     /// Takes the next `byte_count` bytes as a child reader and advances this reader.
-    pub fn take_bounded(&mut self, byte_count: u64, path: &str) -> Result<Self, ArchiveError> {
+    pub fn take_bounded(
+        &mut self,
+        byte_count: u64,
+        path: &(impl fmt::Display + ?Sized),
+    ) -> Result<Self, ArchiveError> {
         let span = Span::new(self.position, byte_count)?;
         let child = self.bounded(span, path)?;
         self.position = span.end();
         Ok(child)
     }
 
-    pub fn read_bytes(&mut self, byte_count: usize, path: &str) -> Result<&'a [u8], ArchiveError> {
+    pub fn read_bytes(
+        &mut self,
+        byte_count: usize,
+        path: &(impl fmt::Display + ?Sized),
+    ) -> Result<&'a [u8], ArchiveError> {
         let byte_count_u64 = u64::try_from(byte_count).map_err(|_| {
             ArchiveError::new(
                 ArchiveErrorKind::IntegerOverflow,
@@ -362,78 +382,84 @@ impl<'a> Reader<'a> {
         Ok(&self.source[start_index..end_index])
     }
 
-    pub fn read_u8(&mut self, path: &str) -> Result<u8, ArchiveError> {
+    pub fn read_u8(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<u8, ArchiveError> {
         Ok(self.read_bytes(1, path)?[0])
     }
 
-    pub fn read_i8(&mut self, path: &str) -> Result<i8, ArchiveError> {
+    pub fn read_i8(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<i8, ArchiveError> {
         Ok(i8::from_le_bytes([self.read_u8(path)?]))
     }
 
-    pub fn read_u16(&mut self, path: &str) -> Result<u16, ArchiveError> {
+    pub fn read_u16(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<u16, ArchiveError> {
         Ok(u16::from_le_bytes(self.read_array(path)?))
     }
 
-    pub fn read_i16(&mut self, path: &str) -> Result<i16, ArchiveError> {
+    pub fn read_i16(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<i16, ArchiveError> {
         Ok(i16::from_le_bytes(self.read_array(path)?))
     }
 
-    pub fn read_u32(&mut self, path: &str) -> Result<u32, ArchiveError> {
+    pub fn read_u32(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<u32, ArchiveError> {
         Ok(u32::from_le_bytes(self.read_array(path)?))
     }
 
-    pub fn read_i32(&mut self, path: &str) -> Result<i32, ArchiveError> {
+    pub fn read_i32(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<i32, ArchiveError> {
         Ok(i32::from_le_bytes(self.read_array(path)?))
     }
 
-    pub fn read_u64(&mut self, path: &str) -> Result<u64, ArchiveError> {
+    pub fn read_u64(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<u64, ArchiveError> {
         Ok(u64::from_le_bytes(self.read_array(path)?))
     }
 
-    pub fn read_i64(&mut self, path: &str) -> Result<i64, ArchiveError> {
+    pub fn read_i64(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<i64, ArchiveError> {
         Ok(i64::from_le_bytes(self.read_array(path)?))
     }
 
-    pub fn read_f32(&mut self, path: &str) -> Result<f32, ArchiveError> {
+    pub fn read_f32(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<f32, ArchiveError> {
         Ok(f32::from_le_bytes(self.read_array(path)?))
     }
 
-    pub fn read_f64(&mut self, path: &str) -> Result<f64, ArchiveError> {
+    pub fn read_f64(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<f64, ArchiveError> {
         Ok(f64::from_le_bytes(self.read_array(path)?))
     }
 
-    pub fn read_guid(&mut self, path: &str) -> Result<Guid, ArchiveError> {
+    pub fn read_guid(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<Guid, ArchiveError> {
         Ok(Guid {
-            a: self.read_u32(&format!("{path}.A"))?,
-            b: self.read_u32(&format!("{path}.B"))?,
-            c: self.read_u32(&format!("{path}.C"))?,
-            d: self.read_u32(&format!("{path}.D"))?,
+            a: self.read_u32(&format_args!("{path}.A"))?,
+            b: self.read_u32(&format_args!("{path}.B"))?,
+            c: self.read_u32(&format_args!("{path}.C"))?,
+            d: self.read_u32(&format_args!("{path}.D"))?,
         })
     }
 
-    pub fn read_io_hash(&mut self, path: &str) -> Result<IoHash, ArchiveError> {
+    pub fn read_io_hash(
+        &mut self,
+        path: &(impl fmt::Display + ?Sized),
+    ) -> Result<IoHash, ArchiveError> {
         Ok(IoHash(self.read_array(path)?))
     }
 
-    pub fn read_name_ref(&mut self, path: &str) -> Result<NameRef, ArchiveError> {
+    pub fn read_name_ref(
+        &mut self,
+        path: &(impl fmt::Display + ?Sized),
+    ) -> Result<NameRef, ArchiveError> {
         let index_offset = self.position;
-        let index = self.read_i32(&format!("{path}.NameIndex"))?;
+        let index = self.read_i32(&format_args!("{path}.NameIndex"))?;
         if index < 0 {
             return Err(ArchiveError::new(
                 ArchiveErrorKind::InvalidNameReference,
                 index_offset,
-                format!("{path}.NameIndex"),
+                format_args!("{path}.NameIndex"),
                 format!("name index must be non-negative, got {index}"),
             ));
         }
 
         let number_offset = self.position;
-        let number = self.read_i32(&format!("{path}.Number"))?;
+        let number = self.read_i32(&format_args!("{path}.Number"))?;
         if number < 0 {
             return Err(ArchiveError::new(
                 ArchiveErrorKind::InvalidNameReference,
                 number_offset,
-                format!("{path}.Number"),
+                format_args!("{path}.Number"),
                 format!("name number must be non-negative, got {number}"),
             ));
         }
@@ -445,20 +471,26 @@ impl<'a> Reader<'a> {
     }
 
     /// Reads `FSoftObjectPath` wire format: asset-path `FString` plus optional subpath `FString`.
-    pub fn read_soft_object_path(&mut self, path: &str) -> Result<String, ArchiveError> {
-        let asset_path = self.read_fstring(&format!("{path}.AssetPath"))?;
+    pub fn read_soft_object_path(
+        &mut self,
+        path: &(impl fmt::Display + ?Sized),
+    ) -> Result<String, ArchiveError> {
+        let asset_path = self.read_fstring(&format_args!("{path}.AssetPath"))?;
         if self.remaining() == 0 {
             return Ok(asset_path);
         }
 
-        let sub_path = self.read_fstring(&format!("{path}.SubPath"))?;
+        let sub_path = self.read_fstring(&format_args!("{path}.SubPath"))?;
         Ok(Self::format_soft_object_path(&asset_path, &sub_path))
     }
 
     /// Reads Unreal's signed-length, null-terminated serialized `FString`.
-    pub fn read_fstring(&mut self, path: &str) -> Result<String, ArchiveError> {
+    pub fn read_fstring(
+        &mut self,
+        path: &(impl fmt::Display + ?Sized),
+    ) -> Result<String, ArchiveError> {
         let length_offset = self.position;
-        let signed_length = self.read_i32(&format!("{path}.Length"))?;
+        let signed_length = self.read_i32(&format_args!("{path}.Length"))?;
         match signed_length {
             0 => Ok(String::new()),
             1.. => self.read_ansi_string(
@@ -470,7 +502,7 @@ impl<'a> Reader<'a> {
             i32::MIN => Err(ArchiveError::new(
                 ArchiveErrorKind::InvalidCount,
                 length_offset,
-                format!("{path}.Length"),
+                format_args!("{path}.Length"),
                 "wide string length cannot be i32::MIN",
             )),
             _ => self.read_wide_string(signed_length.unsigned_abs(), length_offset, path, true),
@@ -485,9 +517,12 @@ impl<'a> Reader<'a> {
     /// **no guaranteed null terminator** — older saves stripped trailing nulls
     /// entirely. Read exactly `count` units and trim trailing nulls, which
     /// tolerates both the unterminated and null-terminated forms.
-    pub(crate) fn read_soft_object_subpath(&mut self, path: &str) -> Result<String, ArchiveError> {
+    pub(crate) fn read_soft_object_subpath(
+        &mut self,
+        path: &(impl fmt::Display + ?Sized),
+    ) -> Result<String, ArchiveError> {
         let length_offset = self.position;
-        let signed_length = self.read_i32(&format!("{path}.Length"))?;
+        let signed_length = self.read_i32(&format_args!("{path}.Length"))?;
         match signed_length {
             0 => Ok(String::new()),
             1.. => self.read_ansi_string(
@@ -499,7 +534,7 @@ impl<'a> Reader<'a> {
             i32::MIN => Err(ArchiveError::new(
                 ArchiveErrorKind::InvalidCount,
                 length_offset,
-                format!("{path}.Length"),
+                format_args!("{path}.Length"),
                 "wide string length cannot be i32::MIN",
             )),
             _ => self.read_wide_string(signed_length.unsigned_abs(), length_offset, path, false),
@@ -509,18 +544,17 @@ impl<'a> Reader<'a> {
     /// Reads an Unreal `TArray` count and invokes `read_element` for each item.
     pub fn read_tarray<T>(
         &mut self,
-        path: &str,
+        path: &(impl fmt::Display + ?Sized),
         minimum_element_size: usize,
         mut read_element: impl FnMut(&mut Self, usize) -> Result<T, ArchiveError>,
     ) -> Result<Vec<T>, ArchiveError> {
         let count_offset = self.position;
-        let count_path = format!("{path}.Count");
-        let count = self.read_count(&count_path)?;
+        let count = self.read_count(&format_args!("{path}.Count"))?;
         let capacity = self.checked_vec_capacity_at::<T>(
             count,
             minimum_element_size,
             count_offset,
-            &count_path,
+            &format_args!("{path}.Count"),
         )?;
 
         let mut values = Vec::with_capacity(capacity);
@@ -534,7 +568,7 @@ impl<'a> Reader<'a> {
         &self,
         count: usize,
         minimum_element_size: usize,
-        path: &str,
+        path: &(impl fmt::Display + ?Sized),
     ) -> Result<usize, ArchiveError> {
         self.checked_vec_capacity_at::<T>(count, minimum_element_size, self.position, path)
     }
@@ -544,7 +578,7 @@ impl<'a> Reader<'a> {
         count: usize,
         minimum_element_size: usize,
         offset: u64,
-        path: &str,
+        path: &(impl fmt::Display + ?Sized),
     ) -> Result<usize, ArchiveError> {
         if count > self.limits.max_array_elements {
             return Err(ArchiveError::new(
@@ -567,7 +601,10 @@ impl<'a> Reader<'a> {
         Ok(count)
     }
 
-    pub(crate) fn read_count(&mut self, path: &str) -> Result<usize, ArchiveError> {
+    pub(crate) fn read_count(
+        &mut self,
+        path: &(impl fmt::Display + ?Sized),
+    ) -> Result<usize, ArchiveError> {
         let offset = self.position;
         let count = self.read_i32(path)?;
         if count < 0 {
@@ -598,7 +635,7 @@ impl<'a> Reader<'a> {
         count: usize,
         element_size: usize,
         offset: u64,
-        path: &str,
+        path: &(impl fmt::Display + ?Sized),
     ) -> Result<(), ArchiveError> {
         let allocation = count.checked_mul(element_size).ok_or_else(|| {
             ArchiveError::new(
@@ -627,7 +664,7 @@ impl<'a> Reader<'a> {
         count: usize,
         minimum_element_size: usize,
         offset: u64,
-        path: &str,
+        path: &(impl fmt::Display + ?Sized),
     ) -> Result<(), ArchiveError> {
         let minimum_bytes = count.checked_mul(minimum_element_size).ok_or_else(|| {
             ArchiveError::new(
@@ -673,11 +710,11 @@ impl<'a> Reader<'a> {
         &mut self,
         code_units: u32,
         length_offset: u64,
-        path: &str,
+        path: &(impl fmt::Display + ?Sized),
         require_terminator: bool,
     ) -> Result<String, ArchiveError> {
         let code_units = self.validate_string_length(code_units, 1, length_offset, path)?;
-        let bytes = self.read_bytes(code_units, &format!("{path}.Data"))?;
+        let bytes = self.read_bytes(code_units, &format_args!("{path}.Data"))?;
 
         // Unreal's serialized ANSI form is an 8-bit code-unit string. This
         // one-to-one mapping is lossless for byte values and avoids assuming UTF-8.
@@ -714,13 +751,13 @@ impl<'a> Reader<'a> {
         &mut self,
         code_units: u32,
         length_offset: u64,
-        path: &str,
+        path: &(impl fmt::Display + ?Sized),
         require_terminator: bool,
     ) -> Result<String, ArchiveError> {
         let capacity = self.validate_string_length(code_units, 2, length_offset, path)?;
         let mut units = Vec::with_capacity(capacity);
         for index in 0..capacity {
-            units.push(self.read_u16(&format!("{path}.Data[{index}]"))?);
+            units.push(self.read_u16(&format_args!("{path}.Data[{index}]"))?);
         }
         let decode = |content: &[u16]| {
             String::from_utf16(content).map_err(|error| {
@@ -765,13 +802,13 @@ impl<'a> Reader<'a> {
         code_units: u32,
         bytes_per_unit: usize,
         offset: u64,
-        path: &str,
+        path: &(impl fmt::Display + ?Sized),
     ) -> Result<usize, ArchiveError> {
         let code_units = usize::try_from(code_units).map_err(|_| {
             ArchiveError::new(
                 ArchiveErrorKind::IntegerOverflow,
                 offset,
-                format!("{path}.Length"),
+                format_args!("{path}.Length"),
                 "string length does not fit in usize",
             )
         })?;
@@ -779,7 +816,7 @@ impl<'a> Reader<'a> {
             return Err(ArchiveError::new(
                 ArchiveErrorKind::InvalidCount,
                 offset,
-                format!("{path}.Length"),
+                format_args!("{path}.Length"),
                 format!(
                     "string code-unit count {code_units} is outside 1..={}",
                     self.limits.max_string_code_units
@@ -790,18 +827,21 @@ impl<'a> Reader<'a> {
             code_units,
             bytes_per_unit,
             offset,
-            &format!("{path}.Length"),
+            &format_args!("{path}.Length"),
         )?;
         self.validate_remaining(
             code_units,
             bytes_per_unit,
             offset,
-            &format!("{path}.Length"),
+            &format_args!("{path}.Length"),
         )?;
         Ok(code_units)
     }
 
-    fn read_array<const N: usize>(&mut self, path: &str) -> Result<[u8; N], ArchiveError> {
+    fn read_array<const N: usize>(
+        &mut self,
+        path: &(impl fmt::Display + ?Sized),
+    ) -> Result<[u8; N], ArchiveError> {
         self.read_bytes(N, path)?
             .try_into()
             .map_err(|_| unreachable!("read_bytes returned the requested length"))
