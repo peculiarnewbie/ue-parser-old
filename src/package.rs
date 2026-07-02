@@ -824,8 +824,9 @@ fn read_custom_versions(
 ) -> Result<Vec<CustomVersion>, PackageError> {
     let mut seen = BTreeMap::new();
     let count = reader.read_count("Summary.CustomVersions.Count")?;
-    reader.checked_vec_capacity::<CustomVersion>(count, 8, "Summary.CustomVersions.Count")?;
-    let mut versions = Vec::with_capacity(count);
+    let capacity =
+        reader.checked_vec_capacity::<CustomVersion>(count, 8, "Summary.CustomVersions.Count")?;
+    let mut versions = Vec::with_capacity(capacity);
     for index in 0..count {
         let path = format!("Summary.CustomVersions[{index}]");
         let version = match legacy_file_version {
@@ -908,8 +909,9 @@ fn read_soft_object_path_list(
     // followed by the `FString` SubPathString.
     let mut reader = Reader::new(source);
     reader.seek(table.offset.get(), "Summary.SoftObjectPaths")?;
-    reader.checked_vec_capacity::<String>(count, 20, "Summary.SoftObjectPaths.Count")?;
-    let mut paths = Vec::with_capacity(count);
+    let capacity =
+        reader.checked_vec_capacity::<String>(count, 20, "Summary.SoftObjectPaths.Count")?;
+    let mut paths = Vec::with_capacity(capacity);
     for index in 0..count {
         let entry_path = format!("Summary.SoftObjectPaths[{index}]");
         let package = reader.read_name_ref(&format!("{entry_path}.PackageName"))?;
@@ -1010,8 +1012,8 @@ fn read_name_map(
             "name count does not fit in usize",
         )
     })?;
-    reader.checked_vec_capacity::<String>(count, 4, "Names.Count")?;
-    let mut names = Vec::with_capacity(count);
+    let capacity = reader.checked_vec_capacity::<String>(count, 4, "Names.Count")?;
+    let mut names = Vec::with_capacity(capacity);
 
     for index in 0..count {
         let path = format!("Names[{index}]");
@@ -1037,8 +1039,8 @@ fn read_import_map(
             "import count does not fit in usize",
         )
     })?;
-    reader.checked_vec_capacity::<Import>(count, 28, "Imports.Count")?;
-    let mut imports = Vec::with_capacity(count);
+    let capacity = reader.checked_vec_capacity::<Import>(count, 28, "Imports.Count")?;
+    let mut imports = Vec::with_capacity(capacity);
 
     for index in 0..count {
         let path = format!("Imports[{index}]");
@@ -1096,8 +1098,8 @@ fn read_export_map(
             "export count does not fit in usize",
         )
     })?;
-    reader.checked_vec_capacity::<Export>(count, 64, "Exports.Count")?;
-    let mut exports = Vec::with_capacity(count);
+    let capacity = reader.checked_vec_capacity::<Export>(count, 64, "Exports.Count")?;
+    let mut exports = Vec::with_capacity(capacity);
 
     for index in 0..count {
         let path = format!("Exports[{index}]");

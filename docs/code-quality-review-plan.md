@@ -58,8 +58,13 @@ the upper layers use the same safety, typing, and testing standards.
 
 ## 3. Centralize Allocation And Count Handling
 
-- Audit all `Vec::with_capacity` calls.
-- Replace raw capacity calls from file-controlled counts with `Reader` helpers.
+- [x] Audit all `Vec::with_capacity` calls.
+  - Completed: reviewed package, property, asset, codec, archive, utrace,
+    example, and test capacity sites; derived/in-memory capacities are left
+    outside the file-count allocation path.
+- [x] Replace raw capacity calls from file-controlled counts with `Reader` helpers.
+  - Completed: parser allocations from serialized counts now allocate from
+    checked capacity values or explicit local caps before `Vec::with_capacity`.
 - Add test cases for absurd counts in package, asset, codec, and utrace paths.
 - Treat unchecked file-driven capacity as a review blocker.
 

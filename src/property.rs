@@ -408,12 +408,12 @@ fn read_property_type_name_at_depth(
         ));
     }
     let inner_count = usize::try_from(inner_count).expect("non-negative i32 fits in usize");
-    reader.checked_vec_capacity::<PropertyTypeName>(
+    let capacity = reader.checked_vec_capacity::<PropertyTypeName>(
         inner_count,
         12,
         &format!("{path}.InnerCount"),
     )?;
-    let mut parameters = Vec::with_capacity(inner_count);
+    let mut parameters = Vec::with_capacity(capacity);
     for index in 0..inner_count {
         parameters.push(read_property_type_name_at_depth(
             reader,

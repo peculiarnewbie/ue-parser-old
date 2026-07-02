@@ -441,12 +441,12 @@ impl AssetDecoder for DataTableDecoder {
                 format!("negative DataTable row count {row_count} at byte {row_count_offset}"),
             ));
         }
-        reader.checked_vec_capacity::<DataTableRow>(
+        let capacity = reader.checked_vec_capacity::<DataTableRow>(
             usize::try_from(row_count).expect("i32 fits in usize"),
             8,
             &format!("{}.Rows.Count", export.object_path),
         )?;
-        let mut rows = Vec::with_capacity(usize::try_from(row_count).expect("i32 fits in usize"));
+        let mut rows = Vec::with_capacity(capacity);
         for index in 0..row_count {
             let row_path = format!("{}.Rows[{index}]", export.object_path);
             let name = reader.read_name_ref(&format!("{row_path}.Name"))?;
@@ -550,12 +550,12 @@ impl AssetDecoder for CurveTableDecoder {
                 ));
             }
         };
-        reader.checked_vec_capacity::<CurveTableRow>(
+        let capacity = reader.checked_vec_capacity::<CurveTableRow>(
             usize::try_from(row_count).expect("i32 fits in usize"),
             16,
             &format!("{}.Rows.Count", export.object_path),
         )?;
-        let mut rows = Vec::with_capacity(usize::try_from(row_count).expect("i32 fits in usize"));
+        let mut rows = Vec::with_capacity(capacity);
         for index in 0..row_count {
             let row_path = format!("{}.Rows[{index}]", export.object_path);
             let name = reader.read_name_ref(&format!("{row_path}.Name"))?;
@@ -684,13 +684,12 @@ impl AssetDecoder for StringTableDecoder {
                 ),
             ));
         }
-        reader.checked_vec_capacity::<StringTableEntry>(
+        let capacity = reader.checked_vec_capacity::<StringTableEntry>(
             usize::try_from(entry_count).expect("i32 fits in usize"),
             8,
             &format!("{}.Entries.Count", export.object_path),
         )?;
-        let mut entries =
-            Vec::with_capacity(usize::try_from(entry_count).expect("i32 fits in usize"));
+        let mut entries = Vec::with_capacity(capacity);
         for index in 0..entry_count {
             let entry_path = format!("{}.Entries[{index}]", export.object_path);
             let key = reader.read_fstring(&format!("{entry_path}.Key"))?;
@@ -773,13 +772,12 @@ impl AssetDecoder for EnumDecoder {
                 format!("negative Enum name count {count} at byte {count_offset}"),
             ));
         }
-        reader.checked_vec_capacity::<(NameRef, i64)>(
+        let capacity = reader.checked_vec_capacity::<(NameRef, i64)>(
             usize::try_from(count).expect("i32 fits in usize"),
             16,
             &format!("{}.Names.Count", export.object_path),
         )?;
-        let mut raw_entries =
-            Vec::with_capacity(usize::try_from(count).expect("i32 fits in usize"));
+        let mut raw_entries = Vec::with_capacity(capacity);
         for index in 0..count {
             let entry_path = format!("{}.Names[{index}]", export.object_path);
             let name = reader.read_name_ref(&format!("{entry_path}.Name"))?;
@@ -919,12 +917,12 @@ impl AssetDecoder for StructDecoder {
                 format!("negative struct field count {field_count} at byte {field_count_offset}"),
             ));
         }
-        reader.checked_vec_capacity::<StructField>(
+        let capacity = reader.checked_vec_capacity::<StructField>(
             usize::try_from(field_count).expect("fits in usize"),
             1,
             &format!("{}.ChildProperties.Count", export.object_path),
         )?;
-        let mut fields = Vec::with_capacity(usize::try_from(field_count).expect("fits in usize"));
+        let mut fields = Vec::with_capacity(capacity);
         for index in 0..field_count {
             let field_path = format!("{}.ChildProperties[{index}]", export.object_path);
             if let Some(field) = read_field(&mut reader, context, &field_path)? {
@@ -1184,12 +1182,12 @@ impl AssetDecoder for SkeletonDecoder {
                 format!("negative reference-skeleton bone count {count} at byte {count_offset}"),
             ));
         }
-        reader.checked_vec_capacity::<SkeletonBone>(
+        let capacity = reader.checked_vec_capacity::<SkeletonBone>(
             usize::try_from(count).expect("i32 fits in usize"),
             if editor_data_present { 16 } else { 12 },
             &format!("{}.ReferenceSkeleton.Num", export.object_path),
         )?;
-        let mut bones = Vec::with_capacity(usize::try_from(count).expect("i32 fits in usize"));
+        let mut bones = Vec::with_capacity(capacity);
         for index in 0..count {
             let path = format!("{}.ReferenceSkeleton.Bones[{index}]", export.object_path);
             let name = reader.read_name_ref(&format!("{path}.Name"))?;
@@ -1502,12 +1500,12 @@ fn decode_simple_curve_keys(
             format!("negative SimpleCurve key count {count}"),
         ));
     }
-    payload.checked_vec_capacity::<CurveKey>(
+    let capacity = payload.checked_vec_capacity::<CurveKey>(
         usize::try_from(count).expect("i32 fits in usize"),
         8,
         &format!("{path}.Keys.Count"),
     )?;
-    let mut keys = Vec::with_capacity(usize::try_from(count).expect("i32 fits in usize"));
+    let mut keys = Vec::with_capacity(capacity);
     for index in 0..count {
         keys.push(CurveKey::Simple(SimpleCurveKey {
             time: payload.read_f32(&format!("{path}.Keys[{index}].Time"))?,
@@ -1557,12 +1555,12 @@ fn decode_rich_curve_keys(
             format!("negative RichCurve key count {count}"),
         ));
     }
-    payload.checked_vec_capacity::<CurveKey>(
+    let capacity = payload.checked_vec_capacity::<CurveKey>(
         usize::try_from(count).expect("i32 fits in usize"),
         27,
         &format!("{path}.Keys.Count"),
     )?;
-    let mut keys = Vec::with_capacity(usize::try_from(count).expect("i32 fits in usize"));
+    let mut keys = Vec::with_capacity(capacity);
     for index in 0..count {
         keys.push(CurveKey::Rich(RichCurveKey {
             interp_mode: payload.read_u8(&format!("{path}.Keys[{index}].InterpMode"))?,

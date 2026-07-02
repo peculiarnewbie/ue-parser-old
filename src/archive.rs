@@ -514,21 +514,16 @@ impl<'a> Reader<'a> {
         mut read_element: impl FnMut(&mut Self, usize) -> Result<T, ArchiveError>,
     ) -> Result<Vec<T>, ArchiveError> {
         let count_offset = self.position;
-        let count = self.read_count(&format!("{path}.Count"))?;
-        self.validate_allocation(
-            count,
-            minimum_element_size.max(size_of::<T>()),
-            count_offset,
-            &format!("{path}.Count"),
-        )?;
-        self.validate_remaining(
+        let count_path = format!("{path}.Count");
+        let count = self.read_count(&count_path)?;
+        let capacity = self.checked_vec_capacity_at::<T>(
             count,
             minimum_element_size,
             count_offset,
-            &format!("{path}.Count"),
+            &count_path,
         )?;
 
-        let mut values = Vec::with_capacity(count);
+        let mut values = Vec::with_capacity(capacity);
         for index in 0..count {
             values.push(read_element(self, index)?);
         }
@@ -541,10 +536,20 @@ impl<'a> Reader<'a> {
         minimum_element_size: usize,
         path: &str,
     ) -> Result<usize, ArchiveError> {
+        self.checked_vec_capacity_at::<T>(count, minimum_element_size, self.position, path)
+    }
+
+    fn checked_vec_capacity_at<T>(
+        &self,
+        count: usize,
+        minimum_element_size: usize,
+        offset: u64,
+        path: &str,
+    ) -> Result<usize, ArchiveError> {
         if count > self.limits.max_array_elements {
             return Err(ArchiveError::new(
                 ArchiveErrorKind::InvalidCount,
-                self.position,
+                offset,
                 path,
                 format!(
                     "count {count} exceeds element limit {}",
@@ -555,10 +560,10 @@ impl<'a> Reader<'a> {
         self.validate_allocation(
             count,
             minimum_element_size.max(size_of::<T>()),
-            self.position,
+            offset,
             path,
         )?;
-        self.validate_remaining(count, minimum_element_size, self.position, path)?;
+        self.validate_remaining(count, minimum_element_size, offset, path)?;
         Ok(count)
     }
 
@@ -712,9 +717,9 @@ impl<'a> Reader<'a> {
         path: &str,
         require_terminator: bool,
     ) -> Result<String, ArchiveError> {
-        let code_units = self.validate_string_length(code_units, 2, length_offset, path)?;
-        let mut units = Vec::with_capacity(code_units);
-        for index in 0..code_units {
+        let capacity = self.validate_string_length(code_units, 2, length_offset, path)?;
+        let mut units = Vec::with_capacity(capacity);
+        for index in 0..capacity {
             units.push(self.read_u16(&format!("{path}.Data[{index}]"))?);
         }
         let decode = |content: &[u16]| {
@@ -782,6 +787,12 @@ impl<'a> Reader<'a> {
             ));
         }
         self.validate_allocation(
+            code_units,
+            bytes_per_unit,
+            offset,
+            &format!("{path}.Length"),
+        )?;
+        self.validate_remaining(
             code_units,
             bytes_per_unit,
             offset,

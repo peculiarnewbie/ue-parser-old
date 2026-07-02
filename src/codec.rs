@@ -299,12 +299,12 @@ fn decode_array_value(
     let (inner_type, inner_name) = resolve_inner_type(context, type_tree, path, "ArrayProperty")?;
 
     let count = payload.read_count(&format!("{path}.Count"))?;
-    payload.checked_vec_capacity::<PropertyValue>(
+    let capacity = payload.checked_vec_capacity::<PropertyValue>(
         count,
         minimum_serialized_size(&inner_name, inner_type),
         &format!("{path}.Count"),
     )?;
-    let mut values = Vec::with_capacity(count);
+    let mut values = Vec::with_capacity(capacity);
     for index in 0..count {
         let element_path = format!("{path}[{index}]");
         values.push(
@@ -370,12 +370,12 @@ fn decode_set_value(
     }
 
     let count = payload.read_count(&format!("{path}.Elements.Count"))?;
-    payload.checked_vec_capacity::<PropertyValue>(
+    let capacity = payload.checked_vec_capacity::<PropertyValue>(
         count,
         minimum_serialized_size(&element_name, element_type),
         &format!("{path}.Elements.Count"),
     )?;
-    let mut values = Vec::with_capacity(count);
+    let mut values = Vec::with_capacity(capacity);
     for index in 0..count {
         let element_path = format!("{path}.Elements[{index}]");
         values.push(
@@ -443,12 +443,12 @@ fn decode_map_value(
     let count = payload.read_count(&format!("{path}.Entries.Count"))?;
     let entry_minimum = minimum_serialized_size(&key_name, key_type)
         .saturating_add(minimum_serialized_size(&value_name, value_type));
-    payload.checked_vec_capacity::<MapEntry>(
+    let capacity = payload.checked_vec_capacity::<MapEntry>(
         count,
         entry_minimum,
         &format!("{path}.Entries.Count"),
     )?;
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = Vec::with_capacity(capacity);
     for index in 0..count {
         let entry_path = format!("{path}.Entries[{index}]");
         let key_path = format!("{entry_path}.Key");

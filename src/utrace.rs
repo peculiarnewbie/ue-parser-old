@@ -2060,7 +2060,12 @@ fn decode_new_event(
     let logger_name_size = reader.read_u8("NewEvent.LoggerNameSize")?;
     let event_name_size = reader.read_u8("NewEvent.EventNameSize")?;
 
-    let mut raw_fields = Vec::with_capacity(usize::from(field_count));
+    let field_capacity = reader.checked_vec_capacity::<RawFieldInfo>(
+        usize::from(field_count),
+        if protocol >= 6 { 8 } else { 6 },
+        "NewEvent.FieldCount",
+    )?;
+    let mut raw_fields = Vec::with_capacity(field_capacity);
     for index in 0..field_count {
         raw_fields.push(if protocol >= 6 {
             read_protocol6_field(&mut reader, index)?
@@ -4838,6 +4843,10 @@ impl<'a> CborReader<'a> {
         Self { bytes, cursor }
     }
 
+    fn checked_container_capacity(len: usize) -> Option<usize> {
+        (len <= Self::MAX_CONTAINER_ITEMS).then_some(len)
+    }
+
     fn read_value(&mut self, depth: usize) -> Option<MetadataValue> {
         if depth > Self::MAX_DEPTH {
             return None;
@@ -4886,10 +4895,8 @@ impl<'a> CborReader<'a> {
             }
             4 => {
                 let len = usize::try_from(self.read_argument(additional)?).ok()?;
-                if len > Self::MAX_CONTAINER_ITEMS {
-                    return None;
-                }
-                let mut values = Vec::with_capacity(len);
+                let capacity = Self::checked_container_capacity(len)?;
+                let mut values = Vec::with_capacity(capacity);
                 for _ in 0..len {
                     values.push(self.read_value(depth + 1)?);
                 }
@@ -4897,10 +4904,8 @@ impl<'a> CborReader<'a> {
             }
             5 => {
                 let len = usize::try_from(self.read_argument(additional)?).ok()?;
-                if len > Self::MAX_CONTAINER_ITEMS {
-                    return None;
-                }
-                let mut entries = Vec::with_capacity(len);
+                let capacity = Self::checked_container_capacity(len)?;
+                let mut entries = Vec::with_capacity(capacity);
                 for _ in 0..len {
                     entries.push(MetadataMapEntry {
                         key: self.read_value(depth + 1)?,
