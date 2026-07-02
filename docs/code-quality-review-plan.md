@@ -28,7 +28,10 @@ the upper layers use the same safety, typing, and testing standards.
     - Completed: allocation-limit archive failures now map to `ResourceLimit`
       parser kinds and CLI JSON kind `resource_limit`, distinct from malformed
       input.
-- Add corrupt and truncated input tests for package parse and utrace parse paths.
+- [x] Add corrupt and truncated input tests for package parse and utrace parse paths.
+  - Completed: committed tiny corpus fixtures now have parser-level mutation
+    tests covering truncated bytes and corrupt magic for `Package::parse` and
+    utrace inspect.
 
 ## 2. Make Tests Trustworthy
 

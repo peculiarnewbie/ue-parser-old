@@ -3,7 +3,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use uasset_parser::{Package, PackageSummary};
+#[cfg(feature = "utrace")]
+use uasset_parser::utrace::{self, TraceErrorKind};
+use uasset_parser::{Package, PackageErrorKind, PackageSummary};
 
 const MINIMAL_CURRENT_SUMMARY: &str =
     include_str!("fixtures/tiny/minimal-current-summary.uasset.hex");
@@ -62,6 +64,22 @@ fn committed_minimal_package_fixture_parses() {
 }
 
 #[test]
+fn package_parse_rejects_corrupt_and_truncated_minimal_fixture() {
+    let bytes = fixture_bytes(MINIMAL_CURRENT_SUMMARY);
+
+    let truncated = &bytes[..bytes.len() - 1];
+    let error = Package::parse(truncated).expect_err("truncated package must fail");
+    assert_eq!(error.kind(), PackageErrorKind::MalformedData);
+    assert!(!error.path().is_empty());
+
+    let mut corrupt = bytes;
+    corrupt[0] ^= 0xff;
+    let error = Package::parse(&corrupt).expect_err("corrupt package magic must fail");
+    assert_eq!(error.kind(), PackageErrorKind::UnsupportedFormat);
+    assert_eq!(error.path(), "Summary.Tag");
+}
+
+#[test]
 fn cli_inspects_committed_minimal_package_fixture() {
     let path = temp_fixture_path("uasset");
     std::fs::write(&path, fixture_bytes(MINIMAL_CURRENT_SUMMARY)).unwrap();
@@ -116,4 +134,21 @@ fn cli_inspects_committed_minimal_utrace_fixture() {
     assert_eq!(json["trace"]["prologue"]["cycle_frequency"], 1_000_000);
     assert_eq!(json["trace"]["thread_info"][0]["thread_id"], 2);
     assert_eq!(json["trace"]["thread_info"][0]["name"], "GameThread");
+}
+
+#[cfg(feature = "utrace")]
+#[test]
+fn utrace_inspect_rejects_corrupt_and_truncated_minimal_fixture() {
+    let bytes = fixture_bytes(MINIMAL_PROLOGUE_TRACE);
+
+    let truncated = &bytes[..bytes.len() - 1];
+    let error = utrace::inspect(truncated).expect_err("truncated trace must fail");
+    assert_eq!(error.kind(), TraceErrorKind::MalformedData);
+    assert!(!error.path().is_empty());
+
+    let mut corrupt = bytes;
+    corrupt[0] ^= 0xff;
+    let error = utrace::inspect(&corrupt).expect_err("corrupt trace magic must fail");
+    assert_eq!(error.kind(), TraceErrorKind::MalformedData);
+    assert_eq!(error.path(), "Header.Magic");
 }
