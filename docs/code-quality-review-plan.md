@@ -38,7 +38,9 @@ the upper layers use the same safety, typing, and testing standards.
   - Completed: added reviewable hex fixtures for a minimal current UE5 package
     summary and a minimal utrace prologue/thread trace, with always-on library
     and CLI integration tests.
-- Add CLI-level malformed input tests.
+- [x] Add CLI-level malformed input tests.
+  - Completed: added stdin-driven JSON error contract tests for malformed
+    package and utrace inputs, asserting stderr output and exit code 2.
 - Add fuzz targets for:
   - `Package::parse`
   - tagged property stream parsing

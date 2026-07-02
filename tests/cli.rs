@@ -1,10 +1,27 @@
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
 
 fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_uasset"))
+}
+
+fn run_with_stdin(args: &[&str], bytes: &[u8]) -> Output {
+    let mut child = binary()
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+    }
+
+    child.wait_with_output().unwrap()
 }
 
 // The StarterContent sample lived alongside the old in-engine project location.
@@ -64,6 +81,26 @@ fn json_io_error_uses_stderr_and_exit_code_four() {
 }
 
 #[test]
+fn json_malformed_package_uses_stderr_and_exit_code_two() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&0x9E2A_83C1_u32.to_le_bytes());
+    bytes.extend_from_slice(&(-8_i32).to_le_bytes());
+
+    let output = run_with_stdin(&["inspect", "-", "--format=json"], &bytes);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+
+    let json: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(json["schema_version"], 6);
+    assert_eq!(json["status"], "error");
+    assert_eq!(json["path"], "-");
+    assert_eq!(json["kind"], "malformed_data");
+    assert_eq!(json["field"], "Summary.LegacyUE3Version");
+    assert_eq!(json["offset"], 8);
+}
+
+#[test]
 #[ignore = "requires a partially decodable .uasset; set UASSET_PARTIAL_SAMPLE"]
 fn partial_decode_reports_errors_and_exit_six() {
     // A package where the summary parses but at least one export fails to decode
@@ -94,19 +131,7 @@ fn partial_decode_reports_errors_and_exit_six() {
 fn stdin_accepts_package_bytes() {
     let fixture = fixture();
     let bytes = std::fs::read(fixture).unwrap();
-    let mut child = binary()
-        .args(["inspect", "-", "--format=json"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    {
-        use std::io::Write;
-        child.stdin.take().unwrap().write_all(&bytes).unwrap();
-    }
-    let output = child.wait_with_output().unwrap();
+    let output = run_with_stdin(&["inspect", "-", "--format=json"], &bytes);
 
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -121,6 +146,25 @@ fn usage_errors_do_not_write_stdout() {
     assert_eq!(output.status.code(), Some(64));
     assert!(output.stdout.is_empty());
     assert!(!output.stderr.is_empty());
+}
+
+#[cfg(feature = "utrace")]
+#[test]
+fn utrace_json_malformed_trace_uses_stderr_and_exit_code_two() {
+    let bytes = b"2CRT\0\0\x04";
+
+    let output = run_with_stdin(&["utrace", "inspect", "-", "--format=json"], bytes);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+
+    let json: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["status"], "error");
+    assert_eq!(json["path"], "-");
+    assert_eq!(json["kind"], "malformed_data");
+    assert_eq!(json["field"], "Header.ProtocolVersion");
+    assert_eq!(json["offset"], 7);
 }
 
 #[cfg(feature = "utrace")]
