@@ -41,10 +41,12 @@ the upper layers use the same safety, typing, and testing standards.
 - [x] Add CLI-level malformed input tests.
   - Completed: added stdin-driven JSON error contract tests for malformed
     package and utrace inputs, asserting stderr output and exit code 2.
-- Add fuzz targets for:
+- [x] Add fuzz targets for:
   - `Package::parse`
   - tagged property stream parsing
   - utrace header and packet parsing
+  - Completed: added a `cargo-fuzz` crate with `package_parse`,
+    `property_stream`, and `utrace_packets` targets.
 
 ## 3. Centralize Allocation And Count Handling
 
