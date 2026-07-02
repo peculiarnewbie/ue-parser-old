@@ -24,7 +24,10 @@ the upper layers use the same safety, typing, and testing standards.
   - [x] strict UTF-16 failure policy in `utrace.rs`
     - Completed: wide trace sample decoding now rejects invalid UTF-16 instead
       of silently surfacing it as a raw sample.
-  - error taxonomy for `ArchiveErrorKind::AllocationLimit` versus malformed data
+  - [x] error taxonomy for `ArchiveErrorKind::AllocationLimit` versus malformed data
+    - Completed: allocation-limit archive failures now map to `ResourceLimit`
+      parser kinds and CLI JSON kind `resource_limit`, distinct from malformed
+      input.
 - Add corrupt and truncated input tests for package parse and utrace parse paths.
 
 ## 2. Make Tests Trustworthy

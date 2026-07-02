@@ -135,6 +135,7 @@ pub struct ClassSerializationControlExtensions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PropertyErrorKind {
     MalformedData,
+    ResourceLimit,
     UnsupportedVersion,
     UnsupportedCapability,
 }
@@ -216,11 +217,11 @@ impl From<ArchiveError> for PropertyError {
             ArchiveErrorKind::OutOfBounds
             | ArchiveErrorKind::InvalidSeek
             | ArchiveErrorKind::InvalidCount
-            | ArchiveErrorKind::AllocationLimit
             | ArchiveErrorKind::MissingNullTerminator
             | ArchiveErrorKind::InvalidString
             | ArchiveErrorKind::InvalidNameReference
             | ArchiveErrorKind::IntegerOverflow => PropertyErrorKind::MalformedData,
+            ArchiveErrorKind::AllocationLimit => PropertyErrorKind::ResourceLimit,
         };
         Self {
             kind,
@@ -509,7 +510,7 @@ fn resolve_name_ref(names: &[String], name: NameRef) -> Result<String, PropertyE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::Reader;
+    use crate::archive::{ArchiveErrorKind, ArchiveLimits, Reader};
     use crate::test_support::{
         TypeParam, name_ref, push_i32, ue5_versions, write_property_tag, write_property_terminator,
         write_type_name,
@@ -619,6 +620,25 @@ mod tests {
             .expect_err("negative size");
         assert_eq!(error.kind(), PropertyErrorKind::MalformedData);
         assert!(error.path().contains("Tag.Size"));
+    }
+
+    #[test]
+    fn maps_archive_allocation_limit_as_resource_limit() {
+        let limits = ArchiveLimits {
+            max_array_elements: 10,
+            max_allocation_bytes: 7,
+            ..ArchiveLimits::default()
+        };
+        let bytes = 2_i32.to_le_bytes();
+        let archive_error = Reader::with_limits(&bytes, limits)
+            .read_tarray::<u32>("Values", 4, |reader, _| reader.read_u32("Value"))
+            .unwrap_err();
+        assert_eq!(archive_error.kind(), ArchiveErrorKind::AllocationLimit);
+
+        let error = PropertyError::from(archive_error);
+
+        assert_eq!(error.kind(), PropertyErrorKind::ResourceLimit);
+        assert_eq!(error.path(), "Values.Count");
     }
 
     fn read_property_type_name_for_test(

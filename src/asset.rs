@@ -267,6 +267,7 @@ pub struct RichCurveKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetErrorKind {
     MalformedData,
+    ResourceLimit,
     UnsupportedFormat,
     UnsupportedVersion,
     UnsupportedCapability,
@@ -317,6 +318,7 @@ impl From<PackageError> for AssetError {
     fn from(source: PackageError) -> Self {
         let kind = match source.kind() {
             crate::package::PackageErrorKind::MalformedData => AssetErrorKind::MalformedData,
+            crate::package::PackageErrorKind::ResourceLimit => AssetErrorKind::ResourceLimit,
             crate::package::PackageErrorKind::UnsupportedFormat => {
                 AssetErrorKind::UnsupportedFormat
             }
@@ -339,6 +341,7 @@ impl From<PropertyError> for AssetError {
     fn from(source: PropertyError) -> Self {
         let kind = match source.kind() {
             PropertyErrorKind::MalformedData => AssetErrorKind::MalformedData,
+            PropertyErrorKind::ResourceLimit => AssetErrorKind::ResourceLimit,
             PropertyErrorKind::UnsupportedVersion => AssetErrorKind::UnsupportedVersion,
             PropertyErrorKind::UnsupportedCapability => AssetErrorKind::UnsupportedCapability,
         };
@@ -356,11 +359,11 @@ impl From<ArchiveError> for AssetError {
             ArchiveErrorKind::OutOfBounds
             | ArchiveErrorKind::InvalidSeek
             | ArchiveErrorKind::InvalidCount
-            | ArchiveErrorKind::AllocationLimit
             | ArchiveErrorKind::MissingNullTerminator
             | ArchiveErrorKind::InvalidString
             | ArchiveErrorKind::InvalidNameReference
             | ArchiveErrorKind::IntegerOverflow => AssetErrorKind::MalformedData,
+            ArchiveErrorKind::AllocationLimit => AssetErrorKind::ResourceLimit,
         };
         Self {
             kind,
@@ -1632,6 +1635,7 @@ fn row_struct_path(package: &Package, properties: &PropertyStream) -> Option<Obj
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::{ArchiveErrorKind, ArchiveLimits, Reader};
     use crate::package::{test_export, test_import, test_package};
     use crate::property::PropertyValue;
     use crate::schema::{ClassSchema, SchemaProvider, StructSchema};
@@ -1671,6 +1675,24 @@ mod tests {
             "ArrayProperty".into(),
             "Keys".into(),
         ]
+    }
+
+    #[test]
+    fn maps_archive_allocation_limit_as_resource_limit() {
+        let limits = ArchiveLimits {
+            max_array_elements: 10,
+            max_allocation_bytes: 7,
+            ..ArchiveLimits::default()
+        };
+        let bytes = 2_i32.to_le_bytes();
+        let archive_error = Reader::with_limits(&bytes, limits)
+            .read_tarray::<u32>("Values", 4, |reader, _| reader.read_u32("Value"))
+            .unwrap_err();
+        assert_eq!(archive_error.kind(), ArchiveErrorKind::AllocationLimit);
+
+        let error = AssetError::from(archive_error);
+
+        assert_eq!(error.kind(), AssetErrorKind::ResourceLimit);
     }
 
     fn decode_datatable(

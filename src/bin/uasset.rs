@@ -33,6 +33,7 @@ const EXIT_IO: u8 = 4;
 const EXIT_INTERNAL: u8 = 5;
 /// At least one export failed to decode but the package and other exports parsed.
 const EXIT_PARTIAL: u8 = 6;
+const EXIT_RESOURCE_LIMIT: u8 = 7;
 const EXIT_USAGE: u8 = 64;
 
 fn main() -> ExitCode {
@@ -1386,6 +1387,7 @@ fn write_utrace_error(format: OutputFormat, error: UtraceErrorOutput) {
 fn exit_code_for_package_error(error: &PackageError) -> u8 {
     match error.kind() {
         PackageErrorKind::MalformedData => EXIT_MALFORMED,
+        PackageErrorKind::ResourceLimit => EXIT_RESOURCE_LIMIT,
         PackageErrorKind::UnsupportedFormat
         | PackageErrorKind::UnsupportedVersion
         | PackageErrorKind::UnsupportedCapability => EXIT_UNSUPPORTED,
@@ -1396,6 +1398,7 @@ fn exit_code_for_package_error(error: &PackageError) -> u8 {
 fn exit_code_for_trace_error(error: &TraceError) -> u8 {
     match error.kind() {
         TraceErrorKind::MalformedData => EXIT_MALFORMED,
+        TraceErrorKind::ResourceLimit => EXIT_RESOURCE_LIMIT,
         TraceErrorKind::UnsupportedFormat => EXIT_UNSUPPORTED,
     }
 }
@@ -1533,6 +1536,7 @@ impl InspectOutput {
 fn asset_error_kind_name(kind: AssetErrorKind) -> &'static str {
     match kind {
         AssetErrorKind::MalformedData => "malformed_data",
+        AssetErrorKind::ResourceLimit => "resource_limit",
         AssetErrorKind::UnsupportedFormat => "unsupported_format",
         AssetErrorKind::UnsupportedVersion => "unsupported_version",
         AssetErrorKind::UnsupportedCapability => "unsupported_capability",
@@ -2229,6 +2233,7 @@ impl ErrorOutput {
     fn package(path: String, error: &PackageError) -> Self {
         let kind = match error.kind() {
             PackageErrorKind::MalformedData => "malformed_data",
+            PackageErrorKind::ResourceLimit => "resource_limit",
             PackageErrorKind::UnsupportedFormat => "unsupported_format",
             PackageErrorKind::UnsupportedVersion => "unsupported_version",
             PackageErrorKind::UnsupportedCapability => "unsupported_capability",
@@ -2262,6 +2267,7 @@ impl UtraceErrorOutput {
     fn trace(path: String, error: &TraceError) -> Self {
         let kind = match error.kind() {
             TraceErrorKind::MalformedData => "malformed_data",
+            TraceErrorKind::ResourceLimit => "resource_limit",
             TraceErrorKind::UnsupportedFormat => "unsupported_format",
         };
         Self {
@@ -2306,6 +2312,7 @@ Exit codes:
   3          Unsupported format, version, or capability
   4          Input/output failure
   5          Internal output failure
+  7          Parser resource limit exceeded
   64         Invalid command-line usage
 ";
 

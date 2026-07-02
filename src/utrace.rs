@@ -1044,6 +1044,7 @@ pub struct TraceError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TraceErrorKind {
     MalformedData,
+    ResourceLimit,
     UnsupportedFormat,
 }
 
@@ -1102,8 +1103,8 @@ impl From<ArchiveError> for TraceError {
             | ArchiveErrorKind::InvalidSeek
             | ArchiveErrorKind::InvalidCount
             | ArchiveErrorKind::IntegerOverflow => TraceErrorKind::MalformedData,
-            ArchiveErrorKind::AllocationLimit
-            | ArchiveErrorKind::MissingNullTerminator
+            ArchiveErrorKind::AllocationLimit => TraceErrorKind::ResourceLimit,
+            ArchiveErrorKind::MissingNullTerminator
             | ArchiveErrorKind::InvalidString
             | ArchiveErrorKind::InvalidNameReference => TraceErrorKind::MalformedData,
         };
@@ -6925,6 +6926,7 @@ fn type_info_name(type_info: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ArchiveLimits;
 
     const UINT8: u8 = 0x00;
     const UINT16: u8 = 0x01;
@@ -6960,6 +6962,25 @@ mod tests {
     fn rejects_swapped_magic() {
         let error = inspect(b"TRC2").unwrap_err();
         assert_eq!(error.kind(), TraceErrorKind::UnsupportedFormat);
+    }
+
+    #[test]
+    fn maps_archive_allocation_limit_as_resource_limit() {
+        let limits = ArchiveLimits {
+            max_array_elements: 10,
+            max_allocation_bytes: 7,
+            ..ArchiveLimits::default()
+        };
+        let bytes = 2_i32.to_le_bytes();
+        let archive_error = Reader::with_limits(&bytes, limits)
+            .read_tarray::<u32>("Values", 4, |reader, _| reader.read_u32("Value"))
+            .unwrap_err();
+        assert_eq!(archive_error.kind(), ArchiveErrorKind::AllocationLimit);
+
+        let error = TraceError::from(archive_error);
+
+        assert_eq!(error.kind(), TraceErrorKind::ResourceLimit);
+        assert_eq!(error.path(), "Values.Count");
     }
 
     #[test]

@@ -44,6 +44,7 @@ const MAX_OBJECT_PATH_DEPTH: usize = 64;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackageErrorKind {
     MalformedData,
+    ResourceLimit,
     UnsupportedFormat,
     UnsupportedVersion,
     UnsupportedCapability,
@@ -126,11 +127,11 @@ impl From<ArchiveError> for PackageError {
             ArchiveErrorKind::OutOfBounds
             | ArchiveErrorKind::InvalidSeek
             | ArchiveErrorKind::InvalidCount
-            | ArchiveErrorKind::AllocationLimit
             | ArchiveErrorKind::MissingNullTerminator
             | ArchiveErrorKind::InvalidString
             | ArchiveErrorKind::InvalidNameReference
             | ArchiveErrorKind::IntegerOverflow => PackageErrorKind::MalformedData,
+            ArchiveErrorKind::AllocationLimit => PackageErrorKind::ResourceLimit,
         };
         Self {
             kind,
@@ -1700,6 +1701,8 @@ pub(crate) fn test_export(serial_size: u64, object_path: &str, class_path: &str)
 mod tests {
     use std::path::PathBuf;
 
+    use crate::archive::ArchiveLimits;
+
     use super::*;
 
     fn push_i32(bytes: &mut Vec<u8>, value: i32) {
@@ -1818,6 +1821,25 @@ mod tests {
             assert_eq!(error.kind(), PackageErrorKind::UnsupportedCapability);
             assert_eq!(error.path(), "Summary.PackageFlags");
         }
+    }
+
+    #[test]
+    fn maps_archive_allocation_limit_as_resource_limit() {
+        let limits = ArchiveLimits {
+            max_array_elements: 10,
+            max_allocation_bytes: 7,
+            ..ArchiveLimits::default()
+        };
+        let bytes = 2_i32.to_le_bytes();
+        let archive_error = Reader::with_limits(&bytes, limits)
+            .read_tarray::<u32>("Values", 4, |reader, _| reader.read_u32("Value"))
+            .unwrap_err();
+        assert_eq!(archive_error.kind(), ArchiveErrorKind::AllocationLimit);
+
+        let error = PackageError::from(archive_error);
+
+        assert_eq!(error.kind(), PackageErrorKind::ResourceLimit);
+        assert_eq!(error.path(), "Values.Count");
     }
 
     #[test]
