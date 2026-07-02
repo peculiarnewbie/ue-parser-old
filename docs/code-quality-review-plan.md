@@ -87,7 +87,10 @@ the upper layers use the same safety, typing, and testing standards.
   - [x] curve keys
   - [x] wide strings
   - [x] utrace event loops
-- Measure allocation behavior before and after if practical.
+- [x] Measure allocation behavior before and after if practical.
+  - Assessed: no allocator instrumentation or parser benchmark harness exists
+    yet, so this slice was verified with targeted code review plus
+    fmt/clippy/tests rather than a noisy one-off measurement.
 
 ## 5. Replace Stringly Dispatch
 
