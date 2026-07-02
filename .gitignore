@@ -3,5 +3,7 @@ Cargo.lock
 tests/fixtures/*
 !tests/fixtures/
 !tests/fixtures/electroswag-v15.json
+!tests/fixtures/tiny/
+!tests/fixtures/tiny/*.hex
 *.exe
 tmp_*.txt

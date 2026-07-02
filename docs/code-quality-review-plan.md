@@ -34,7 +34,10 @@ the upper layers use the same safety, typing, and testing standards.
   - Completed: real fixture-dependent package, CLI, electroswag, and utrace
     tests are now explicit ignored tests, and their fixture helpers fail loudly
     when those ignored tests are run without configured fixtures.
-- Commit a tiny fixture corpus for always-on integration coverage.
+- [x] Commit a tiny fixture corpus for always-on integration coverage.
+  - Completed: added reviewable hex fixtures for a minimal current UE5 package
+    summary and a minimal utrace prologue/thread trace, with always-on library
+    and CLI integration tests.
 - Add CLI-level malformed input tests.
 - Add fuzz targets for:
   - `Package::parse`
