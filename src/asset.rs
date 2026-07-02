@@ -1491,9 +1491,9 @@ fn decode_simple_curve_keys(
 
     let reader = crate::archive::Reader::new(source);
     let mut payload = reader
-        .bounded(record.payload, &format!("{path}.Keys.Payload"))
+        .bounded(record.payload, &format_args!("{path}.Keys.Payload"))
         .map_err(AssetError::from)?;
-    let count = payload.read_i32(&format!("{path}.Keys.Count"))?;
+    let count = payload.read_i32(&format_args!("{path}.Keys.Count"))?;
     if count < 0 {
         return Err(AssetError::new(
             AssetErrorKind::MalformedData,
@@ -1503,13 +1503,13 @@ fn decode_simple_curve_keys(
     let capacity = payload.checked_vec_capacity::<CurveKey>(
         usize::try_from(count).expect("i32 fits in usize"),
         8,
-        &format!("{path}.Keys.Count"),
+        &format_args!("{path}.Keys.Count"),
     )?;
     let mut keys = Vec::with_capacity(capacity);
     for index in 0..count {
         keys.push(CurveKey::Simple(SimpleCurveKey {
-            time: payload.read_f32(&format!("{path}.Keys[{index}].Time"))?,
-            value: payload.read_f32(&format!("{path}.Keys[{index}].Value"))?,
+            time: payload.read_f32(&format_args!("{path}.Keys[{index}].Time"))?,
+            value: payload.read_f32(&format_args!("{path}.Keys[{index}].Value"))?,
         }));
     }
     if payload.remaining() != 0 {
@@ -1546,9 +1546,9 @@ fn decode_rich_curve_keys(
 
     let reader = crate::archive::Reader::new(source);
     let mut payload = reader
-        .bounded(record.payload, &format!("{path}.Keys.Payload"))
+        .bounded(record.payload, &format_args!("{path}.Keys.Payload"))
         .map_err(AssetError::from)?;
-    let count = payload.read_i32(&format!("{path}.Keys.Count"))?;
+    let count = payload.read_i32(&format_args!("{path}.Keys.Count"))?;
     if count < 0 {
         return Err(AssetError::new(
             AssetErrorKind::MalformedData,
@@ -1558,23 +1558,24 @@ fn decode_rich_curve_keys(
     let capacity = payload.checked_vec_capacity::<CurveKey>(
         usize::try_from(count).expect("i32 fits in usize"),
         27,
-        &format!("{path}.Keys.Count"),
+        &format_args!("{path}.Keys.Count"),
     )?;
     let mut keys = Vec::with_capacity(capacity);
     for index in 0..count {
         keys.push(CurveKey::Rich(RichCurveKey {
-            interp_mode: payload.read_u8(&format!("{path}.Keys[{index}].InterpMode"))?,
-            tangent_mode: payload.read_u8(&format!("{path}.Keys[{index}].TangentMode"))?,
+            interp_mode: payload.read_u8(&format_args!("{path}.Keys[{index}].InterpMode"))?,
+            tangent_mode: payload.read_u8(&format_args!("{path}.Keys[{index}].TangentMode"))?,
             tangent_weight_mode: payload
-                .read_u8(&format!("{path}.Keys[{index}].TangentWeightMode"))?,
-            time: payload.read_f32(&format!("{path}.Keys[{index}].Time"))?,
-            value: payload.read_f32(&format!("{path}.Keys[{index}].Value"))?,
-            arrive_tangent: payload.read_f32(&format!("{path}.Keys[{index}].ArriveTangent"))?,
+                .read_u8(&format_args!("{path}.Keys[{index}].TangentWeightMode"))?,
+            time: payload.read_f32(&format_args!("{path}.Keys[{index}].Time"))?,
+            value: payload.read_f32(&format_args!("{path}.Keys[{index}].Value"))?,
+            arrive_tangent: payload
+                .read_f32(&format_args!("{path}.Keys[{index}].ArriveTangent"))?,
             arrive_tangent_weight: payload
-                .read_f32(&format!("{path}.Keys[{index}].ArriveTangentWeight"))?,
-            leave_tangent: payload.read_f32(&format!("{path}.Keys[{index}].LeaveTangent"))?,
+                .read_f32(&format_args!("{path}.Keys[{index}].ArriveTangentWeight"))?,
+            leave_tangent: payload.read_f32(&format_args!("{path}.Keys[{index}].LeaveTangent"))?,
             leave_tangent_weight: payload
-                .read_f32(&format!("{path}.Keys[{index}].LeaveTangentWeight"))?,
+                .read_f32(&format_args!("{path}.Keys[{index}].LeaveTangentWeight"))?,
         }));
     }
     if payload.remaining() != 0 {

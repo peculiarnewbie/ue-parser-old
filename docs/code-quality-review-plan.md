@@ -78,13 +78,15 @@ the upper layers use the same safety, typing, and testing standards.
   - Completed: `Reader` and `ArchiveError` path inputs now accept
     `Display`, allowing lazy `format_args!` path construction without allocating
     on successful reads.
-- Avoid eager `format!` on successful reads.
+- [x] Avoid eager `format!` on successful reads.
+  - Completed: migrated the first hot `Reader` loops to lazy
+    `format_args!` paths.
 - Migrate hot loops first:
-  - name map
-  - property streams
-  - curve keys
-  - wide strings
-  - utrace event loops
+  - [x] name map
+  - [x] property streams
+  - [x] curve keys
+  - [x] wide strings
+  - [x] utrace event loops
 - Measure allocation behavior before and after if practical.
 
 ## 5. Replace Stringly Dispatch

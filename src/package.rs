@@ -1016,10 +1016,9 @@ fn read_name_map(
     let mut names = Vec::with_capacity(capacity);
 
     for index in 0..count {
-        let path = format!("Names[{index}]");
-        names.push(reader.read_fstring(&path)?);
+        names.push(reader.read_fstring(&format_args!("Names[{index}]"))?);
         if summary.versions.is_at_least_ue4(UE4_NAME_HASHES_SERIALIZED) {
-            reader.skip(4, &format!("{path}.Hashes"))?;
+            reader.skip(4, &format_args!("Names[{index}].Hashes"))?;
         }
     }
     Ok(names)

@@ -290,7 +290,7 @@ pub fn read_tagged_property_stream(
     let mut records = Vec::new();
     loop {
         let tag_start = reader.tell();
-        let name = reader.read_name_ref(&format!("{path}.Tag.Name"))?;
+        let name = reader.read_name_ref(&format_args!("{path}.Tag.Name"))?;
         validate_name_ref(names, name, &format!("{path}.Tag.Name"))?;
         if resolve_name_ref(names, name)? == "None" {
             return Ok(PropertyStream {
@@ -302,7 +302,7 @@ pub fn read_tagged_property_stream(
 
         let type_name = read_property_type_name(reader, names, &format!("{path}.Tag.Type"))?;
         let size_offset = reader.tell();
-        let size = reader.read_i32(&format!("{path}.Tag.Size"))?;
+        let size = reader.read_i32(&format_args!("{path}.Tag.Size"))?;
         if size < 0 {
             return Err(PropertyError::new(
                 PropertyErrorKind::MalformedData,
@@ -312,15 +312,15 @@ pub fn read_tagged_property_stream(
             ));
         }
         let payload_size = u64::try_from(size).expect("size was checked as non-negative");
-        let flags = PropertyTagFlags(reader.read_u8(&format!("{path}.Tag.Flags"))?);
+        let flags = PropertyTagFlags(reader.read_u8(&format_args!("{path}.Tag.Flags"))?);
         let array_index = if flags.contains(TAG_FLAG_HAS_ARRAY_INDEX) {
-            reader.read_i32(&format!("{path}.Tag.ArrayIndex"))?
+            reader.read_i32(&format_args!("{path}.Tag.ArrayIndex"))?
         } else {
             0
         };
         let property_guid = flags
             .contains(TAG_FLAG_HAS_PROPERTY_GUID)
-            .then(|| reader.read_guid(&format!("{path}.Tag.PropertyGuid")))
+            .then(|| reader.read_guid(&format_args!("{path}.Tag.PropertyGuid")))
             .transpose()?;
         let extensions = if flags.contains(TAG_FLAG_HAS_PROPERTY_EXTENSIONS) {
             Some(read_property_extensions(
@@ -333,7 +333,7 @@ pub fn read_tagged_property_stream(
         };
 
         let payload = Span::new(reader.tell(), payload_size)?;
-        reader.skip(payload_size, &format!("{path}.Tag.Payload"))?;
+        reader.skip(payload_size, &format_args!("{path}.Tag.Payload"))?;
         records.push(PropertyRecord {
             name,
             type_name,

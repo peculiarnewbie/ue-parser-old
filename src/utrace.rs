@@ -6850,10 +6850,10 @@ impl<'a> VarintReader<'a> {
 }
 
 fn read_protocol4_field(reader: &mut Reader<'_>, index: u8) -> Result<RawFieldInfo, TraceError> {
-    let offset = reader.read_u16(&format!("NewEvent.Fields[{index}].Offset"))?;
-    let size = reader.read_u16(&format!("NewEvent.Fields[{index}].Size"))?;
-    let type_info = reader.read_u8(&format!("NewEvent.Fields[{index}].TypeInfo"))?;
-    let name_size = reader.read_u8(&format!("NewEvent.Fields[{index}].NameSize"))?;
+    let offset = reader.read_u16(&format_args!("NewEvent.Fields[{index}].Offset"))?;
+    let size = reader.read_u16(&format_args!("NewEvent.Fields[{index}].Size"))?;
+    let type_info = reader.read_u8(&format_args!("NewEvent.Fields[{index}].TypeInfo"))?;
+    let name_size = reader.read_u8(&format_args!("NewEvent.Fields[{index}].NameSize"))?;
     Ok(RawFieldInfo {
         family: FieldFamily::Regular,
         offset,
@@ -6865,15 +6865,15 @@ fn read_protocol4_field(reader: &mut Reader<'_>, index: u8) -> Result<RawFieldIn
 }
 
 fn read_protocol6_field(reader: &mut Reader<'_>, index: u8) -> Result<RawFieldInfo, TraceError> {
-    let field_type = reader.read_u8(&format!("NewEvent.Fields[{index}].FieldType"))?;
-    reader.skip(1, &format!("NewEvent.Fields[{index}].Padding"))?;
+    let field_type = reader.read_u8(&format_args!("NewEvent.Fields[{index}].FieldType"))?;
+    reader.skip(1, &format_args!("NewEvent.Fields[{index}].Padding"))?;
     match field_type {
         0 => read_protocol4_field(reader, index),
         1 => {
-            let offset = reader.read_u16(&format!("NewEvent.Fields[{index}].Offset"))?;
-            let ref_uid = reader.read_u16(&format!("NewEvent.Fields[{index}].RefUid"))?;
-            let type_info = reader.read_u8(&format!("NewEvent.Fields[{index}].TypeInfo"))?;
-            let name_size = reader.read_u8(&format!("NewEvent.Fields[{index}].NameSize"))?;
+            let offset = reader.read_u16(&format_args!("NewEvent.Fields[{index}].Offset"))?;
+            let ref_uid = reader.read_u16(&format_args!("NewEvent.Fields[{index}].RefUid"))?;
+            let type_info = reader.read_u8(&format_args!("NewEvent.Fields[{index}].TypeInfo"))?;
+            let name_size = reader.read_u8(&format_args!("NewEvent.Fields[{index}].NameSize"))?;
             Ok(RawFieldInfo {
                 family: FieldFamily::Reference,
                 offset,
@@ -6884,10 +6884,10 @@ fn read_protocol6_field(reader: &mut Reader<'_>, index: u8) -> Result<RawFieldIn
             })
         }
         2 => {
-            let offset = reader.read_u16(&format!("NewEvent.Fields[{index}].Offset"))?;
-            reader.skip(2, &format!("NewEvent.Fields[{index}].Unused1"))?;
-            reader.skip(1, &format!("NewEvent.Fields[{index}].Unused2"))?;
-            let type_info = reader.read_u8(&format!("NewEvent.Fields[{index}].TypeInfo"))?;
+            let offset = reader.read_u16(&format_args!("NewEvent.Fields[{index}].Offset"))?;
+            reader.skip(2, &format_args!("NewEvent.Fields[{index}].Unused1"))?;
+            reader.skip(1, &format_args!("NewEvent.Fields[{index}].Unused2"))?;
+            let type_info = reader.read_u8(&format_args!("NewEvent.Fields[{index}].TypeInfo"))?;
             Ok(RawFieldInfo {
                 family: FieldFamily::DefinitionId,
                 offset,
