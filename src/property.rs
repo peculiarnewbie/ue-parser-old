@@ -21,6 +21,7 @@ const PROPERTY_EXTENSION_OVERRIDABLE_INFORMATION: u8 = 0x02;
 
 const CLASS_EXTENSION_RESERVE_FOR_FUTURE_USE: u8 = 0x01;
 const CLASS_EXTENSION_OVERRIDABLE_SERIALIZATION_INFORMATION: u8 = 0x02;
+const MAX_PROPERTY_TYPE_DEPTH: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PropertyTypeName {
@@ -376,6 +377,23 @@ fn read_property_type_name(
     names: &[String],
     path: &str,
 ) -> Result<PropertyTypeName, PropertyError> {
+    read_property_type_name_at_depth(reader, names, path, 0)
+}
+
+fn read_property_type_name_at_depth(
+    reader: &mut Reader<'_>,
+    names: &[String],
+    path: &str,
+    depth: usize,
+) -> Result<PropertyTypeName, PropertyError> {
+    if depth >= MAX_PROPERTY_TYPE_DEPTH {
+        return Err(PropertyError::new(
+            PropertyErrorKind::MalformedData,
+            Some(reader.tell()),
+            path,
+            format!("property type-name nesting exceeds depth limit {MAX_PROPERTY_TYPE_DEPTH}"),
+        ));
+    }
     let name = reader.read_name_ref(&format!("{path}.Name"))?;
     validate_name_ref(names, name, &format!("{path}.Name"))?;
     let inner_count_offset = reader.tell();
@@ -389,12 +407,18 @@ fn read_property_type_name(
         ));
     }
     let inner_count = usize::try_from(inner_count).expect("non-negative i32 fits in usize");
+    reader.checked_vec_capacity::<PropertyTypeName>(
+        inner_count,
+        12,
+        &format!("{path}.InnerCount"),
+    )?;
     let mut parameters = Vec::with_capacity(inner_count);
     for index in 0..inner_count {
-        parameters.push(read_property_type_name(
+        parameters.push(read_property_type_name_at_depth(
             reader,
             names,
             &format!("{path}.Parameters[{index}]"),
+            depth + 1,
         )?);
     }
     Ok(PropertyTypeName { name, parameters })
@@ -550,6 +574,30 @@ mod tests {
         assert_eq!(type_name.name, name_ref(5, 0));
         assert_eq!(type_name.parameters.len(), 1);
         assert_eq!(type_name.parameters[0].name, name_ref(6, 0));
+    }
+
+    #[test]
+    fn rejects_overly_deep_property_type_names() {
+        fn write_nested_type(bytes: &mut Vec<u8>, depth: usize) {
+            push_i32(bytes, 5);
+            push_i32(bytes, 0);
+            if depth == 0 {
+                push_i32(bytes, 0);
+            } else {
+                push_i32(bytes, 1);
+                write_nested_type(bytes, depth - 1);
+            }
+        }
+
+        let mut bytes = Vec::new();
+        write_nested_type(&mut bytes, MAX_PROPERTY_TYPE_DEPTH);
+        let mut reader = Reader::new(&bytes);
+
+        let error = read_property_type_name_for_test(&mut reader, &names())
+            .expect_err("depth limit should reject nested type names");
+
+        assert_eq!(error.kind(), PropertyErrorKind::MalformedData);
+        assert!(error.detail().contains("depth limit"));
     }
 
     #[test]

@@ -1,0 +1,136 @@
+# Code Quality Review Plan
+
+This plan tracks the implementation work from the code quality review. The
+priority is to preserve the parser's existing low-level discipline while making
+the upper layers use the same safety, typing, and testing standards.
+
+## 0. Lock Current Baseline
+
+- Keep the recent correctness fixes as the first slice.
+- Record the baseline verification commands:
+  - `cargo fmt`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+  - `cargo test --all-targets --all-features`
+
+## 1. Finish Remaining Actual Bugs
+
+- Confirm current fixes cover:
+  - package-index cycle detection
+  - recursion depth caps
+  - `ByteProperty` container decoding
+  - checked allocations
+  - legacy-version `unreachable!`
+- Still address:
+  - strict UTF-16 failure policy in `utrace.rs`
+  - error taxonomy for `ArchiveErrorKind::AllocationLimit` versus malformed data
+- Add corrupt and truncated input tests for package parse and utrace parse paths.
+
+## 2. Make Tests Trustworthy
+
+- Stop silent green fixture skips.
+- Convert optional fixture tests to either:
+  - explicit `#[ignore]` fixture tests, or
+  - CI-required fixture tests with clear environment setup.
+- Commit a tiny fixture corpus for always-on integration coverage.
+- Add CLI-level malformed input tests.
+- Add fuzz targets for:
+  - `Package::parse`
+  - tagged property stream parsing
+  - utrace header and packet parsing
+
+## 3. Centralize Allocation And Count Handling
+
+- Audit all `Vec::with_capacity` calls.
+- Replace raw capacity calls from file-controlled counts with `Reader` helpers.
+- Add test cases for absurd counts in package, asset, codec, and utrace paths.
+- Treat unchecked file-driven capacity as a review blocker.
+
+## 4. Add Lazy Error Context
+
+- Design a small path/context abstraction for `Reader`.
+- Avoid eager `format!` on successful reads.
+- Migrate hot loops first:
+  - name map
+  - property streams
+  - curve keys
+  - wide strings
+  - utrace event loops
+- Measure allocation behavior before and after if practical.
+
+## 5. Replace Stringly Dispatch
+
+- Add enums for known domains:
+  - `PropertyKind`
+  - `TraceEventKind`
+  - JSON status/kind enums where stable contract matters
+- Resolve strings once at boundaries.
+- Update property decoding to match on `PropertyKind`.
+- Update utrace event routing to avoid repeated string-table scans and tuple
+  string matches.
+
+## 6. Deduplicate Repeated Helpers
+
+- Extract shared helpers for:
+  - archive bool decoding
+  - name-reference validation and resolution
+  - asset class preambles
+  - important-event stream walking
+  - CLI render and command drivers
+- Remove duplicated error-output structs where one shared shape works.
+
+## 7. Strengthen Domain Types
+
+- Replace sentinel primitives with domain types where they reduce invalid states:
+  - `parent_index: Option<_>` instead of a documented `-1`
+  - thread-id newtypes or one consistent integer width
+  - named structs for `(count, cycles)` aggregations
+  - flags newtypes for raw `u32` flag fields
+- Apply these where they remove repeated conversion code or impossible states.
+
+## 8. Fix Flag-Bag Output Shapes
+
+- Convert `AssetOutput` to a `#[serde(tag = "kind")]` enum.
+- Align `PropertyOutput::from_record` and `value_output` for raw size semantics.
+- Decide which JSON structs are stable CLI contract versus internal library
+  shapes.
+- Require schema-version bumps for stable output changes.
+
+## 9. Split `utrace.rs`
+
+- Split by ownership:
+  - `types`
+  - `error`
+  - `transport`
+  - `registry`
+  - `cbor`
+  - `cpu`
+  - `gpu`
+  - `dashboard`
+  - `coverage`
+- Move tests with the module they validate where practical.
+- Keep the public API stable during the split.
+
+## 10. Reduce Utrace Copies
+
+- Make normal event streaming use borrowed `RawEvent<'_>`.
+- Only materialize owned payloads at API and output seams.
+- Avoid reparsing aux payloads multiple times per event.
+- Add memory-oriented regression tests or benchmarks for large traces.
+
+## 11. Public API Future-Proofing
+
+- Add `#[non_exhaustive]` to public enums before release.
+- Revisit `From<ArchiveError>` mappings so allocation/resource-limit errors are
+  not reported as generic corruption.
+- Document semver expectations for parser enums and CLI JSON.
+
+## Suggested Order
+
+1. Test reliability.
+2. Remaining actual bugs.
+3. Allocation audit.
+4. Lazy error context.
+5. String dispatch enums.
+6. Deduplication.
+7. Output, type, and API cleanup.
+8. Utrace split and borrowed event model.

@@ -158,6 +158,70 @@ fn utrace_json_success_decodes_prologue_and_threads() {
 }
 
 #[cfg(feature = "utrace")]
+#[test]
+fn utrace_coverage_json_contract_cross_references_universe() {
+    let dir = std::env::temp_dir();
+    let trace_path = dir.join(format!(
+        "uasset-parser-utrace-{}-coverage.utrace",
+        std::process::id()
+    ));
+    let universe_path = dir.join(format!(
+        "uasset-parser-utrace-{}-universe.txt",
+        std::process::id()
+    ));
+    std::fs::write(&trace_path, synthetic_utrace()).unwrap();
+    std::fs::write(&universe_path, "$Trace.NewTrace\nMadeUp.Event\n").unwrap();
+
+    let output = binary()
+        .args([
+            "utrace",
+            "coverage",
+            trace_path.to_str().unwrap(),
+            "--universe",
+            universe_path.to_str().unwrap(),
+            "--format=json",
+        ])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&trace_path);
+    let _ = std::fs::remove_file(&universe_path);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stderr.is_empty(),
+        "stderr was not empty: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["coverage"]["summary"]["declared_event_types"], 2);
+    assert_eq!(json["coverage"]["summary"]["decoded_event_types"], 2);
+    assert_eq!(json["coverage"]["summary"]["raw_event_types"], 0);
+    assert_eq!(json["coverage"]["summary"]["raw_observed_events"], 0);
+    assert!(
+        json["coverage"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["logger"] == "$Trace"
+                && event["event"] == "NewTrace"
+                && event["status"] == "decoded"
+                && event["note"].as_str().is_some())
+    );
+    assert_eq!(json["coverage"]["universe"]["total"], 2);
+    assert_eq!(json["coverage"]["universe"]["declared_in_trace"], 1);
+    assert!(
+        json["coverage"]["universe"]["unseen"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event == "MadeUp.Event")
+    );
+}
+
+#[cfg(feature = "utrace")]
 fn synthetic_utrace() -> Vec<u8> {
     const UINT8: u8 = 0x00;
     const UINT16: u8 = 0x01;

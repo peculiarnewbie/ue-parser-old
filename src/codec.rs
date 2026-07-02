@@ -9,6 +9,7 @@ use crate::property::{
 
 /// UE `INDEX_NONE` marks a full container replace in map property payloads.
 const INDEX_NONE: i32 = -1;
+const MAX_PROPERTY_DECODE_DEPTH: usize = 64;
 use crate::schema::SchemaProvider;
 use crate::version::VersionContext;
 
@@ -16,6 +17,12 @@ pub struct DecodeContext<'a> {
     pub package: &'a Package,
     pub versions: &'a VersionContext,
     pub schemas: &'a dyn SchemaProvider,
+}
+
+#[derive(Clone, Copy)]
+struct TypeSpec<'a> {
+    name: &'a str,
+    tree: &'a PropertyTypeName,
 }
 
 /// Decodes supported property payloads in place.
@@ -32,8 +39,17 @@ pub fn decode_property_stream_values(
     stream: &mut PropertyStream,
     context: &DecodeContext<'_>,
 ) -> Result<(), PropertyError> {
+    decode_property_stream_values_at_depth(source, stream, context, 0)
+}
+
+fn decode_property_stream_values_at_depth(
+    source: &[u8],
+    stream: &mut PropertyStream,
+    context: &DecodeContext<'_>,
+    depth: usize,
+) -> Result<(), PropertyError> {
     for record in &mut stream.records {
-        decode_property_record(source, record, context)?;
+        decode_property_record(source, record, context, depth)?;
     }
     Ok(())
 }
@@ -42,6 +58,7 @@ fn decode_property_record(
     source: &[u8],
     record: &mut PropertyRecord,
     context: &DecodeContext<'_>,
+    depth: usize,
 ) -> Result<(), PropertyError> {
     if record.flags.is_skipped() {
         record.value = PropertyValue::Raw {
@@ -85,12 +102,15 @@ fn decode_property_record(
     } else {
         match decode_typed_value(
             source,
-            &type_name,
-            &record.type_name,
+            TypeSpec {
+                name: &type_name,
+                tree: &record.type_name,
+            },
             record.flags,
             &mut payload,
             context,
             &path,
+            depth,
         ) {
             Ok(Some(value)) => value,
             Ok(None) => {
@@ -119,14 +139,14 @@ fn decode_property_record(
 
 fn decode_typed_value(
     source: &[u8],
-    type_name: &str,
-    type_tree: &PropertyTypeName,
+    type_spec: TypeSpec<'_>,
     flags: PropertyTagFlags,
     payload: &mut Reader<'_>,
     context: &DecodeContext<'_>,
     path: &str,
+    depth: usize,
 ) -> Result<Option<PropertyValue>, PropertyError> {
-    match type_name {
+    match type_spec.name {
         "BoolProperty" => Ok(Some(PropertyValue::Bool(flags.bool_value()))),
         "Int8Property" => Ok(Some(PropertyValue::Int(i64::from(
             payload.read_i8(&format!("{path}.Int8"))?,
@@ -190,10 +210,16 @@ fn decode_typed_value(
         "SoftObjectProperty" => Ok(Some(PropertyValue::SoftObjectPath(
             decode_soft_object_path(payload, path, context)?,
         ))),
-        "ArrayProperty" => decode_array_value(source, type_tree, payload, context, path).map(Some),
-        "SetProperty" => decode_set_value(source, type_tree, payload, context, path).map(Some),
-        "MapProperty" => decode_map_value(source, type_tree, payload, context, path).map(Some),
-        "StructProperty" => decode_struct_value(source, payload, context, path).map(Some),
+        "ArrayProperty" => {
+            decode_array_value(source, type_spec.tree, payload, context, path, depth).map(Some)
+        }
+        "SetProperty" => {
+            decode_set_value(source, type_spec.tree, payload, context, path, depth).map(Some)
+        }
+        "MapProperty" => {
+            decode_map_value(source, type_spec.tree, payload, context, path, depth).map(Some)
+        }
+        "StructProperty" => decode_struct_value(source, payload, context, path, depth).map(Some),
         _ => Ok(None),
     }
 }
@@ -268,30 +294,33 @@ fn decode_array_value(
     payload: &mut Reader<'_>,
     context: &DecodeContext<'_>,
     path: &str,
+    depth: usize,
 ) -> Result<PropertyValue, PropertyError> {
     let (inner_type, inner_name) = resolve_inner_type(context, type_tree, path, "ArrayProperty")?;
 
     let count = payload.read_count(&format!("{path}.Count"))?;
+    payload.checked_vec_capacity::<PropertyValue>(
+        count,
+        minimum_serialized_size(&inner_name, inner_type),
+        &format!("{path}.Count"),
+    )?;
     let mut values = Vec::with_capacity(count);
     for index in 0..count {
         let element_path = format!("{path}[{index}]");
         values.push(
-            decode_typed_value(
+            decode_container_element(
                 source,
-                &inner_name,
-                inner_type,
-                PropertyTagFlags::default(),
+                TypeSpec {
+                    name: &inner_name,
+                    tree: inner_type,
+                },
                 payload,
                 context,
                 &element_path,
+                depth,
             )?
             .ok_or_else(|| {
-                PropertyError::new(
-                    crate::property::PropertyErrorKind::MalformedData,
-                    Some(payload.tell()),
-                    &element_path,
-                    format!("unsupported array element type {inner_name}"),
-                )
+                unsupported_container_type(payload, &element_path, "array element", &inner_name)
             })?,
         );
     }
@@ -304,6 +333,7 @@ fn decode_set_value(
     payload: &mut Reader<'_>,
     context: &DecodeContext<'_>,
     path: &str,
+    depth: usize,
 ) -> Result<PropertyValue, PropertyError> {
     let (element_type, element_name) = resolve_inner_type(context, type_tree, path, "SetProperty")?;
 
@@ -316,48 +346,52 @@ fn decode_set_value(
             format!("set ElementsToRemove count must be non-negative, got {remove_count}"),
         ));
     }
+    payload.checked_vec_capacity::<PropertyValue>(
+        usize::try_from(remove_count).expect("non-negative i32 fits in usize"),
+        minimum_serialized_size(&element_name, element_type),
+        &format!("{path}.ElementsToRemove.Count"),
+    )?;
     for index in 0..remove_count {
         let element_path = format!("{path}.ElementsToRemove[{index}]");
-        decode_typed_value(
+        decode_container_element(
             source,
-            &element_name,
-            element_type,
-            PropertyTagFlags::default(),
+            TypeSpec {
+                name: &element_name,
+                tree: element_type,
+            },
             payload,
             context,
             &element_path,
+            depth,
         )?
         .ok_or_else(|| {
-            PropertyError::new(
-                crate::property::PropertyErrorKind::MalformedData,
-                Some(payload.tell()),
-                &element_path,
-                format!("unsupported set element type {element_name}"),
-            )
+            unsupported_container_type(payload, &element_path, "set element", &element_name)
         })?;
     }
 
     let count = payload.read_count(&format!("{path}.Elements.Count"))?;
+    payload.checked_vec_capacity::<PropertyValue>(
+        count,
+        minimum_serialized_size(&element_name, element_type),
+        &format!("{path}.Elements.Count"),
+    )?;
     let mut values = Vec::with_capacity(count);
     for index in 0..count {
         let element_path = format!("{path}.Elements[{index}]");
         values.push(
-            decode_typed_value(
+            decode_container_element(
                 source,
-                &element_name,
-                element_type,
-                PropertyTagFlags::default(),
+                TypeSpec {
+                    name: &element_name,
+                    tree: element_type,
+                },
                 payload,
                 context,
                 &element_path,
+                depth,
             )?
             .ok_or_else(|| {
-                PropertyError::new(
-                    crate::property::PropertyErrorKind::MalformedData,
-                    Some(payload.tell()),
-                    &element_path,
-                    format!("unsupported set element type {element_name}"),
-                )
+                unsupported_container_type(payload, &element_path, "set element", &element_name)
             })?,
         );
     }
@@ -370,31 +404,32 @@ fn decode_map_value(
     payload: &mut Reader<'_>,
     context: &DecodeContext<'_>,
     path: &str,
+    depth: usize,
 ) -> Result<PropertyValue, PropertyError> {
     let (key_type, key_name) = resolve_map_key_type(context, type_tree, path)?;
     let (value_type, value_name) = resolve_map_value_type(context, type_tree, path)?;
 
     let keys_to_remove = payload.read_i32(&format!("{path}.KeysToRemove.Count"))?;
     if keys_to_remove > 0 {
+        payload.checked_vec_capacity::<PropertyValue>(
+            usize::try_from(keys_to_remove).expect("positive i32 fits in usize"),
+            minimum_serialized_size(&key_name, key_type),
+            &format!("{path}.KeysToRemove.Count"),
+        )?;
         for index in 0..keys_to_remove {
             let key_path = format!("{path}.KeysToRemove[{index}]");
-            decode_typed_value(
+            decode_container_element(
                 source,
-                &key_name,
-                key_type,
-                PropertyTagFlags::default(),
+                TypeSpec {
+                    name: &key_name,
+                    tree: key_type,
+                },
                 payload,
                 context,
                 &key_path,
+                depth,
             )?
-            .ok_or_else(|| {
-                PropertyError::new(
-                    crate::property::PropertyErrorKind::MalformedData,
-                    Some(payload.tell()),
-                    &key_path,
-                    format!("unsupported map key type {key_name}"),
-                )
-            })?;
+            .ok_or_else(|| unsupported_container_type(payload, &key_path, "map key", &key_name))?;
         }
     } else if keys_to_remove != 0 && keys_to_remove != INDEX_NONE {
         return Err(PropertyError::new(
@@ -406,48 +441,119 @@ fn decode_map_value(
     }
 
     let count = payload.read_count(&format!("{path}.Entries.Count"))?;
+    let entry_minimum = minimum_serialized_size(&key_name, key_type)
+        .saturating_add(minimum_serialized_size(&value_name, value_type));
+    payload.checked_vec_capacity::<MapEntry>(
+        count,
+        entry_minimum,
+        &format!("{path}.Entries.Count"),
+    )?;
     let mut entries = Vec::with_capacity(count);
     for index in 0..count {
         let entry_path = format!("{path}.Entries[{index}]");
         let key_path = format!("{entry_path}.Key");
         let value_path = format!("{entry_path}.Value");
-        let key = decode_typed_value(
+        let key = decode_container_element(
             source,
-            &key_name,
-            key_type,
-            PropertyTagFlags::default(),
+            TypeSpec {
+                name: &key_name,
+                tree: key_type,
+            },
             payload,
             context,
             &key_path,
+            depth,
         )?
-        .ok_or_else(|| {
-            PropertyError::new(
-                crate::property::PropertyErrorKind::MalformedData,
-                Some(payload.tell()),
-                &key_path,
-                format!("unsupported map key type {key_name}"),
-            )
-        })?;
-        let value = decode_typed_value(
+        .ok_or_else(|| unsupported_container_type(payload, &key_path, "map key", &key_name))?;
+        let value = decode_container_element(
             source,
-            &value_name,
-            value_type,
-            PropertyTagFlags::default(),
+            TypeSpec {
+                name: &value_name,
+                tree: value_type,
+            },
             payload,
             context,
             &value_path,
+            depth,
         )?
         .ok_or_else(|| {
-            PropertyError::new(
-                crate::property::PropertyErrorKind::MalformedData,
-                Some(payload.tell()),
-                &value_path,
-                format!("unsupported map value type {value_name}"),
-            )
+            unsupported_container_type(payload, &value_path, "map value", &value_name)
         })?;
         entries.push(MapEntry { key, value });
     }
     Ok(PropertyValue::Map(entries))
+}
+
+fn decode_container_element(
+    source: &[u8],
+    type_spec: TypeSpec<'_>,
+    payload: &mut Reader<'_>,
+    context: &DecodeContext<'_>,
+    path: &str,
+    depth: usize,
+) -> Result<Option<PropertyValue>, PropertyError> {
+    if let Some(byte_count) = fixed_serialized_size(type_spec.name, type_spec.tree) {
+        let mut element_payload = payload.take_bounded(
+            u64::try_from(byte_count).expect("fixed payload size fits in u64"),
+            path,
+        )?;
+        return decode_typed_value(
+            source,
+            type_spec,
+            PropertyTagFlags::default(),
+            &mut element_payload,
+            context,
+            path,
+            depth,
+        );
+    }
+
+    decode_typed_value(
+        source,
+        type_spec,
+        PropertyTagFlags::default(),
+        payload,
+        context,
+        path,
+        depth,
+    )
+}
+
+fn unsupported_container_type(
+    payload: &Reader<'_>,
+    path: &str,
+    role: &str,
+    type_name: &str,
+) -> PropertyError {
+    PropertyError::new(
+        crate::property::PropertyErrorKind::MalformedData,
+        Some(payload.tell()),
+        path,
+        format!("unsupported {role} type {type_name}"),
+    )
+}
+
+fn minimum_serialized_size(type_name: &str, type_tree: &PropertyTypeName) -> usize {
+    fixed_serialized_size(type_name, type_tree).unwrap_or(1)
+}
+
+fn fixed_serialized_size(type_name: &str, type_tree: &PropertyTypeName) -> Option<usize> {
+    match type_name {
+        "Int8Property" | "UInt8Property" => Some(1),
+        "ByteProperty" => Some(if type_tree.parameters.is_empty() {
+            1
+        } else {
+            8
+        }),
+        "Int16Property" | "UInt16Property" => Some(2),
+        "IntProperty" | "Int32Property" | "UInt32Property" | "FloatProperty" | "ObjectProperty"
+        | "ClassProperty" | "WeakObjectProperty" => Some(4),
+        "Int64Property" | "UInt64Property" | "DoubleProperty" | "NameProperty" | "EnumProperty" => {
+            Some(8)
+        }
+        "LazyObjectProperty" => Some(16),
+        _ => None,
+    }
 }
 
 fn resolve_inner_type<'a>(
@@ -528,10 +634,19 @@ fn decode_struct_value(
     payload: &mut Reader<'_>,
     context: &DecodeContext<'_>,
     path: &str,
+    depth: usize,
 ) -> Result<PropertyValue, PropertyError> {
+    if depth >= MAX_PROPERTY_DECODE_DEPTH {
+        return Err(PropertyError::new(
+            crate::property::PropertyErrorKind::MalformedData,
+            Some(payload.tell()),
+            path,
+            format!("property value nesting exceeds depth limit {MAX_PROPERTY_DECODE_DEPTH}"),
+        ));
+    }
     let mut stream =
         read_tagged_property_stream(payload, context.versions, &context.package.names, path)?;
-    decode_property_stream_values(source, &mut stream, context)?;
+    decode_property_stream_values_at_depth(source, &mut stream, context, depth + 1)?;
     Ok(PropertyValue::Struct(stream))
 }
 
@@ -657,7 +772,7 @@ mod tests {
             schemas: &schemas,
         };
         let mut record = record;
-        decode_property_record(&source, &mut record, &context).expect("decode record");
+        decode_property_record(&source, &mut record, &context, 0).expect("decode record");
         record.value
     }
 
@@ -842,6 +957,57 @@ mod tests {
     }
 
     #[test]
+    fn rejects_overly_deep_nested_struct_values() {
+        fn nested_struct_payload(depth: usize) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            if depth > 0 {
+                let child = nested_struct_payload(depth - 1);
+                write_property_tag(
+                    &mut bytes,
+                    3,
+                    &TypeParam {
+                        type_index: 4,
+                        parameters: Vec::new(),
+                    },
+                    0,
+                    &child,
+                );
+            }
+            write_property_terminator(&mut bytes, 0);
+            bytes
+        }
+
+        let bytes = nested_struct_payload(MAX_PROPERTY_DECODE_DEPTH + 1);
+        let names = vec![
+            "None".into(),
+            "NestedInt".into(),
+            "IntProperty".into(),
+            "NestedStruct".into(),
+            "StructProperty".into(),
+        ];
+        let mut reader = Reader::new(&bytes);
+        let mut stream =
+            read_tagged_property_stream(&mut reader, &ue5_versions(), &names, "Test.Struct")
+                .expect("parse struct stream");
+        let package = test_package(names);
+        let schemas = EmptySchemas;
+        let context = DecodeContext {
+            package: &package,
+            versions: &package.summary.versions,
+            schemas: &schemas,
+        };
+
+        let error = decode_property_stream_values(&bytes, &mut stream, &context)
+            .expect_err("depth limit should reject nested struct values");
+
+        assert_eq!(
+            error.kind(),
+            crate::property::PropertyErrorKind::MalformedData
+        );
+        assert!(error.detail().contains("depth limit"));
+    }
+
+    #[test]
     fn reports_raw_when_enum_payload_has_trailing_bytes() {
         let names = vec!["EnumProperty".into(), "MyEnum::Alpha".into()];
         let mut payload = Vec::new();
@@ -867,7 +1033,10 @@ mod tests {
         push_i32(&mut payload, 0); // name number
 
         let value = decode_record(names, 0, Vec::new(), PropertyTagFlags(0), &payload);
-        assert_eq!(value, PropertyValue::Enum(crate::test_support::name_ref(1, 0)));
+        assert_eq!(
+            value,
+            PropertyValue::Enum(crate::test_support::name_ref(1, 0))
+        );
     }
 
     #[test]
@@ -878,6 +1047,34 @@ mod tests {
 
         let value = decode_record(names, 0, Vec::new(), PropertyTagFlags(0), &payload);
         assert_eq!(value, PropertyValue::UInt(0x2A));
+    }
+
+    #[test]
+    fn decodes_plain_byte_array_elements_as_single_bytes() {
+        let names = vec!["ArrayProperty".into(), "ByteProperty".into()];
+        let mut payload = Vec::new();
+        push_i32(&mut payload, 3);
+        payload.extend_from_slice(&[1, 2, 3]);
+
+        let value = decode_record(
+            names,
+            0,
+            vec![PropertyTypeName {
+                name: crate::test_support::name_ref(1, 0),
+                parameters: Vec::new(),
+            }],
+            PropertyTagFlags(0),
+            &payload,
+        );
+
+        assert_eq!(
+            value,
+            PropertyValue::Array(vec![
+                PropertyValue::UInt(1),
+                PropertyValue::UInt(2),
+                PropertyValue::UInt(3),
+            ])
+        );
     }
 
     #[test]
@@ -944,7 +1141,7 @@ mod tests {
             versions: &package.summary.versions,
             schemas: &schemas,
         };
-        decode_property_record(&source, &mut record, &context).expect("decode");
+        decode_property_record(&source, &mut record, &context, 0).expect("decode");
         assert_eq!(
             record.value,
             PropertyValue::SoftObjectPath(

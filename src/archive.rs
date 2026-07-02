@@ -1,6 +1,6 @@
 //! Bounded byte access and Unreal primitive wire decoding.
 
-use std::fmt;
+use std::{fmt, mem::size_of};
 
 /// An absolute, half-open byte range in the source file.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -521,12 +521,45 @@ impl<'a> Reader<'a> {
             count_offset,
             &format!("{path}.Count"),
         )?;
+        self.validate_remaining(
+            count,
+            minimum_element_size,
+            count_offset,
+            &format!("{path}.Count"),
+        )?;
 
         let mut values = Vec::with_capacity(count);
         for index in 0..count {
             values.push(read_element(self, index)?);
         }
         Ok(values)
+    }
+
+    pub fn checked_vec_capacity<T>(
+        &self,
+        count: usize,
+        minimum_element_size: usize,
+        path: &str,
+    ) -> Result<usize, ArchiveError> {
+        if count > self.limits.max_array_elements {
+            return Err(ArchiveError::new(
+                ArchiveErrorKind::InvalidCount,
+                self.position,
+                path,
+                format!(
+                    "count {count} exceeds element limit {}",
+                    self.limits.max_array_elements
+                ),
+            ));
+        }
+        self.validate_allocation(
+            count,
+            minimum_element_size.max(size_of::<T>()),
+            self.position,
+            path,
+        )?;
+        self.validate_remaining(count, minimum_element_size, self.position, path)?;
+        Ok(count)
     }
 
     pub(crate) fn read_count(&mut self, path: &str) -> Result<usize, ArchiveError> {
@@ -578,6 +611,45 @@ impl<'a> Reader<'a> {
                 format!(
                     "minimum allocation {allocation} exceeds byte limit {}",
                     self.limits.max_allocation_bytes
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_remaining(
+        &self,
+        count: usize,
+        minimum_element_size: usize,
+        offset: u64,
+        path: &str,
+    ) -> Result<(), ArchiveError> {
+        let minimum_bytes = count.checked_mul(minimum_element_size).ok_or_else(|| {
+            ArchiveError::new(
+                ArchiveErrorKind::IntegerOverflow,
+                offset,
+                path,
+                format!(
+                    "serialized size for {count} elements of {minimum_element_size} bytes overflows"
+                ),
+            )
+        })?;
+        let minimum_bytes = u64::try_from(minimum_bytes).map_err(|_| {
+            ArchiveError::new(
+                ArchiveErrorKind::IntegerOverflow,
+                offset,
+                path,
+                "minimum serialized size does not fit in u64",
+            )
+        })?;
+        if minimum_bytes > self.remaining() {
+            return Err(ArchiveError::new(
+                ArchiveErrorKind::OutOfBounds,
+                offset,
+                path,
+                format!(
+                    "minimum serialized size {minimum_bytes} exceeds remaining bytes {}",
+                    self.remaining()
                 ),
             ));
         }

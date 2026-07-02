@@ -26,6 +26,7 @@ pub const STRINGTABLE_CLASS: &str = "/Script/Engine.StringTable";
 pub const USERDEFINEDENUM_CLASS: &str = "/Script/Engine.UserDefinedEnum";
 pub const USERDEFINEDSTRUCT_CLASS: &str = "/Script/CoreUObject.UserDefinedStruct";
 pub const SKELETON_CLASS: &str = "/Script/Engine.Skeleton";
+const MAX_FIELD_DEPTH: usize = 64;
 
 /// Package/meta exports that share the package file but are not inspectable assets.
 const SKIP_UOBJECT_DECODE_CLASSES: &[&str] = &[
@@ -437,6 +438,11 @@ impl AssetDecoder for DataTableDecoder {
                 format!("negative DataTable row count {row_count} at byte {row_count_offset}"),
             ));
         }
+        reader.checked_vec_capacity::<DataTableRow>(
+            usize::try_from(row_count).expect("i32 fits in usize"),
+            8,
+            &format!("{}.Rows.Count", export.object_path),
+        )?;
         let mut rows = Vec::with_capacity(usize::try_from(row_count).expect("i32 fits in usize"));
         for index in 0..row_count {
             let row_path = format!("{}.Rows[{index}]", export.object_path);
@@ -541,6 +547,11 @@ impl AssetDecoder for CurveTableDecoder {
                 ));
             }
         };
+        reader.checked_vec_capacity::<CurveTableRow>(
+            usize::try_from(row_count).expect("i32 fits in usize"),
+            16,
+            &format!("{}.Rows.Count", export.object_path),
+        )?;
         let mut rows = Vec::with_capacity(usize::try_from(row_count).expect("i32 fits in usize"));
         for index in 0..row_count {
             let row_path = format!("{}.Rows[{index}]", export.object_path);
@@ -670,6 +681,11 @@ impl AssetDecoder for StringTableDecoder {
                 ),
             ));
         }
+        reader.checked_vec_capacity::<StringTableEntry>(
+            usize::try_from(entry_count).expect("i32 fits in usize"),
+            8,
+            &format!("{}.Entries.Count", export.object_path),
+        )?;
         let mut entries =
             Vec::with_capacity(usize::try_from(entry_count).expect("i32 fits in usize"));
         for index in 0..entry_count {
@@ -754,6 +770,11 @@ impl AssetDecoder for EnumDecoder {
                 format!("negative Enum name count {count} at byte {count_offset}"),
             ));
         }
+        reader.checked_vec_capacity::<(NameRef, i64)>(
+            usize::try_from(count).expect("i32 fits in usize"),
+            16,
+            &format!("{}.Names.Count", export.object_path),
+        )?;
         let mut raw_entries =
             Vec::with_capacity(usize::try_from(count).expect("i32 fits in usize"));
         for index in 0..count {
@@ -895,6 +916,11 @@ impl AssetDecoder for StructDecoder {
                 format!("negative struct field count {field_count} at byte {field_count_offset}"),
             ));
         }
+        reader.checked_vec_capacity::<StructField>(
+            usize::try_from(field_count).expect("fits in usize"),
+            1,
+            &format!("{}.ChildProperties.Count", export.object_path),
+        )?;
         let mut fields = Vec::with_capacity(usize::try_from(field_count).expect("fits in usize"));
         for index in 0..field_count {
             let field_path = format!("{}.ChildProperties[{index}]", export.object_path);
@@ -966,6 +992,21 @@ fn read_field(
     context: &AssetDecodeContext<'_>,
     path: &str,
 ) -> Result<Option<StructField>, AssetError> {
+    read_field_at_depth(reader, context, path, 0)
+}
+
+fn read_field_at_depth(
+    reader: &mut crate::archive::Reader<'_>,
+    context: &AssetDecodeContext<'_>,
+    path: &str,
+    depth: usize,
+) -> Result<Option<StructField>, AssetError> {
+    if depth >= MAX_FIELD_DEPTH {
+        return Err(AssetError::new(
+            AssetErrorKind::MalformedData,
+            format!("struct field nesting exceeds depth limit {MAX_FIELD_DEPTH} at {path}"),
+        ));
+    }
     let type_name = reader.read_name_ref(&format!("{path}.Type"))?;
     let type_str = context.package.resolve_name(type_name).unwrap_or_default();
     if type_str == "None" || type_str.is_empty() {
@@ -987,7 +1028,7 @@ fn read_field(
     let _bp_rep_condition = reader.read_u8(&format!("{path}.BlueprintReplicationCondition"))?;
 
     // Type-specific tail.
-    let referenced_path = read_field_type_tail(reader, context, path, &type_str)?;
+    let referenced_path = read_field_type_tail(reader, context, path, &type_str, depth)?;
 
     Ok(Some(StructField {
         name,
@@ -1004,6 +1045,7 @@ fn read_field_type_tail(
     context: &AssetDecodeContext<'_>,
     path: &str,
     type_str: &str,
+    depth: usize,
 ) -> Result<Option<ObjectPath>, AssetError> {
     let read_ref = |reader: &mut crate::archive::Reader<'_>,
                     field: &str|
@@ -1021,7 +1063,12 @@ fn read_field_type_tail(
         "ByteProperty" => read_ref(reader, "Enum"),
         "EnumProperty" => {
             let enum_ref = read_ref(reader, "Enum")?;
-            read_field(reader, context, &format!("{path}.UnderlyingProp"))?;
+            read_field_at_depth(
+                reader,
+                context,
+                &format!("{path}.UnderlyingProp"),
+                depth + 1,
+            )?;
             Ok(enum_ref)
         }
         "StructProperty" => read_ref(reader, "Struct"),
@@ -1035,16 +1082,16 @@ fn read_field_type_tail(
         }
         "InterfaceProperty" => read_ref(reader, "InterfaceClass"),
         "ArrayProperty" => {
-            read_field(reader, context, &format!("{path}.Inner"))?;
+            read_field_at_depth(reader, context, &format!("{path}.Inner"), depth + 1)?;
             Ok(None)
         }
         "SetProperty" | "OptionalProperty" => {
-            read_field(reader, context, &format!("{path}.Element"))?;
+            read_field_at_depth(reader, context, &format!("{path}.Element"), depth + 1)?;
             Ok(None)
         }
         "MapProperty" => {
-            read_field(reader, context, &format!("{path}.Key"))?;
-            read_field(reader, context, &format!("{path}.Value"))?;
+            read_field_at_depth(reader, context, &format!("{path}.Key"), depth + 1)?;
+            read_field_at_depth(reader, context, &format!("{path}.Value"), depth + 1)?;
             Ok(None)
         }
         "IntProperty" | "Int8Property" | "Int16Property" | "Int64Property" | "UInt16Property"
@@ -1134,6 +1181,11 @@ impl AssetDecoder for SkeletonDecoder {
                 format!("negative reference-skeleton bone count {count} at byte {count_offset}"),
             ));
         }
+        reader.checked_vec_capacity::<SkeletonBone>(
+            usize::try_from(count).expect("i32 fits in usize"),
+            if editor_data_present { 16 } else { 12 },
+            &format!("{}.ReferenceSkeleton.Num", export.object_path),
+        )?;
         let mut bones = Vec::with_capacity(usize::try_from(count).expect("i32 fits in usize"));
         for index in 0..count {
             let path = format!("{}.ReferenceSkeleton.Bones[{index}]", export.object_path);
@@ -1447,6 +1499,11 @@ fn decode_simple_curve_keys(
             format!("negative SimpleCurve key count {count}"),
         ));
     }
+    payload.checked_vec_capacity::<CurveKey>(
+        usize::try_from(count).expect("i32 fits in usize"),
+        8,
+        &format!("{path}.Keys.Count"),
+    )?;
     let mut keys = Vec::with_capacity(usize::try_from(count).expect("i32 fits in usize"));
     for index in 0..count {
         keys.push(CurveKey::Simple(SimpleCurveKey {
@@ -1497,6 +1554,11 @@ fn decode_rich_curve_keys(
             format!("negative RichCurve key count {count}"),
         ));
     }
+    payload.checked_vec_capacity::<CurveKey>(
+        usize::try_from(count).expect("i32 fits in usize"),
+        27,
+        &format!("{path}.Keys.Count"),
+    )?;
     let mut keys = Vec::with_capacity(usize::try_from(count).expect("i32 fits in usize"));
     for index in 0..count {
         keys.push(CurveKey::Rich(RichCurveKey {
@@ -1964,8 +2026,7 @@ mod tests {
             schemas: &schemas,
         };
 
-        let Some(DecodedAsset::UObject(object)) =
-            decode_export(&export, &context).expect("decode")
+        let Some(DecodedAsset::UObject(object)) = decode_export(&export, &context).expect("decode")
         else {
             panic!("expected a generic UObject decode");
         };
@@ -2448,6 +2509,48 @@ mod tests {
             .decode(&export, &context)
             .expect_err("unsupported field type");
         assert_eq!(error.kind(), AssetErrorKind::UnsupportedCapability);
+    }
+
+    #[test]
+    fn rejects_overly_deep_struct_field_nesting() {
+        fn write_nested_array_field(bytes: &mut Vec<u8>, depth: usize) {
+            if depth == 0 {
+                write_struct_field(bytes, 3, 2, 4, &[]);
+                return;
+            }
+
+            let mut inner = Vec::new();
+            write_nested_array_field(&mut inner, depth - 1);
+            write_struct_field(bytes, 1, 2, 16, &inner);
+        }
+
+        let package = test_package(vec![
+            "None".into(),
+            "ArrayProperty".into(),
+            "Value".into(),
+            "IntProperty".into(),
+        ]);
+        let mut fields = Vec::new();
+        write_nested_array_field(&mut fields, MAX_FIELD_DEPTH);
+        let export_bytes = write_userdefinedstruct_export(0, &fields, 1, 0);
+        let export = test_export(
+            export_bytes.len() as u64,
+            "/Game/Test/S_Test.S_Test",
+            USERDEFINEDSTRUCT_CLASS,
+        );
+        let schemas = EmptySchemas;
+        let context = AssetDecodeContext {
+            source: &export_bytes,
+            package: &package,
+            schemas: &schemas,
+        };
+
+        let error = StructDecoder
+            .decode(&export, &context)
+            .expect_err("field depth limit should reject nested array fields");
+
+        assert_eq!(error.kind(), AssetErrorKind::MalformedData);
+        assert!(error.message().contains("depth limit"));
     }
 
     #[test]

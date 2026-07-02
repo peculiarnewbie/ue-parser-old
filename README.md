@@ -80,7 +80,29 @@ inspection and dashboard summaries:
 ```text
 uasset utrace inspect Trace.utrace
 uasset utrace inspect Trace.utrace --format json
+uasset utrace inventory Trace.utrace --format json
 uasset utrace dashboard Trace.utrace --format json
+uasset utrace coverage Trace.utrace --format json
+```
+
+`utrace inventory` is parser-oriented: it counts observed event families and
+includes a small decoded payload sample per event type where fields can be
+decoded generically.
+
+`utrace coverage` reports decode coverage: it classifies every event a trace
+declares as decoded / partial / raw (with a note on what each decoder drops),
+ranks the remaining raw families by observed volume, and — given `--universe
+<file>` — cross-references the trace against the full set of engine trace events
+to list the ones this trace never declared. The classification comes from the
+`EVENT_COVERAGE` table in `src/utrace.rs` (the single source of truth), so it
+cannot drift from what the parser actually decodes.
+
+Generate a universe file from an engine source tree with
+[`scripts/harvest-ue-trace-events.sh`](scripts/harvest-ue-trace-events.sh):
+
+```text
+scripts/harvest-ue-trace-events.sh /path/to/UE/Engine/Source ue_events.txt
+uasset utrace coverage Trace.utrace --universe ue_events.txt
 ```
 
 UTrace parser coverage notes for future agents live in

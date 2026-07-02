@@ -18,7 +18,9 @@ use uasset_parser::package::{PackageError, PackageErrorKind, PackageIndex, Table
 use uasset_parser::property::{PropertyRecord, PropertyValue, RawReason};
 use uasset_parser::schema::{ClassSchema, SchemaProvider, StructSchema};
 #[cfg(feature = "utrace")]
-use uasset_parser::utrace::{TraceDashboard, TraceError, TraceErrorKind, TraceInspect};
+use uasset_parser::utrace::{
+    TraceCoverage, TraceDashboard, TraceError, TraceErrorKind, TraceInspect, TraceInventory,
+};
 use uasset_parser::{Package, PackageSummary};
 
 const SCHEMA_VERSION: u32 = 6;
@@ -91,6 +93,15 @@ enum Command {
 enum UtraceCommand {
     Inspect(InspectOptions),
     Dashboard(InspectOptions),
+    Inventory(InspectOptions),
+    Coverage(CoverageOptions),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CoverageOptions {
+    input: Input,
+    format: OutputFormat,
+    universe: Option<PathBuf>,
 }
 
 impl Command {
@@ -129,6 +140,13 @@ impl Command {
                 Self::Inspect(options) => Ok(Self::Utrace(UtraceCommand::Dashboard(options))),
                 _ => unreachable!("parse_inspect only returns Inspect"),
             },
+            Some("inventory") => match Self::parse_inspect(arguments.collect())? {
+                Self::Inspect(options) => Ok(Self::Utrace(UtraceCommand::Inventory(options))),
+                _ => unreachable!("parse_inspect only returns Inspect"),
+            },
+            Some("coverage") => Ok(Self::Utrace(UtraceCommand::Coverage(Self::parse_coverage(
+                arguments.collect(),
+            )?))),
             Some(command) => Err(format!("unknown utrace command {command:?}")),
             None => Err("utrace command is not valid UTF-8".to_owned()),
         }
@@ -171,6 +189,57 @@ impl Command {
             input: input.ok_or_else(|| "inspect requires a file path or `-`".to_owned())?,
             format,
         }))
+    }
+
+    fn parse_coverage(arguments: Vec<OsString>) -> Result<CoverageOptions, String> {
+        let mut format = OutputFormat::Text;
+        let mut input = None;
+        let mut universe = None;
+        let mut index = 0;
+
+        while index < arguments.len() {
+            let argument = &arguments[index];
+            match argument.to_str() {
+                Some("--format") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--format requires text or json".to_owned())?;
+                    format = parse_format(value)?;
+                }
+                Some(value) if value.starts_with("--format=") => {
+                    format = parse_format(OsString::from(&value["--format=".len()..]).as_os_str())?;
+                }
+                Some("--universe") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--universe requires a file path".to_owned())?;
+                    universe = Some(PathBuf::from(value));
+                }
+                Some(value) if value.starts_with("--universe=") => {
+                    universe = Some(PathBuf::from(&value["--universe=".len()..]));
+                }
+                Some("-h" | "--help") => {
+                    return Err("use `uasset help` for command usage".to_owned());
+                }
+                Some(value) if value.starts_with('-') && value != "-" => {
+                    return Err(format!("unknown coverage option {value:?}"));
+                }
+                _ if input.is_some() => {
+                    return Err("coverage accepts exactly one input".to_owned());
+                }
+                Some("-") => input = Some(Input::Stdin),
+                _ => input = Some(Input::File(PathBuf::from(argument))),
+            }
+            index += 1;
+        }
+
+        Ok(CoverageOptions {
+            input: input.ok_or_else(|| "coverage requires a file path or `-`".to_owned())?,
+            format,
+            universe,
+        })
     }
 }
 
@@ -235,6 +304,8 @@ fn run_utrace(command: UtraceCommand) -> u8 {
     match command {
         UtraceCommand::Inspect(options) => inspect_utrace(&options),
         UtraceCommand::Dashboard(options) => dashboard_utrace(&options),
+        UtraceCommand::Inventory(options) => inventory_utrace(&options),
+        UtraceCommand::Coverage(options) => coverage_utrace(&options),
     }
 }
 
@@ -320,6 +391,103 @@ fn dashboard_utrace(options: &InspectOptions) -> u8 {
     write_stdout(&rendered)
 }
 
+#[cfg(feature = "utrace")]
+fn inventory_utrace(options: &InspectOptions) -> u8 {
+    let input_name = options.input.display_name();
+    let bytes = match read_input(&options.input) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            write_utrace_error(
+                options.format,
+                UtraceErrorOutput::io(input_name, error.to_string()),
+            );
+            return EXIT_IO;
+        }
+    };
+
+    let inventory = match uasset_parser::utrace::inventory(&bytes) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            let exit_code = exit_code_for_trace_error(&error);
+            write_utrace_error(options.format, UtraceErrorOutput::trace(input_name, &error));
+            return exit_code;
+        }
+    };
+    let output = UtraceInventoryOutput {
+        schema_version: UTRACE_SCHEMA_VERSION,
+        status: "ok",
+        path: input_name,
+        inventory,
+    };
+    let rendered = match render_utrace_inventory_output(options.format, &output) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            eprintln!("uasset: failed to serialize utrace inventory output: {error}");
+            return EXIT_INTERNAL;
+        }
+    };
+    write_stdout(&rendered)
+}
+
+#[cfg(feature = "utrace")]
+fn coverage_utrace(options: &CoverageOptions) -> u8 {
+    let input_name = options.input.display_name();
+    let bytes = match read_input(&options.input) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            write_utrace_error(
+                options.format,
+                UtraceErrorOutput::io(input_name, error.to_string()),
+            );
+            return EXIT_IO;
+        }
+    };
+
+    let universe = match &options.universe {
+        Some(path) => match fs::read_to_string(path) {
+            Ok(contents) => Some(
+                contents
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned)
+                    .collect::<std::collections::BTreeSet<String>>(),
+            ),
+            Err(error) => {
+                write_utrace_error(
+                    options.format,
+                    UtraceErrorOutput::io(path.to_string_lossy().into_owned(), error.to_string()),
+                );
+                return EXIT_IO;
+            }
+        },
+        None => None,
+    };
+
+    let coverage = match uasset_parser::utrace::coverage(&bytes, universe.as_ref()) {
+        Ok(coverage) => coverage,
+        Err(error) => {
+            let exit_code = exit_code_for_trace_error(&error);
+            write_utrace_error(options.format, UtraceErrorOutput::trace(input_name, &error));
+            return exit_code;
+        }
+    };
+    let output = UtraceCoverageOutput {
+        schema_version: UTRACE_SCHEMA_VERSION,
+        status: "ok",
+        path: input_name,
+        coverage,
+    };
+    let rendered = match render_utrace_coverage_output(options.format, &output) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            eprintln!("uasset: failed to serialize utrace coverage output: {error}");
+            return EXIT_INTERNAL;
+        }
+    };
+    write_stdout(&rendered)
+}
+
 fn read_input(input: &Input) -> io::Result<Vec<u8>> {
     match input {
         Input::File(path) => fs::read(path),
@@ -376,6 +544,155 @@ fn render_utrace_dashboard_output(
 }
 
 #[cfg(feature = "utrace")]
+fn render_utrace_inventory_output(
+    format: OutputFormat,
+    output: &UtraceInventoryOutput,
+) -> Result<Vec<u8>, serde_json::Error> {
+    match format {
+        OutputFormat::Text => Ok(render_utrace_inventory_text_output(output).into_bytes()),
+        OutputFormat::Json => {
+            let mut rendered = serde_json::to_vec(output)?;
+            rendered.push(b'\n');
+            Ok(rendered)
+        }
+    }
+}
+
+#[cfg(feature = "utrace")]
+fn render_utrace_coverage_output(
+    format: OutputFormat,
+    output: &UtraceCoverageOutput,
+) -> Result<Vec<u8>, serde_json::Error> {
+    match format {
+        OutputFormat::Text => Ok(render_utrace_coverage_text_output(output).into_bytes()),
+        OutputFormat::Json => {
+            let mut rendered = serde_json::to_vec(output)?;
+            rendered.push(b'\n');
+            Ok(rendered)
+        }
+    }
+}
+
+#[cfg(feature = "utrace")]
+fn render_utrace_coverage_text_output(output: &UtraceCoverageOutput) -> String {
+    let mut rendered = String::new();
+    let coverage = &output.coverage;
+    let summary = &coverage.summary;
+    writeln!(rendered, "path: {}", output.path).unwrap();
+    writeln!(
+        rendered,
+        "declared_event_types={} decoded={} partial={} raw={} observed_events={} raw_observed_events={}",
+        summary.declared_event_types,
+        summary.decoded_event_types,
+        summary.partial_event_types,
+        summary.raw_event_types,
+        summary.observed_events,
+        summary.raw_observed_events
+    )
+    .unwrap();
+    writeln!(rendered, "raw declared events (biggest gaps by volume):").unwrap();
+    for entry in coverage
+        .events
+        .iter()
+        .filter(|entry| entry.status == uasset_parser::utrace::DecodeStatus::Raw)
+        .take(20)
+    {
+        writeln!(
+            rendered,
+            "  {}.{} uid={} observed={}",
+            entry.logger, entry.event, entry.uid, entry.observed_count
+        )
+        .unwrap();
+    }
+    if let Some(universe) = &coverage.universe {
+        writeln!(
+            rendered,
+            "universe: total={} declared_in_trace={} unseen={} not_in_universe={}",
+            universe.total,
+            universe.declared_in_trace,
+            universe.unseen.len(),
+            universe.not_in_universe.len()
+        )
+        .unwrap();
+        writeln!(
+            rendered,
+            "unseen engine events (not declared in this trace):"
+        )
+        .unwrap();
+        for event in universe.unseen.iter().take(40) {
+            writeln!(rendered, "  {event}").unwrap();
+        }
+        if !universe.not_in_universe.is_empty() {
+            writeln!(
+                rendered,
+                "declared but not in universe (game-specific or non-macro):"
+            )
+            .unwrap();
+            for event in universe.not_in_universe.iter().take(20) {
+                writeln!(rendered, "  {event}").unwrap();
+            }
+        }
+    }
+    rendered
+}
+
+#[cfg(feature = "utrace")]
+fn render_utrace_inventory_text_output(output: &UtraceInventoryOutput) -> String {
+    let mut rendered = String::new();
+    let summary = &output.inventory.summary;
+    writeln!(rendered, "path: {}", output.path).unwrap();
+    writeln!(
+        rendered,
+        "declared_event_types={} observed_event_types={} observed_events={} decoded={} partial={} raw={} known_event_types={} known_events={}",
+        summary.declared_event_types,
+        summary.observed_event_types,
+        summary.observed_events,
+        summary.decoded_event_types,
+        summary.partial_event_types,
+        summary.raw_event_types,
+        summary.known_event_types,
+        summary.known_events
+    )
+    .unwrap();
+    writeln!(rendered, "events:").unwrap();
+    for event in output.inventory.events.iter().take(40) {
+        writeln!(
+            rendered,
+            "  {}.{} uid={} observed={} status={:?} fields={} samples={}",
+            event.logger,
+            event.event,
+            event.uid,
+            event.observed_count,
+            event.decode_status,
+            event.fields.len(),
+            event.samples.len()
+        )
+        .unwrap();
+        for sample in event.samples.iter().take(1) {
+            let field_names = sample.fields.keys().cloned().collect::<Vec<_>>().join(", ");
+            writeln!(
+                rendered,
+                "    sample thread={} fields=[{}]",
+                sample.thread_id, field_names
+            )
+            .unwrap();
+        }
+    }
+    if !output.inventory.known_events.is_empty() {
+        writeln!(rendered, "known_events:").unwrap();
+        for event in &output.inventory.known_events {
+            writeln!(
+                rendered,
+                "  {} uid={} observed={}",
+                event.name, event.uid, event.observed_count
+            )
+            .unwrap();
+        }
+    }
+    rendered
+}
+
+#[cfg(feature = "utrace")]
 fn render_utrace_dashboard_text_output(output: &UtraceDashboardOutput) -> String {
     let mut rendered = String::new();
     writeln!(rendered, "path: {}", output.path).unwrap();
@@ -387,14 +704,32 @@ fn render_utrace_dashboard_text_output(output: &UtraceDashboardOutput) -> String
         )
         .unwrap();
     }
+    if let Some(session) = &output.dashboard.session {
+        writeln!(
+            rendered,
+            "session: platform={:?} app={:?} project={:?} config={:?} target={:?} changelist={} branch={:?} build={:?}",
+            session.platform,
+            session.app_name,
+            session.project_name,
+            session.configuration,
+            session.target_type,
+            session.changelist,
+            session.branch,
+            session.build_version
+        )
+        .unwrap();
+    }
     writeln!(
         rendered,
-        "threads: {} frames: {} cpu_specs: {} cpu_batches: {} cpu_intervals: {}",
+        "threads: {} frames: {} cpu_specs: {} cpu_batches: {} cpu_intervals: {} gpu_queues: {} gpu_work_intervals: {} gpu_breadcrumb_intervals: {}",
         output.dashboard.thread_info.len(),
         output.dashboard.frames.len(),
         output.dashboard.cpu.specs.len(),
         output.dashboard.cpu.batches.count,
-        output.dashboard.cpu.batches.intervals
+        output.dashboard.cpu.batches.intervals,
+        output.dashboard.gpu.queues.len(),
+        output.dashboard.gpu.work.intervals,
+        output.dashboard.gpu.breadcrumbs.intervals
     )
     .unwrap();
     for scope in output.dashboard.cpu.scopes.iter().take(20) {
@@ -412,6 +747,274 @@ fn render_utrace_dashboard_text_output(output: &UtraceDashboardOutput) -> String
             )
             .unwrap(),
         }
+    }
+    writeln!(
+        rendered,
+        "cpu metadata: specs={} records={} scopes={} resolved={} unresolved={} metadata_bytes={}",
+        output.dashboard.cpu.metadata.specs,
+        output.dashboard.cpu.metadata.records,
+        output.dashboard.cpu.metadata.scopes,
+        output.dashboard.cpu.metadata.resolved_scopes,
+        output.dashboard.cpu.metadata.unresolved_scopes,
+        output.dashboard.cpu.metadata.metadata_bytes
+    )
+    .unwrap();
+    for scope in output.dashboard.cpu.metadata.top.iter().take(10) {
+        writeln!(
+            rendered,
+            "metadata scope {} {:?}: count={} total_cycles={}",
+            scope.spec_id, scope.name, scope.count, scope.total_cycles
+        )
+        .unwrap();
+    }
+    writeln!(
+        rendered,
+        "cpu named events: {}",
+        output.dashboard.cpu.named_events.len()
+    )
+    .unwrap();
+    for event in output.dashboard.cpu.named_events.iter().take(10) {
+        writeln!(
+            rendered,
+            "cpu event {:?}: observed={} sample={}",
+            event.event,
+            event.observed_count,
+            event.sample.is_some()
+        )
+        .unwrap();
+    }
+    writeln!(
+        rendered,
+        "counters: specs={} samples={} int_samples={} float_samples={} unresolved={}",
+        output.dashboard.counters.specs,
+        output.dashboard.counters.samples,
+        output.dashboard.counters.int_samples,
+        output.dashboard.counters.float_samples,
+        output.dashboard.counters.unresolved_samples
+    )
+    .unwrap();
+    for counter in output.dashboard.counters.counters.iter().take(10) {
+        writeln!(
+            rendered,
+            "counter {} {:?}: samples={} latest={:?} min={:?} max={:?}",
+            counter.id, counter.name, counter.samples, counter.latest, counter.min, counter.max
+        )
+        .unwrap();
+    }
+    writeln!(
+        rendered,
+        "stats: specs={} floating_point={} memory={} clear_every_frame={} groups={}",
+        output.dashboard.stats.specs,
+        output.dashboard.stats.floating_point_specs,
+        output.dashboard.stats.memory_specs,
+        output.dashboard.stats.clear_every_frame_specs,
+        output.dashboard.stats.groups.len()
+    )
+    .unwrap();
+    for group in output.dashboard.stats.groups.iter().take(10) {
+        writeln!(
+            rendered,
+            "stat group {:?}: specs={} floating_point={} memory={} clear_every_frame={}",
+            group.name,
+            group.specs,
+            group.floating_point_specs,
+            group.memory_specs,
+            group.clear_every_frame_specs
+        )
+        .unwrap();
+    }
+    writeln!(
+        rendered,
+        "csv: categories={} stats={} declared={} inline={} unresolved={}",
+        output.dashboard.csv.categories,
+        output.dashboard.csv.stats,
+        output.dashboard.csv.declared_stats,
+        output.dashboard.csv.inline_stats,
+        output.dashboard.csv.unresolved_stats
+    )
+    .unwrap();
+    for category in output.dashboard.csv.top_categories.iter().take(10) {
+        writeln!(
+            rendered,
+            "csv category {} {:?}: stats={} declared={} inline={}",
+            category.index,
+            category.name,
+            category.stats,
+            category.declared_stats,
+            category.inline_stats
+        )
+        .unwrap();
+    }
+    writeln!(
+        rendered,
+        "loading: classes={}",
+        output.dashboard.loading.class_count
+    )
+    .unwrap();
+    for class in output.dashboard.loading.classes.iter().take(10) {
+        writeln!(rendered, "load class 0x{:x}: {:?}", class.class, class.name).unwrap();
+    }
+    writeln!(
+        rendered,
+        "trace timing: threads={}",
+        output.dashboard.trace_timing.thread_count
+    )
+    .unwrap();
+    writeln!(
+        rendered,
+        "cpu end threads: {}",
+        output.dashboard.cpu.end_threads.len()
+    )
+    .unwrap();
+    writeln!(
+        rendered,
+        "memory: scopes={} unique_tags={}",
+        output.dashboard.memory.scope_count,
+        output.dashboard.memory.scopes.len()
+    )
+    .unwrap();
+    writeln!(
+        rendered,
+        "metadata stack: clear_scope={} saved_stack={} restored_stack={} unmatched_restore={}",
+        output.dashboard.metadata_stack.clear_scope_count,
+        output.dashboard.metadata_stack.saved_stack_count,
+        output.dashboard.metadata_stack.restored_stack_count,
+        output.dashboard.metadata_stack.unmatched_restore_count
+    )
+    .unwrap();
+    writeln!(
+        rendered,
+        "slate: added_widgets={} unique_widgets={}",
+        output.dashboard.slate.added_widgets,
+        output.dashboard.slate.widgets.len()
+    )
+    .unwrap();
+    writeln!(
+        rendered,
+        "channels: count={} enabled={} read_only={} toggles={}",
+        output.dashboard.channels.count,
+        output.dashboard.channels.enabled,
+        output.dashboard.channels.read_only,
+        output.dashboard.channels.toggles
+    )
+    .unwrap();
+    for channel in output.dashboard.channels.channels.iter().take(10) {
+        writeln!(
+            rendered,
+            "channel {} {:?}: enabled={} read_only={} toggles={}",
+            channel.id, channel.name, channel.is_enabled, channel.read_only, channel.toggle_count
+        )
+        .unwrap();
+    }
+    writeln!(
+        rendered,
+        "thread groups: begin={} end={} unmatched={} unclosed={}",
+        output.dashboard.thread_groups.begin_events,
+        output.dashboard.thread_groups.end_events,
+        output.dashboard.thread_groups.unmatched_ends,
+        output.dashboard.thread_groups.unclosed_groups
+    )
+    .unwrap();
+    for group in output.dashboard.thread_groups.groups.iter().take(10) {
+        writeln!(
+            rendered,
+            "thread group {:?}: begin={} end={} balanced={}",
+            group.name, group.begin_count, group.end_count, group.balanced
+        )
+        .unwrap();
+    }
+    writeln!(
+        rendered,
+        "bookmarks: specs={} events={} unresolved={} format_arg_bytes={}",
+        output.dashboard.annotations.bookmarks.specs,
+        output.dashboard.annotations.bookmarks.events,
+        output.dashboard.annotations.bookmarks.unresolved_events,
+        output.dashboard.annotations.bookmarks.format_args_bytes
+    )
+    .unwrap();
+    for bookmark in output
+        .dashboard
+        .annotations
+        .bookmarks
+        .bookmarks
+        .iter()
+        .take(10)
+    {
+        writeln!(
+            rendered,
+            "bookmark {} {:?}: count={} file={:?} line={:?}",
+            bookmark.bookmark_point,
+            bookmark.format_string,
+            bookmark.count,
+            bookmark.file,
+            bookmark.line
+        )
+        .unwrap();
+    }
+    writeln!(
+        rendered,
+        "regions: begin={} end={} completed={} unmatched={} unterminated={}",
+        output.dashboard.annotations.regions.begin_events,
+        output.dashboard.annotations.regions.end_events,
+        output.dashboard.annotations.regions.completed,
+        output.dashboard.annotations.regions.unmatched_ends,
+        output.dashboard.annotations.regions.unterminated
+    )
+    .unwrap();
+    writeln!(
+        rendered,
+        "logging: categories={} message_specs={} messages={} unresolved={} unknown_category={} format_arg_bytes={}",
+        output.dashboard.logging.categories,
+        output.dashboard.logging.message_specs,
+        output.dashboard.logging.messages,
+        output.dashboard.logging.unresolved_messages,
+        output.dashboard.logging.specs_with_unknown_category,
+        output.dashboard.logging.format_args_bytes
+    )
+    .unwrap();
+    for verbosity in &output.dashboard.logging.verbosity {
+        writeln!(
+            rendered,
+            "log verbosity {:?}: message_specs={} messages={}",
+            verbosity.verbosity, verbosity.message_specs, verbosity.messages
+        )
+        .unwrap();
+    }
+    for category in output.dashboard.logging.top_categories.iter().take(10) {
+        writeln!(
+            rendered,
+            "log category {:?}: verbosity={:?} message_specs={} messages={}",
+            category.name, category.default_verbosity, category.message_specs, category.messages
+        )
+        .unwrap();
+    }
+    for message in output.dashboard.logging.top_messages.iter().take(10) {
+        writeln!(
+            rendered,
+            "log point {} {:?}: verbosity={:?} category={:?} count={} file={:?} line={:?}",
+            message.log_point,
+            message.format_string,
+            message.verbosity,
+            message.category,
+            message.count,
+            message.file,
+            message.line
+        )
+        .unwrap();
+    }
+    writeln!(
+        rendered,
+        "unmodeled: event_types={} observed_events={}",
+        output.dashboard.unmodeled.event_types, output.dashboard.unmodeled.observed_events
+    )
+    .unwrap();
+    for event in output.dashboard.unmodeled.events.iter().take(10) {
+        writeln!(
+            rendered,
+            "unmodeled {}.{}: count={}",
+            event.logger, event.event, event.observed_count
+        )
+        .unwrap();
     }
     for thread in output.dashboard.cpu.threads.iter().take(10) {
         match thread.total_seconds {
@@ -436,6 +1039,33 @@ fn render_utrace_dashboard_text_output(output: &UtraceDashboardOutput) -> String
             )
             .unwrap();
         }
+    }
+    for queue in output.dashboard.gpu.queues.iter().take(10) {
+        writeln!(
+            rendered,
+            "gpu queue {} {:?}: work={} work_cycles={} waits={} frames={} draws={} primitives={}",
+            queue.queue_id,
+            queue.name,
+            queue.work_count,
+            queue.work_total_cycles,
+            queue.wait_count,
+            queue.frame_boundary_count,
+            queue.draw_count,
+            queue.primitive_count
+        )
+        .unwrap();
+    }
+    for breadcrumb in output.dashboard.gpu.breadcrumbs.top.iter().take(10) {
+        writeln!(
+            rendered,
+            "gpu breadcrumb {} {:?}: count={} total_cycles={} metadata_events={}",
+            breadcrumb.spec_id,
+            breadcrumb.name,
+            breadcrumb.count,
+            breadcrumb.total_cycles,
+            breadcrumb.metadata_events
+        )
+        .unwrap();
     }
     rendered
 }
@@ -680,9 +1310,7 @@ fn render_text_output(output: &InspectOutput) -> String {
         writeln!(
             rendered,
             "decode_error: {} [{}] {}",
-            error.object_path,
-            error.kind,
-            error.message
+            error.object_path, error.kind, error.message
         )
         .unwrap();
     }
@@ -809,6 +1437,24 @@ struct UtraceDashboardOutput {
     status: &'static str,
     path: String,
     dashboard: TraceDashboard,
+}
+
+#[cfg(feature = "utrace")]
+#[derive(Serialize)]
+struct UtraceInventoryOutput {
+    schema_version: u32,
+    status: &'static str,
+    path: String,
+    inventory: TraceInventory,
+}
+
+#[cfg(feature = "utrace")]
+#[derive(Serialize)]
+struct UtraceCoverageOutput {
+    schema_version: u32,
+    status: &'static str,
+    path: String,
+    coverage: TraceCoverage,
 }
 
 impl InspectOutput {
@@ -1597,7 +2243,6 @@ impl ErrorOutput {
             offset: error.offset(),
         }
     }
-
 }
 
 #[cfg(feature = "utrace")]
@@ -1640,6 +2285,8 @@ Usage:
   uasset inspect <path|-> [--format text|json]
   uasset utrace inspect <path|-> [--format text|json]
   uasset utrace dashboard <path|-> [--format text|json]
+  uasset utrace inventory <path|-> [--format text|json]
+  uasset utrace coverage <path|-> [--universe <file>] [--format text|json]
   uasset help
   uasset version
 
@@ -1730,6 +2377,70 @@ mod tests {
                 input: Input::File(PathBuf::from("trace.utrace")),
                 format: OutputFormat::Json,
             }))
+        );
+    }
+
+    #[test]
+    fn parses_utrace_inventory_contract() {
+        assert_eq!(
+            Command::parse(vec![
+                "utrace".into(),
+                "inventory".into(),
+                "trace.utrace".into(),
+                "--format=json".into()
+            ])
+            .unwrap(),
+            Command::Utrace(UtraceCommand::Inventory(InspectOptions {
+                input: Input::File(PathBuf::from("trace.utrace")),
+                format: OutputFormat::Json,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_utrace_coverage_contract() {
+        assert_eq!(
+            Command::parse(vec![
+                "utrace".into(),
+                "coverage".into(),
+                "trace.utrace".into(),
+                "--universe=events.txt".into(),
+                "--format=json".into()
+            ])
+            .unwrap(),
+            Command::Utrace(UtraceCommand::Coverage(CoverageOptions {
+                input: Input::File(PathBuf::from("trace.utrace")),
+                format: OutputFormat::Json,
+                universe: Some(PathBuf::from("events.txt")),
+            }))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_utrace_coverage_contracts() {
+        assert_eq!(
+            Command::parse(vec!["utrace".into(), "coverage".into()]).unwrap_err(),
+            "coverage requires a file path or `-`"
+        );
+        assert_eq!(
+            Command::parse(vec![
+                "utrace".into(),
+                "coverage".into(),
+                "--universe".into(),
+                "trace.utrace".into()
+            ])
+            .unwrap_err(),
+            "coverage requires a file path or `-`"
+        );
+        assert_eq!(
+            Command::parse(vec![
+                "utrace".into(),
+                "coverage".into(),
+                "trace.utrace".into(),
+                "--bad".into()
+            ])
+            .unwrap_err(),
+            "unknown coverage option \"--bad\""
         );
     }
 }
