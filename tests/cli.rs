@@ -7,11 +7,9 @@ fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_uasset"))
 }
 
-// The StarterContent sample lived alongside the old in-engine project
-// location. Resolve an explicit override first, then the historical relative
-// default; tests that need it skip when neither is present so portable builds
-// outside that layout still pass.
-fn fixture() -> Option<PathBuf> {
+// The StarterContent sample lived alongside the old in-engine project location.
+// Resolve an explicit override first, then the historical relative default.
+fn fixture() -> PathBuf {
     let path = std::env::var_os("UASSET_STARTER_SAMPLE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -20,20 +18,19 @@ fn fixture() -> Option<PathBuf> {
             )
         });
     if path.is_file() {
-        Some(path)
+        path
     } else {
-        eprintln!(
-            "skipping StarterContent CLI check; set UASSET_STARTER_SAMPLE to a Floor_400x400.uasset to run it"
+        panic!(
+            "StarterContent sample not found at {}; set UASSET_STARTER_SAMPLE",
+            path.display()
         );
-        None
     }
 }
 
 #[test]
+#[ignore = "requires StarterContent Floor_400x400.uasset; set UASSET_STARTER_SAMPLE"]
 fn json_success_is_machine_readable_and_stderr_is_empty() {
-    let Some(fixture) = fixture() else {
-        return;
-    };
+    let fixture = fixture();
     let output = binary()
         .args(["inspect", fixture.to_str().unwrap(), "--format", "json"])
         .output()
@@ -67,17 +64,15 @@ fn json_io_error_uses_stderr_and_exit_code_four() {
 }
 
 #[test]
+#[ignore = "requires a partially decodable .uasset; set UASSET_PARTIAL_SAMPLE"]
 fn partial_decode_reports_errors_and_exit_six() {
     // A package where the summary parses but at least one export fails to decode
     // must emit the decoded assets, list the failures in `decode_errors`, set
     // status "partial", and exit 6 (not abort the whole file). Gated on a sample
-    // since it needs a real such asset; skips on portable builds.
-    let Some(path) = std::env::var_os("UASSET_PARTIAL_SAMPLE").map(PathBuf::from) else {
-        eprintln!(
-            "skipping partial-decode CLI check; set UASSET_PARTIAL_SAMPLE to a package with an undecodable export"
-        );
-        return;
-    };
+    // since it needs a real such asset.
+    let path = std::env::var_os("UASSET_PARTIAL_SAMPLE")
+        .map(PathBuf::from)
+        .expect("set UASSET_PARTIAL_SAMPLE to a package with an undecodable export");
     let output = binary()
         .args(["inspect", path.to_str().unwrap(), "--format", "json"])
         .output()
@@ -95,10 +90,9 @@ fn partial_decode_reports_errors_and_exit_six() {
 }
 
 #[test]
+#[ignore = "requires StarterContent Floor_400x400.uasset; set UASSET_STARTER_SAMPLE"]
 fn stdin_accepts_package_bytes() {
-    let Some(fixture) = fixture() else {
-        return;
-    };
+    let fixture = fixture();
     let bytes = std::fs::read(fixture).unwrap();
     let mut child = binary()
         .args(["inspect", "-", "--format=json"])

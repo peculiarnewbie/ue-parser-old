@@ -9,16 +9,16 @@ fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_uasset"))
 }
 
-fn fixture() -> Option<PathBuf> {
+fn fixture() -> PathBuf {
     if let Some(path) = std::env::var_os("UTRACE_FIXTURE").map(PathBuf::from) {
         return require_file_or_skip(path, "UTRACE_FIXTURE");
     }
 
     if let Some(dir) = std::env::var_os("UTRACE_FIXTURE_DIR").map(PathBuf::from) {
         if let Some(path) = first_utrace_in(&dir) {
-            return Some(path);
+            return path;
         }
-        return missing_fixture(format!(
+        missing_fixture(format!(
             "UTRACE_FIXTURE_DIR did not contain a .utrace file: {}",
             dir.display()
         ));
@@ -26,7 +26,7 @@ fn fixture() -> Option<PathBuf> {
 
     let default_dir = PathBuf::from("D:/Perforce/Arif_Fixtures/Traces");
     if let Some(path) = first_utrace_in(&default_dir) {
-        return Some(path);
+        return path;
     }
 
     missing_fixture(
@@ -35,9 +35,9 @@ fn fixture() -> Option<PathBuf> {
     )
 }
 
-fn require_file_or_skip(path: PathBuf, source: &str) -> Option<PathBuf> {
+fn require_file_or_skip(path: PathBuf, source: &str) -> PathBuf {
     if path.is_file() {
-        Some(path)
+        path
     } else {
         missing_fixture(format!(
             "{source} does not point to a file: {}",
@@ -62,19 +62,14 @@ fn first_utrace_in(dir: &Path) -> Option<PathBuf> {
     traces.into_iter().next()
 }
 
-fn missing_fixture(message: String) -> Option<PathBuf> {
-    if std::env::var_os("UTRACE_REQUIRE_FIXTURE").is_some() {
-        panic!("{message}");
-    }
-    eprintln!("skipping UTrace fixture check; {message}");
-    None
+fn missing_fixture(message: String) -> ! {
+    panic!("{message}");
 }
 
 #[test]
+#[ignore = "requires a real .utrace fixture; set UTRACE_FIXTURE or UTRACE_FIXTURE_DIR"]
 fn real_utrace_fixture_exposes_header_prologue_threads_and_registry() {
-    let Some(fixture) = fixture() else {
-        return;
-    };
+    let fixture = fixture();
 
     let output = binary()
         .args([
@@ -141,10 +136,9 @@ fn real_utrace_fixture_exposes_header_prologue_threads_and_registry() {
 }
 
 #[test]
+#[ignore = "requires a real .utrace fixture; set UTRACE_FIXTURE or UTRACE_FIXTURE_DIR"]
 fn real_utrace_fixture_exposes_cpu_dashboard_summary() {
-    let Some(fixture) = fixture() else {
-        return;
-    };
+    let fixture = fixture();
 
     let output = binary()
         .args([
@@ -698,10 +692,9 @@ fn real_utrace_fixture_exposes_cpu_dashboard_summary() {
 }
 
 #[test]
+#[ignore = "requires a real .utrace fixture; set UTRACE_FIXTURE or UTRACE_FIXTURE_DIR"]
 fn real_utrace_fixture_reports_decode_coverage() {
-    let Some(fixture) = fixture() else {
-        return;
-    };
+    let fixture = fixture();
 
     let output = binary()
         .args([
@@ -760,10 +753,9 @@ fn real_utrace_fixture_reports_decode_coverage() {
 }
 
 #[test]
+#[ignore = "requires a real .utrace fixture; set UTRACE_FIXTURE or UTRACE_FIXTURE_DIR"]
 fn real_utrace_fixture_cross_references_event_universe() {
-    let Some(fixture) = fixture() else {
-        return;
-    };
+    let fixture = fixture();
 
     // Minimal synthetic universe: one event the fixture declares, plus one it does not.
     let dir = std::env::temp_dir();
@@ -804,10 +796,9 @@ fn real_utrace_fixture_cross_references_event_universe() {
 }
 
 #[test]
+#[ignore = "requires a real .utrace fixture; set UTRACE_FIXTURE or UTRACE_FIXTURE_DIR"]
 fn real_utrace_fixture_exposes_logging_dashboard() {
-    let Some(fixture) = fixture() else {
-        return;
-    };
+    let fixture = fixture();
 
     let output = binary()
         .args([
@@ -911,10 +902,9 @@ fn real_utrace_fixture_exposes_logging_dashboard() {
 }
 
 #[test]
+#[ignore = "requires a real .utrace fixture; set UTRACE_FIXTURE or UTRACE_FIXTURE_DIR"]
 fn real_utrace_fixture_exposes_event_inventory() {
-    let Some(fixture) = fixture() else {
-        return;
-    };
+    let fixture = fixture();
 
     let output = binary()
         .args([

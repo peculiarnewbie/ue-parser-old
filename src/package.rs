@@ -1821,11 +1821,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires StarterContent Floor_400x400.uasset; set UASSET_STARTER_SAMPLE"]
     fn parses_existing_classic_ue5_asset_summary() {
         // The StarterContent sample lived alongside the old in-engine project
         // location. Resolution order mirrors the fixture tests: an explicit
-        // override, then the historical relative default. When neither is
-        // present the test skips so portable builds outside that layout pass.
+        // override, then the historical relative default.
         let path = std::env::var_os("UASSET_STARTER_SAMPLE")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -1834,10 +1834,10 @@ mod tests {
                 )
             });
         if !path.is_file() {
-            eprintln!(
-                "skipping classic UE5 summary check; set UASSET_STARTER_SAMPLE to a Floor_400x400.uasset to run it"
+            panic!(
+                "StarterContent sample not found at {}; set UASSET_STARTER_SAMPLE",
+                path.display()
             );
-            return;
         }
         let bytes = std::fs::read(path).unwrap();
 
@@ -1887,13 +1887,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
     fn parses_soft_object_path_list_from_fixture_when_available() {
         let path = std::env::var_os("UASSET_FIXTURE_DIR")
             .map(PathBuf::from)
             .map(|dir| dir.join("Content/E2EFixture/Data/DT_AssetRefs.uasset"));
         let Some(path) = path.filter(|path| path.is_file()) else {
-            eprintln!("skipping soft object path fixture check; set UASSET_FIXTURE_DIR");
-            return;
+            panic!("set UASSET_FIXTURE_DIR with Content/E2EFixture/Data/DT_AssetRefs.uasset");
         };
 
         let bytes = std::fs::read(path).unwrap();

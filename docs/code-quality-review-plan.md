@@ -27,10 +27,13 @@ the upper layers use the same safety, typing, and testing standards.
 
 ## 2. Make Tests Trustworthy
 
-- Stop silent green fixture skips.
-- Convert optional fixture tests to either:
+- [x] Stop silent green fixture skips.
+- [x] Convert optional fixture tests to either:
   - explicit `#[ignore]` fixture tests, or
   - CI-required fixture tests with clear environment setup.
+  - Completed: real fixture-dependent package, CLI, electroswag, and utrace
+    tests are now explicit ignored tests, and their fixture helpers fail loudly
+    when those ignored tests are run without configured fixtures.
 - Commit a tiny fixture corpus for always-on integration coverage.
 - Add CLI-level malformed input tests.
 - Add fuzz targets for:

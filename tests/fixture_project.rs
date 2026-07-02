@@ -340,24 +340,18 @@ fn contract() -> FixtureContract {
     serde_json::from_str(CONTRACT_JSON).expect("fixture contract JSON must be valid")
 }
 
-fn fixture_root(contract: &FixtureContract) -> Option<PathBuf> {
+fn fixture_root(contract: &FixtureContract) -> PathBuf {
     let configured = env::var_os("UASSET_FIXTURE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| contract.default_fixture_dir.clone());
     if configured.join("E2EFixtures.uproject").is_file() {
-        Some(configured)
-    } else if env::var_os("UASSET_REQUIRE_FIXTURE").is_some() {
+        configured
+    } else {
         panic!(
-            "{} fixture project not found at {}",
+            "{} fixture project not found at {}; set UASSET_FIXTURE_DIR",
             contract.contract_version,
             configured.display()
         );
-    } else {
-        eprintln!(
-            "skipping {} fixture validation; set UASSET_FIXTURE_DIR or UASSET_REQUIRE_FIXTURE=1",
-            contract.contract_version
-        );
-        None
     }
 }
 
@@ -370,11 +364,10 @@ fn skip_missing_fixture_asset(root: &Path, file: &Path) -> bool {
     if path.is_file() {
         return false;
     }
-    eprintln!(
-        "skipping {}; asset not on disk — run fixture bootstrap",
+    panic!(
+        "fixture asset not found at {}; run fixture bootstrap",
         path.display()
     );
-    true
 }
 
 /// Reads, parses, and decodes a DataTable or CompositeDataTable export from a fixture
@@ -586,11 +579,10 @@ fn with_decoded_struct(root: &Path, relative: &str, check: impl FnOnce(&Package,
 /// on-disk bytes: field order, friendly names, property types, the struct-typed
 /// field's referenced row struct, and decoded default values.
 #[test]
+#[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
 fn shared_fixture_user_defined_struct_decodes() {
     let contract = contract();
-    let Some(root) = fixture_root(&contract) else {
-        return;
-    };
+    let root = fixture_root(&contract);
     let relative = "Content/E2EFixture/Data/S_E2EFixture.uasset";
     if skip_missing_fixture_asset(&root, Path::new(relative)) {
         return;
@@ -756,11 +748,10 @@ fn with_decoded_uobject(
 }
 
 #[test]
+#[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
 fn shared_fixture_corpus_matches_the_parser_contract() {
     let contract = contract();
-    let Some(root) = fixture_root(&contract) else {
-        return;
-    };
+    let root = fixture_root(&contract);
 
     for asset in &contract.assets {
         if skip_missing_fixture_asset(&root, &asset.file) {
@@ -808,11 +799,10 @@ fn shared_fixture_corpus_matches_the_parser_contract() {
 }
 
 #[test]
+#[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
 fn shared_fixture_composite_datatable_resolves_export() {
     let contract = contract();
-    let Some(root) = fixture_root(&contract) else {
-        return;
-    };
+    let root = fixture_root(&contract);
 
     let asset = contract
         .assets
@@ -855,11 +845,10 @@ fn shared_fixture_composite_datatable_resolves_export() {
 }
 
 #[test]
+#[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
 fn shared_fixture_corpus_resolves_datatable_exports() {
     let contract = contract();
-    let Some(root) = fixture_root(&contract) else {
-        return;
-    };
+    let root = fixture_root(&contract);
 
     for asset in contract
         .assets
@@ -916,11 +905,10 @@ fn shared_fixture_corpus_resolves_datatable_exports() {
 }
 
 #[test]
+#[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
 fn shared_fixture_datatables_decode_row_names() {
     let contract = contract();
-    let Some(root) = fixture_root(&contract) else {
-        return;
-    };
+    let root = fixture_root(&contract);
 
     for asset in contract
         .assets
@@ -993,11 +981,10 @@ fn shared_fixture_datatables_decode_row_names() {
 }
 
 #[test]
+#[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
 fn shared_fixture_datatables_match_contract_mirror() {
     let contract = contract();
-    let Some(root) = fixture_root(&contract) else {
-        return;
-    };
+    let root = fixture_root(&contract);
     assert!(
         !contract.datatables.is_empty(),
         "contract mirror must define DataTables"
@@ -1096,11 +1083,10 @@ fn shared_fixture_datatables_match_contract_mirror() {
 }
 
 #[test]
+#[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
 fn shared_fixture_datatables_decode_without_raw_properties() {
     let contract = contract();
-    let Some(root) = fixture_root(&contract) else {
-        return;
-    };
+    let root = fixture_root(&contract);
 
     for table in &contract.datatables {
         if skip_missing_fixture_asset(&root, &table.file) {
@@ -1127,11 +1113,10 @@ fn shared_fixture_datatables_decode_without_raw_properties() {
 }
 
 #[test]
+#[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
 fn shared_fixture_data_assets_match_contract_mirror() {
     let contract = contract();
-    let Some(root) = fixture_root(&contract) else {
-        return;
-    };
+    let root = fixture_root(&contract);
     assert!(
         !contract.data_assets.is_empty(),
         "contract mirror must define Data Assets"
@@ -1200,11 +1185,10 @@ fn shared_fixture_data_assets_match_contract_mirror() {
 }
 
 #[test]
+#[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
 fn shared_fixture_data_assets_decode_without_raw_properties() {
     let contract = contract();
-    let Some(root) = fixture_root(&contract) else {
-        return;
-    };
+    let root = fixture_root(&contract);
 
     for asset in &contract.data_assets {
         if skip_missing_fixture_asset(&root, &asset.file) {
@@ -1228,11 +1212,10 @@ fn shared_fixture_data_assets_decode_without_raw_properties() {
 }
 
 #[test]
+#[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
 fn shared_fixture_curve_tables_match_contract_mirror() {
     let contract = contract();
-    let Some(root) = fixture_root(&contract) else {
-        return;
-    };
+    let root = fixture_root(&contract);
     assert!(
         !contract.curve_tables.is_empty(),
         "contract mirror must define CurveTable fixtures"
@@ -1295,11 +1278,10 @@ fn shared_fixture_curve_tables_match_contract_mirror() {
 }
 
 #[test]
+#[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
 fn shared_fixture_string_tables_match_contract_mirror() {
     let contract = contract();
-    let Some(root) = fixture_root(&contract) else {
-        return;
-    };
+    let root = fixture_root(&contract);
     assert!(
         !contract.string_tables.is_empty(),
         "contract mirror must define StringTable fixtures"
@@ -1343,11 +1325,10 @@ fn shared_fixture_string_tables_match_contract_mirror() {
 }
 
 #[test]
+#[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
 fn shared_fixture_uobjects_match_contract_mirror() {
     let contract = contract();
-    let Some(root) = fixture_root(&contract) else {
-        return;
-    };
+    let root = fixture_root(&contract);
     assert!(
         !contract.uobjects.is_empty(),
         "contract mirror must define plain UObject fixtures"
@@ -1401,11 +1382,10 @@ fn shared_fixture_uobjects_match_contract_mirror() {
 }
 
 #[test]
+#[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
 fn shared_fixture_uobjects_decode_without_raw_properties() {
     let contract = contract();
-    let Some(root) = fixture_root(&contract) else {
-        return;
-    };
+    let root = fixture_root(&contract);
 
     for asset in &contract.uobjects {
         if skip_missing_fixture_asset(&root, &asset.file) {
@@ -1428,11 +1408,10 @@ fn shared_fixture_uobjects_decode_without_raw_properties() {
 }
 
 #[test]
+#[ignore = "requires the electroswag fixture project; set UASSET_FIXTURE_DIR"]
 fn shared_fixture_corpus_matches_the_spawned_cli_contract() {
     let contract = contract();
-    let Some(root) = fixture_root(&contract) else {
-        return;
-    };
+    let root = fixture_root(&contract);
 
     for asset in &contract.assets {
         if skip_missing_fixture_asset(&root, &asset.file) {
