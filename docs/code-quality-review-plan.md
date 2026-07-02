@@ -65,7 +65,9 @@ the upper layers use the same safety, typing, and testing standards.
 - [x] Replace raw capacity calls from file-controlled counts with `Reader` helpers.
   - Completed: parser allocations from serialized counts now allocate from
     checked capacity values or explicit local caps before `Vec::with_capacity`.
-- Add test cases for absurd counts in package, asset, codec, and utrace paths.
+- [x] Add test cases for absurd counts in package, asset, codec, and utrace paths.
+  - Completed: added regression tests for name-map counts, DataTable row
+    counts, decoded array payload counts, and utrace NewEvent field counts.
 - Treat unchecked file-driven capacity as a review blocker.
 
 ## 4. Add Lazy Error Context

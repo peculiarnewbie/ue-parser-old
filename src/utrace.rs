@@ -7013,6 +7013,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_absurd_new_event_field_count_before_allocating_fields() {
+        let declaration = [42, 0, u8::MAX, 0x07, 3, 4];
+
+        let error =
+            decode_new_event(&declaration, 7, 0).expect_err("absurd field count should fail");
+
+        assert_eq!(error.kind(), TraceErrorKind::MalformedData);
+        assert_eq!(error.path(), "NewEvent.FieldCount");
+        assert!(error.detail().contains("minimum serialized size"));
+    }
+
+    #[test]
     fn decodes_new_trace_and_thread_info() {
         let new_trace_uid = 10;
         let thread_info_uid = 11;

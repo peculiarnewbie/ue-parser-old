@@ -1693,6 +1693,35 @@ mod tests {
         assert_eq!(error.kind(), AssetErrorKind::ResourceLimit);
     }
 
+    #[test]
+    fn rejects_absurd_datatable_row_count_before_allocating_rows() {
+        let mut export_bytes = write_datatable_export(0, &[], &[]);
+        const DATATABLE_ROW_COUNT_OFFSET: usize = 1 + 8 + 4;
+        export_bytes[DATATABLE_ROW_COUNT_OFFSET..DATATABLE_ROW_COUNT_OFFSET + 4]
+            .copy_from_slice(&i32::MAX.to_le_bytes());
+
+        let package = test_package(names());
+        let export = test_export(
+            export_bytes.len() as u64,
+            "/Game/Test/DT_Test.DT_Test",
+            "/Script/Engine.DataTable",
+        );
+        let schemas = EmptySchemas;
+        let context = AssetDecodeContext {
+            source: &export_bytes,
+            package: &package,
+            schemas: &schemas,
+        };
+
+        let error = DataTableDecoder
+            .decode(&export, &context)
+            .expect_err("absurd row count");
+
+        assert_eq!(error.kind(), AssetErrorKind::MalformedData);
+        assert!(error.message().contains("Rows.Count"));
+        assert!(error.message().contains("exceeds element limit"));
+    }
+
     fn decode_datatable(
         export_bytes: Vec<u8>,
         package: Package,

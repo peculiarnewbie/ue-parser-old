@@ -720,8 +720,9 @@ mod tests {
     use crate::archive::{Reader, Span};
     use crate::package::test_package;
     use crate::property::{
-        PropertyRecord, PropertyStream, PropertyTagFlags, PropertyTypeName, PropertyValue,
-        RawReason, TextValue, VectorValue, read_tagged_property_stream,
+        PropertyError, PropertyErrorKind, PropertyRecord, PropertyStream, PropertyTagFlags,
+        PropertyTypeName, PropertyValue, RawReason, TextValue, VectorValue,
+        read_tagged_property_stream,
     };
     use crate::schema::{ClassSchema, SchemaProvider, StructSchema};
     use crate::test_support::{
@@ -748,6 +749,16 @@ mod tests {
         flags: PropertyTagFlags,
         payload: &[u8],
     ) -> PropertyValue {
+        decode_record_result(names, type_index, type_params, flags, payload).expect("decode record")
+    }
+
+    fn decode_record_result(
+        names: Vec<String>,
+        type_index: i32,
+        type_params: Vec<PropertyTypeName>,
+        flags: PropertyTagFlags,
+        payload: &[u8],
+    ) -> Result<PropertyValue, PropertyError> {
         let source = payload.to_vec();
         let record = PropertyRecord {
             name: crate::test_support::name_ref(0, 0),
@@ -772,8 +783,8 @@ mod tests {
             schemas: &schemas,
         };
         let mut record = record;
-        decode_property_record(&source, &mut record, &context, 0).expect("decode record");
-        record.value
+        decode_property_record(&source, &mut record, &context, 0)?;
+        Ok(record.value)
     }
 
     fn decode_stream(payload: &[u8]) -> PropertyStream {
@@ -908,6 +919,28 @@ mod tests {
             panic!("expected array, got {value:?}");
         };
         assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn rejects_absurd_array_count_before_allocating_values() {
+        let names = vec!["Value".into(), "ArrayProperty".into(), "IntProperty".into()];
+        let payload = i32::MAX.to_le_bytes();
+
+        let error = decode_record_result(
+            names,
+            1,
+            vec![PropertyTypeName {
+                name: crate::test_support::name_ref(2, 0),
+                parameters: Vec::new(),
+            }],
+            PropertyTagFlags(0),
+            &payload,
+        )
+        .expect_err("absurd array count should fail");
+
+        assert_eq!(error.kind(), PropertyErrorKind::MalformedData);
+        assert_eq!(error.path(), "Property.Value.Count");
+        assert!(error.detail().contains("exceeds element limit"));
     }
 
     #[test]

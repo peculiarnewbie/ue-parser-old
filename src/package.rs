@@ -1799,6 +1799,10 @@ mod tests {
         bytes
     }
 
+    fn write_i32_at(bytes: &mut [u8], offset: usize, value: i32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
     #[test]
     fn parses_current_ue5_summary_contract() {
         let bytes = current_summary_fixture(0);
@@ -1842,6 +1846,19 @@ mod tests {
 
         assert_eq!(error.kind(), PackageErrorKind::ResourceLimit);
         assert_eq!(error.path(), "Values.Count");
+    }
+
+    #[test]
+    fn rejects_absurd_name_count_before_allocating_name_map() {
+        let mut bytes = current_summary_fixture(0);
+        const NAMES_COUNT_OFFSET: usize = 60;
+        write_i32_at(&mut bytes, NAMES_COUNT_OFFSET, i32::MAX);
+
+        let error = Package::parse(&bytes).expect_err("absurd name count should fail");
+
+        assert_eq!(error.kind(), PackageErrorKind::MalformedData);
+        assert_eq!(error.path(), "Names.Count");
+        assert!(error.detail().contains("exceeds element limit"));
     }
 
     #[test]
