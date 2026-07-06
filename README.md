@@ -83,11 +83,16 @@ uasset utrace inspect Trace.utrace --format json
 uasset utrace inventory Trace.utrace --format json
 uasset utrace dashboard Trace.utrace --format json
 uasset utrace coverage Trace.utrace --format json
+uasset utrace html Trace.utrace --output Trace.html
 ```
 
 `utrace inventory` is parser-oriented: it counts observed event families and
 includes a small decoded payload sample per event type where fields can be
 decoded generically.
+
+`utrace html` writes a simple static dashboard page for quick local review. It
+uses the same decoded data as `utrace dashboard` and defaults to stdout when
+`--output` is omitted.
 
 `utrace coverage` reports decode coverage: it classifies every event a trace
 declares as decoded / partial / raw (with a note on what each decoder drops),

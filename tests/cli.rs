@@ -260,6 +260,48 @@ fn utrace_coverage_json_contract_cross_references_universe() {
 }
 
 #[cfg(feature = "utrace")]
+#[test]
+fn utrace_html_success_writes_static_report() {
+    let dir = std::env::temp_dir();
+    let trace_path = dir.join(format!(
+        "uasset-parser-utrace-{}-html.utrace",
+        std::process::id()
+    ));
+    let html_path = dir.join(format!(
+        "uasset-parser-utrace-{}-report.html",
+        std::process::id()
+    ));
+    std::fs::write(&trace_path, synthetic_utrace()).unwrap();
+
+    let output = binary()
+        .args([
+            "utrace",
+            "html",
+            trace_path.to_str().unwrap(),
+            "--output",
+            html_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    let html = std::fs::read_to_string(&html_path).unwrap();
+    let _ = std::fs::remove_file(&trace_path);
+    let _ = std::fs::remove_file(&html_path);
+
+    assert!(html.contains("<!doctype html>"));
+    assert!(html.contains("UTrace report"));
+    assert!(html.contains("GameThread"));
+    assert!(html.contains("Cycle frequency"));
+    assert!(html.contains("<h2>Frames</h2>"));
+    assert!(html.contains("1000000"));
+    assert!(!html.contains("Raw Dashboard JSON"));
+}
+
+#[cfg(feature = "utrace")]
 fn synthetic_utrace() -> Vec<u8> {
     const UINT8: u8 = 0x00;
     const UINT16: u8 = 0x01;

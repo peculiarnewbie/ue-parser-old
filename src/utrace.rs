@@ -66,16 +66,22 @@ pub struct FrameCorrelationDashboard {
     pub frames: Vec<CorrelatedFrameSummary>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CorrelatedFrameSummary {
     pub frame_number: u32,
     pub cpu_metadata_count: u64,
     pub cpu_metadata_cycles: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_metadata_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub top_cpu_scopes: Vec<CpuScopeSummary>,
     pub gpu_queue_count: u64,
     pub gpu_work_count: u64,
     pub gpu_work_cycles: u64,
     pub gpu_breadcrumb_count: u64,
     pub gpu_breadcrumb_cycles: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub top_gpu_breadcrumbs: Vec<GpuFrameBreadcrumbSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -2238,6 +2244,7 @@ fn read_dashboard_events(
     let mut metadata_stack_contexts = BTreeMap::<u16, CpuMetadataStackRuntimeState>::new();
     let mut cpu_batch_thread_states = BTreeMap::<u16, CpuBatchThreadState>::new();
     let mut scope_totals = BTreeMap::<u32, (u64, u64)>::new();
+    let mut frame_scope_totals = BTreeMap::<u32, BTreeMap<u32, (u64, u64)>>::new();
     let mut thread_scope_totals = BTreeMap::<u16, BTreeMap<u32, (u64, u64)>>::new();
     let mut cpu_named_events = BTreeMap::<String, CpuNamedEventState>::new();
     let mut gpu_queues = BTreeMap::<u32, GpuQueueState>::new();
@@ -2487,6 +2494,7 @@ fn read_dashboard_events(
                     metadata_stack_context: metadata_stack_contexts.entry(*thread_id).or_default(),
                     thread_state: cpu_batch_thread_states.entry(*thread_id).or_default(),
                     batch_base_cycle: raw_event.scope_cycle,
+                    frame_scope_totals: &mut frame_scope_totals,
                     thread_scope_totals: thread_scope_totals.entry(*thread_id).or_default(),
                 };
                 decode_cpu_batch(&data, &spec_by_id, &metadata_by_id, &mut batch_state)?;
@@ -2631,8 +2639,13 @@ fn read_dashboard_events(
         .threads
         .sort_by(|left, right| right.total_cycles.cmp(&left.total_cycles));
     decoded.gpu.frames = gpu_frame_summaries(&gpu_queues);
-    decoded.frame_correlation =
-        frame_correlation_dashboard(&cpu_metadata_rendered_totals, &decoded.gpu.frames);
+    decoded.frame_correlation = frame_correlation_dashboard(
+        &cpu_metadata_rendered_totals,
+        frame_scope_totals,
+        &spec_by_id,
+        &decoded.gpu.frames,
+        cycle_frequency,
+    );
     decoded.gpu.queues = gpu_queue_summaries(gpu_queues);
     decoded.gpu.work = gpu_work_summary(&decoded.gpu.queues);
     decoded.gpu.breadcrumbs = gpu_breadcrumb_dashboard(
@@ -3433,11 +3446,14 @@ fn gpu_work_summary(queues: &[GpuQueueSummary]) -> GpuWorkSummary {
 }
 
 fn frame_correlation_dashboard(
-    cpu_scope_totals: &BTreeMap<(u32, String), (u64, u64)>,
+    cpu_metadata_scope_totals: &BTreeMap<(u32, String), (u64, u64)>,
+    frame_scope_totals: BTreeMap<u32, BTreeMap<u32, (u64, u64)>>,
+    specs: &BTreeMap<u32, CpuScopeSpec>,
     gpu_frames: &[GpuFrameSummary],
+    cycle_frequency: Option<u64>,
 ) -> FrameCorrelationDashboard {
     let mut frames = BTreeMap::<u32, CorrelatedFrameSummary>::new();
-    for ((_, rendered_name), &(count, total_cycles)) in cpu_scope_totals {
+    for ((_, rendered_name), &(count, total_cycles)) in cpu_metadata_scope_totals {
         let Some(frame_number) = parse_rendered_frame_number(rendered_name) else {
             continue;
         };
@@ -3447,15 +3463,42 @@ fn frame_correlation_dashboard(
                 frame_number,
                 cpu_metadata_count: 0,
                 cpu_metadata_cycles: 0,
+                cpu_metadata_seconds: None,
+                top_cpu_scopes: Vec::new(),
                 gpu_queue_count: 0,
                 gpu_work_count: 0,
                 gpu_work_cycles: 0,
                 gpu_breadcrumb_count: 0,
                 gpu_breadcrumb_cycles: 0,
+                top_gpu_breadcrumbs: Vec::new(),
             });
         frame.cpu_metadata_count = frame.cpu_metadata_count.saturating_add(count);
         frame.cpu_metadata_cycles = frame.cpu_metadata_cycles.saturating_add(total_cycles);
+        frame.cpu_metadata_seconds =
+            cycle_frequency.map(|frequency| frame.cpu_metadata_cycles as f64 / frequency as f64);
     }
+    for (frame_number, totals) in frame_scope_totals {
+        let frame = frames
+            .entry(frame_number)
+            .or_insert_with(|| CorrelatedFrameSummary {
+                frame_number,
+                cpu_metadata_count: 0,
+                cpu_metadata_cycles: 0,
+                cpu_metadata_seconds: None,
+                top_cpu_scopes: Vec::new(),
+                gpu_queue_count: 0,
+                gpu_work_count: 0,
+                gpu_work_cycles: 0,
+                gpu_breadcrumb_count: 0,
+                gpu_breadcrumb_cycles: 0,
+                top_gpu_breadcrumbs: Vec::new(),
+            });
+        frame.top_cpu_scopes = scope_summaries(totals, specs, cycle_frequency)
+            .into_iter()
+            .take(5)
+            .collect();
+    }
+    let mut breadcrumb_totals = BTreeMap::<u32, BTreeMap<String, (u64, u64)>>::new();
     for gpu_frame in gpu_frames {
         let frame =
             frames
@@ -3464,11 +3507,14 @@ fn frame_correlation_dashboard(
                     frame_number: gpu_frame.frame_number,
                     cpu_metadata_count: 0,
                     cpu_metadata_cycles: 0,
+                    cpu_metadata_seconds: None,
+                    top_cpu_scopes: Vec::new(),
                     gpu_queue_count: 0,
                     gpu_work_count: 0,
                     gpu_work_cycles: 0,
                     gpu_breadcrumb_count: 0,
                     gpu_breadcrumb_cycles: 0,
+                    top_gpu_breadcrumbs: Vec::new(),
                 });
         frame.gpu_queue_count += 1;
         frame.gpu_work_count = frame.gpu_work_count.saturating_add(gpu_frame.work_count);
@@ -3481,8 +3527,22 @@ fn frame_correlation_dashboard(
         frame.gpu_breadcrumb_cycles = frame
             .gpu_breadcrumb_cycles
             .saturating_add(gpu_frame.breadcrumb_total_cycles);
+        let totals = breadcrumb_totals.entry(gpu_frame.frame_number).or_default();
+        for breadcrumb in &gpu_frame.top_breadcrumbs {
+            if parse_rendered_frame_number(&breadcrumb.name).is_some() {
+                continue;
+            }
+            let total = totals.entry(breadcrumb.name.clone()).or_insert((0, 0));
+            total.0 = total.0.saturating_add(breadcrumb.count);
+            total.1 = total.1.saturating_add(breadcrumb.total_cycles);
+        }
     }
     let mut frames = frames.into_values().collect::<Vec<_>>();
+    for frame in &mut frames {
+        if let Some(totals) = breadcrumb_totals.get(&frame.frame_number) {
+            frame.top_gpu_breadcrumbs = gpu_frame_top_breadcrumbs(totals);
+        }
+    }
     frames.sort_by_key(|frame| frame.frame_number);
     frames.truncate(120);
     FrameCorrelationDashboard { frames }
@@ -4109,6 +4169,15 @@ impl CpuMetadataStackRuntimeState {
             .rev()
             .find(|entry| entry.restored)
             .map(|entry| entry.metadata_id)
+    }
+
+    fn active_frame_number(&self, metadata: &BTreeMap<u32, CpuMetadataRecord>) -> Option<u32> {
+        self.active.iter().rev().find_map(|entry| {
+            metadata
+                .get(&entry.metadata_id)
+                .and_then(|record| record.rendered_name.as_deref())
+                .and_then(parse_rendered_frame_number)
+        })
     }
 }
 
@@ -5642,6 +5711,7 @@ struct CpuBatchDecodeState<'a> {
     metadata_stack_context: &'a mut CpuMetadataStackRuntimeState,
     thread_state: &'a mut CpuBatchThreadState,
     batch_base_cycle: Option<u64>,
+    frame_scope_totals: &'a mut BTreeMap<u32, BTreeMap<u32, (u64, u64)>>,
     thread_scope_totals: &'a mut BTreeMap<u32, (u64, u64)>,
 }
 
@@ -6222,6 +6292,7 @@ fn decode_cpu_batch(
                                     state,
                                 );
                             }
+                            record_cpu_frame_scope(spec_id, duration, metadata, state);
                         }
                         CpuStackEntryKind::Metadata {
                             metadata_id,
@@ -6377,6 +6448,21 @@ fn record_restored_cpu_metadata_scope(
         metadata,
         state.metadata_interval_state,
     );
+}
+
+fn record_cpu_frame_scope(
+    spec_id: u32,
+    duration: u64,
+    metadata: &BTreeMap<u32, CpuMetadataRecord>,
+    state: &mut CpuBatchDecodeState<'_>,
+) {
+    let Some(frame_number) = state.metadata_stack_context.active_frame_number(metadata) else {
+        return;
+    };
+    let frame_totals = state.frame_scope_totals.entry(frame_number).or_default();
+    let total = frame_totals.entry(spec_id).or_insert((0, 0));
+    total.0 += 1;
+    total.1 = total.1.saturating_add(duration);
 }
 
 fn suspend_cpu_coroutine_stack(
@@ -7697,6 +7783,7 @@ mod tests {
         let mut metadata_interval_state = CpuMetadataIntervalState::default();
         let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
         let mut thread_state = CpuBatchThreadState::default();
+        let mut frame_scope_totals = BTreeMap::new();
         let mut thread_scope_totals = BTreeMap::new();
         let mut state = CpuBatchDecodeState {
             batches: &mut batches,
@@ -7706,6 +7793,7 @@ mod tests {
             metadata_stack_context: &mut metadata_stack_context,
             thread_state: &mut thread_state,
             batch_base_cycle: None,
+            frame_scope_totals: &mut frame_scope_totals,
             thread_scope_totals: &mut thread_scope_totals,
         };
 
@@ -7745,6 +7833,7 @@ mod tests {
         let mut metadata_interval_state = CpuMetadataIntervalState::default();
         let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
         let mut thread_state = CpuBatchThreadState::default();
+        let mut frame_scope_totals = BTreeMap::new();
         let mut thread_scope_totals = BTreeMap::new();
 
         for batch in [&first_batch, &second_batch] {
@@ -7756,6 +7845,7 @@ mod tests {
                 metadata_stack_context: &mut metadata_stack_context,
                 thread_state: &mut thread_state,
                 batch_base_cycle: None,
+                frame_scope_totals: &mut frame_scope_totals,
                 thread_scope_totals: &mut thread_scope_totals,
             };
             decode_cpu_batch(batch, &specs, &BTreeMap::new(), &mut state).unwrap();
@@ -7793,6 +7883,7 @@ mod tests {
         let mut metadata_interval_state = CpuMetadataIntervalState::default();
         let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
         let mut thread_state = CpuBatchThreadState::default();
+        let mut frame_scope_totals = BTreeMap::new();
         let mut thread_scope_totals = BTreeMap::new();
         let mut state = CpuBatchDecodeState {
             batches: &mut batches,
@@ -7802,6 +7893,7 @@ mod tests {
             metadata_stack_context: &mut metadata_stack_context,
             thread_state: &mut thread_state,
             batch_base_cycle: Some(1_000),
+            frame_scope_totals: &mut frame_scope_totals,
             thread_scope_totals: &mut thread_scope_totals,
         };
 
@@ -7892,6 +7984,7 @@ mod tests {
         let mut metadata_scope_totals = BTreeMap::new();
         let mut metadata_interval_state = CpuMetadataIntervalState::default();
         let mut thread_state = CpuBatchThreadState::default();
+        let mut frame_scope_totals = BTreeMap::new();
         let mut thread_scope_totals = BTreeMap::new();
         {
             let mut state = CpuBatchDecodeState {
@@ -7902,6 +7995,7 @@ mod tests {
                 metadata_stack_context: &mut metadata_stack_context,
                 thread_state: &mut thread_state,
                 batch_base_cycle: None,
+                frame_scope_totals: &mut frame_scope_totals,
                 thread_scope_totals: &mut thread_scope_totals,
             };
 
@@ -7911,6 +8005,7 @@ mod tests {
         assert_eq!(batches.metadata_scopes, 0);
         assert_eq!(batches.restored_metadata_scopes, 1);
         assert_eq!(scope_totals[&1], (1, 20));
+        assert_eq!(frame_scope_totals[&366401][&1], (1, 20));
         assert_eq!(metadata_scope_totals[&7], (1, 20));
         assert_eq!(
             metadata_interval_state.rendered_scope_totals[&(7, "Frame 366401".to_owned())],

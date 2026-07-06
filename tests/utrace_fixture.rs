@@ -616,7 +616,23 @@ fn real_utrace_fixture_exposes_cpu_dashboard_summary() {
                 && frame["gpu_queue_count"]
                     .as_u64()
                     .is_some_and(|count| count > 0)
-                && frame["gpu_breadcrumb_count"].as_u64().is_some()),
+                && frame["gpu_breadcrumb_count"].as_u64().is_some()
+                && frame["cpu_metadata_seconds"].as_f64().is_some()
+                && frame["top_cpu_scopes"]
+                    .as_array()
+                    .is_some_and(|scopes| scopes.iter().any(|scope| {
+                        scope["name"].as_str().is_some_and(|name| !name.is_empty())
+                            && scope["total_cycles"]
+                                .as_u64()
+                                .is_some_and(|cycles| cycles > 0)
+                    }))
+                && frame["top_gpu_breadcrumbs"]
+                    .as_array()
+                    .is_some_and(|breadcrumbs| breadcrumbs.iter().any(|breadcrumb| {
+                        breadcrumb["name"]
+                            .as_str()
+                            .is_some_and(|name| !name.is_empty())
+                    }))),
         "fixture should expose bounded CPU/GPU frame correlation summaries"
     );
     assert!(

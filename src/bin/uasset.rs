@@ -96,6 +96,7 @@ enum UtraceCommand {
     Dashboard(InspectOptions),
     Inventory(InspectOptions),
     Coverage(CoverageOptions),
+    Html(UtraceHtmlOptions),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -103,6 +104,12 @@ struct CoverageOptions {
     input: Input,
     format: OutputFormat,
     universe: Option<PathBuf>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct UtraceHtmlOptions {
+    input: Input,
+    output: Option<PathBuf>,
 }
 
 impl Command {
@@ -146,6 +153,9 @@ impl Command {
                 _ => unreachable!("parse_inspect only returns Inspect"),
             },
             Some("coverage") => Ok(Self::Utrace(UtraceCommand::Coverage(Self::parse_coverage(
+                arguments.collect(),
+            )?))),
+            Some("html") => Ok(Self::Utrace(UtraceCommand::Html(Self::parse_utrace_html(
                 arguments.collect(),
             )?))),
             Some(command) => Err(format!("unknown utrace command {command:?}")),
@@ -242,6 +252,45 @@ impl Command {
             universe,
         })
     }
+
+    fn parse_utrace_html(arguments: Vec<OsString>) -> Result<UtraceHtmlOptions, String> {
+        let mut input = None;
+        let mut output = None;
+        let mut index = 0;
+
+        while index < arguments.len() {
+            let argument = &arguments[index];
+            match argument.to_str() {
+                Some("--output") | Some("-o") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--output requires a file path".to_owned())?;
+                    output = Some(PathBuf::from(value));
+                }
+                Some(value) if value.starts_with("--output=") => {
+                    output = Some(PathBuf::from(&value["--output=".len()..]));
+                }
+                Some("-h" | "--help") => {
+                    return Err("use `uasset help` for command usage".to_owned());
+                }
+                Some(value) if value.starts_with('-') && value != "-" => {
+                    return Err(format!("unknown html option {value:?}"));
+                }
+                _ if input.is_some() => {
+                    return Err("html accepts exactly one input".to_owned());
+                }
+                Some("-") => input = Some(Input::Stdin),
+                _ => input = Some(Input::File(PathBuf::from(argument))),
+            }
+            index += 1;
+        }
+
+        Ok(UtraceHtmlOptions {
+            input: input.ok_or_else(|| "html requires a file path or `-`".to_owned())?,
+            output,
+        })
+    }
 }
 
 fn reject_trailing_arguments(mut arguments: impl Iterator<Item = OsString>) -> Result<(), String> {
@@ -307,6 +356,7 @@ fn run_utrace(command: UtraceCommand) -> u8 {
         UtraceCommand::Dashboard(options) => dashboard_utrace(&options),
         UtraceCommand::Inventory(options) => inventory_utrace(&options),
         UtraceCommand::Coverage(options) => coverage_utrace(&options),
+        UtraceCommand::Html(options) => html_utrace(&options),
     }
 }
 
@@ -489,6 +539,54 @@ fn coverage_utrace(options: &CoverageOptions) -> u8 {
     write_stdout(&rendered)
 }
 
+#[cfg(feature = "utrace")]
+fn html_utrace(options: &UtraceHtmlOptions) -> u8 {
+    let input_name = options.input.display_name();
+    let bytes = match read_input(&options.input) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            write_utrace_error(
+                OutputFormat::Text,
+                UtraceErrorOutput::io(input_name, error.to_string()),
+            );
+            return EXIT_IO;
+        }
+    };
+
+    let dashboard = match uasset_parser::utrace::dashboard(&bytes) {
+        Ok(dashboard) => dashboard,
+        Err(error) => {
+            let exit_code = exit_code_for_trace_error(&error);
+            write_utrace_error(
+                OutputFormat::Text,
+                UtraceErrorOutput::trace(input_name, &error),
+            );
+            return exit_code;
+        }
+    };
+    let output = UtraceDashboardOutput {
+        schema_version: UTRACE_SCHEMA_VERSION,
+        status: "ok",
+        path: input_name,
+        dashboard,
+    };
+    let rendered = render_utrace_dashboard_html_output(&output);
+
+    match &options.output {
+        Some(path) => match fs::write(path, rendered) {
+            Ok(()) => EXIT_SUCCESS,
+            Err(error) => {
+                write_utrace_error(
+                    OutputFormat::Text,
+                    UtraceErrorOutput::io(path.to_string_lossy().into_owned(), error.to_string()),
+                );
+                EXIT_IO
+            }
+        },
+        None => write_stdout(rendered.as_bytes()),
+    }
+}
+
 fn read_input(input: &Input) -> io::Result<Vec<u8>> {
     match input {
         Input::File(path) => fs::read(path),
@@ -572,6 +670,296 @@ fn render_utrace_coverage_output(
             Ok(rendered)
         }
     }
+}
+
+#[cfg(feature = "utrace")]
+fn render_utrace_dashboard_html_output(output: &UtraceDashboardOutput) -> String {
+    let dashboard = &output.dashboard;
+    let mut rendered = String::new();
+    rendered.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n");
+    rendered.push_str("<meta charset=\"utf-8\">\n");
+    rendered.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    writeln!(
+        rendered,
+        "<title>UTrace report - {}</title>",
+        html_escape(&output.path)
+    )
+    .unwrap();
+    rendered.push_str(
+        "<style>
+:root { color-scheme: light dark; --border: #d0d7de; --muted: #57606a; --bg: #ffffff; --panel: #f6f8fa; --text: #24292f; }
+@media (prefers-color-scheme: dark) { :root { --border: #30363d; --muted: #8b949e; --bg: #0d1117; --panel: #161b22; --text: #c9d1d9; } }
+body { margin: 0; font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif; color: var(--text); background: var(--bg); }
+main { max-width: 1180px; margin: 0 auto; padding: 24px; }
+h1 { margin: 0 0 4px; font-size: 28px; }
+h2 { margin: 28px 0 10px; font-size: 18px; }
+.muted { color: var(--muted); }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+.metric { border: 1px solid var(--border); border-radius: 6px; padding: 12px; background: var(--panel); }
+.metric strong { display: block; font-size: 22px; }
+table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+th, td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+th { background: var(--panel); }
+code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, \"Liberation Mono\", monospace; }
+pre { overflow: auto; border: 1px solid var(--border); border-radius: 6px; padding: 12px; background: var(--panel); }
+</style>\n",
+    );
+    rendered.push_str("</head>\n<body>\n<main>\n");
+    write!(
+        rendered,
+        "<h1>UTrace report</h1>\n<p class=\"muted\">{}</p>\n",
+        html_escape(&output.path)
+    )
+    .unwrap();
+
+    rendered.push_str("<section class=\"grid\">\n");
+    html_metric(
+        &mut rendered,
+        "Threads",
+        dashboard.thread_info.len(),
+        "declared thread names",
+    );
+    html_metric(
+        &mut rendered,
+        "Frames",
+        dashboard.frames.len(),
+        "CPU frame markers",
+    );
+    html_metric(
+        &mut rendered,
+        "CPU scopes",
+        dashboard.cpu.scopes.len(),
+        "summarized scope specs",
+    );
+    html_metric(
+        &mut rendered,
+        "CPU intervals",
+        dashboard.cpu.batches.intervals,
+        "decoded timing intervals",
+    );
+    html_metric(
+        &mut rendered,
+        "Counters",
+        dashboard.counters.counters.len(),
+        "tracked counters",
+    );
+    html_metric(
+        &mut rendered,
+        "Unmodeled events",
+        dashboard.unmodeled.event_types,
+        "event types not decoded yet",
+    );
+    rendered.push_str("</section>\n");
+
+    if let Some(prologue) = &dashboard.prologue {
+        rendered.push_str("<h2>Trace Timing</h2>\n<table><tbody>\n");
+        html_kv_row(&mut rendered, "Start cycle", prologue.start_cycle);
+        html_kv_row(&mut rendered, "Cycle frequency", prologue.cycle_frequency);
+        html_kv_row(&mut rendered, "Pointer size", prologue.pointer_size);
+        html_kv_row(&mut rendered, "Start date time", prologue.start_date_time);
+        rendered.push_str("</tbody></table>\n");
+    }
+
+    if let Some(session) = &dashboard.session {
+        rendered.push_str("<h2>Session</h2>\n<table><tbody>\n");
+        html_kv_row(&mut rendered, "Platform", &session.platform);
+        html_kv_row(&mut rendered, "App", &session.app_name);
+        html_kv_row(&mut rendered, "Project", &session.project_name);
+        html_kv_row(
+            &mut rendered,
+            "Configuration",
+            format!("{:?}", session.configuration),
+        );
+        html_kv_row(
+            &mut rendered,
+            "Target",
+            format!("{:?}", session.target_type),
+        );
+        html_kv_row(&mut rendered, "Build", &session.build_version);
+        html_kv_row(&mut rendered, "Branch", &session.branch);
+        html_kv_row(&mut rendered, "Changelist", session.changelist);
+        rendered.push_str("</tbody></table>\n");
+    }
+
+    rendered.push_str("<h2>Threads</h2>\n<table><thead><tr><th>ID</th><th>System ID</th><th>Name</th><th>Sort Hint</th></tr></thead><tbody>\n");
+    for thread in dashboard.thread_info.iter().take(50) {
+        writeln!(
+            rendered,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            thread.thread_id,
+            thread.system_id,
+            html_escape(&thread.name),
+            thread.sort_hint
+        )
+        .unwrap();
+    }
+    rendered.push_str("</tbody></table>\n");
+
+    rendered.push_str("<h2>Frames</h2>\n<table><thead><tr><th>Frame</th><th>CPU Frame Seconds</th><th>CPU Frame Cycles</th><th>Top CPU Scopes</th><th>GPU Queues</th><th>GPU Work</th><th>GPU Work Cycles</th><th>Top GPU Breadcrumbs</th></tr></thead><tbody>\n");
+    for frame in dashboard.frame_correlation.frames.iter().take(80) {
+        let cpu_scopes = frame
+            .top_cpu_scopes
+            .iter()
+            .take(4)
+            .map(|scope| format!("{} ({})", scope.name, scope.total_cycles))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let gpu_breadcrumbs = frame
+            .top_gpu_breadcrumbs
+            .iter()
+            .take(4)
+            .map(|breadcrumb| format!("{} ({})", breadcrumb.name, breadcrumb.total_cycles))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            rendered,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            frame.frame_number,
+            html_optional(frame.cpu_metadata_seconds),
+            frame.cpu_metadata_cycles,
+            html_escape(&cpu_scopes),
+            frame.gpu_queue_count,
+            frame.gpu_work_count,
+            frame.gpu_work_cycles,
+            html_escape(&gpu_breadcrumbs)
+        )
+        .unwrap();
+    }
+    rendered.push_str("</tbody></table>\n");
+
+    rendered.push_str("<h2>Top CPU Scopes</h2>\n<table><thead><tr><th>Spec</th><th>Name</th><th>Count</th><th>Total Cycles</th><th>Total Seconds</th></tr></thead><tbody>\n");
+    for scope in dashboard.cpu.scopes.iter().take(40) {
+        writeln!(
+            rendered,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            scope.spec_id,
+            html_escape(&scope.name),
+            scope.count,
+            scope.total_cycles,
+            html_optional(scope.total_seconds)
+        )
+        .unwrap();
+    }
+    rendered.push_str("</tbody></table>\n");
+
+    rendered.push_str("<h2>Counters</h2>\n<table><thead><tr><th>ID</th><th>Name</th><th>Samples</th><th>Latest</th><th>Min</th><th>Max</th></tr></thead><tbody>\n");
+    for counter in dashboard.counters.counters.iter().take(40) {
+        writeln!(
+            rendered,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            counter.id,
+            html_escape(&counter.name),
+            counter.samples,
+            html_optional(counter.latest),
+            html_optional(counter.min),
+            html_optional(counter.max)
+        )
+        .unwrap();
+    }
+    rendered.push_str("</tbody></table>\n");
+
+    rendered.push_str("<h2>GPU Queues</h2>\n<table><thead><tr><th>ID</th><th>Name</th><th>Work</th><th>Work Cycles</th><th>Draws</th><th>Primitives</th></tr></thead><tbody>\n");
+    for queue in dashboard.gpu.queues.iter().take(40) {
+        writeln!(
+            rendered,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            queue.queue_id,
+            html_escape(queue.name.as_deref().unwrap_or("")),
+            queue.work_count,
+            queue.work_total_cycles,
+            queue.draw_count,
+            queue.primitive_count
+        )
+        .unwrap();
+    }
+    rendered.push_str("</tbody></table>\n");
+
+    rendered.push_str("<h2>Parser Progress</h2>\n<table><tbody>\n");
+    html_kv_row(
+        &mut rendered,
+        "Unmodeled event types",
+        dashboard.unmodeled.event_types,
+    );
+    html_kv_row(
+        &mut rendered,
+        "Unmodeled observed events",
+        dashboard.unmodeled.observed_events,
+    );
+    html_kv_row(&mut rendered, "Log messages", dashboard.logging.messages);
+    html_kv_row(
+        &mut rendered,
+        "Bookmark events",
+        dashboard.annotations.bookmarks.events,
+    );
+    html_kv_row(
+        &mut rendered,
+        "Region completions",
+        dashboard.annotations.regions.completed,
+    );
+    html_kv_row(&mut rendered, "Trace channels", dashboard.channels.count);
+    rendered.push_str("</tbody></table>\n");
+
+    rendered.push_str("<h2>Top Unmodeled Events</h2>\n<table><thead><tr><th>Event</th><th>Observed</th></tr></thead><tbody>\n");
+    for event in dashboard.unmodeled.events.iter().take(40) {
+        writeln!(
+            rendered,
+            "<tr><td>{}.{}</td><td>{}</td></tr>",
+            html_escape(&event.logger),
+            html_escape(&event.event),
+            event.observed_count
+        )
+        .unwrap();
+    }
+    rendered.push_str("</tbody></table>\n");
+
+    rendered.push_str("</main>\n</body>\n</html>\n");
+    rendered
+}
+
+#[cfg(feature = "utrace")]
+fn html_metric(rendered: &mut String, label: &str, value: impl std::fmt::Display, note: &str) {
+    writeln!(
+        rendered,
+        "<div class=\"metric\"><span>{}</span><strong>{}</strong><small class=\"muted\">{}</small></div>",
+        html_escape(label),
+        html_escape(&value.to_string()),
+        html_escape(note)
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "utrace")]
+fn html_kv_row(rendered: &mut String, key: &str, value: impl std::fmt::Display) {
+    writeln!(
+        rendered,
+        "<tr><th>{}</th><td>{}</td></tr>",
+        html_escape(key),
+        html_escape(&value.to_string())
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "utrace")]
+fn html_optional(value: Option<f64>) -> String {
+    value
+        .map(|value| html_escape(&format!("{value:.6}")))
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "utrace")]
+fn html_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 #[cfg(feature = "utrace")]
@@ -2293,6 +2681,7 @@ Usage:
   uasset utrace dashboard <path|-> [--format text|json]
   uasset utrace inventory <path|-> [--format text|json]
   uasset utrace coverage <path|-> [--universe <file>] [--format text|json]
+  uasset utrace html <path|-> [--output <file>]
   uasset help
   uasset version
 
@@ -2419,6 +2808,23 @@ mod tests {
                 input: Input::File(PathBuf::from("trace.utrace")),
                 format: OutputFormat::Json,
                 universe: Some(PathBuf::from("events.txt")),
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_utrace_html_contract() {
+        assert_eq!(
+            Command::parse(vec![
+                "utrace".into(),
+                "html".into(),
+                "trace.utrace".into(),
+                "--output=trace.html".into()
+            ])
+            .unwrap(),
+            Command::Utrace(UtraceCommand::Html(UtraceHtmlOptions {
+                input: Input::File(PathBuf::from("trace.utrace")),
+                output: Some(PathBuf::from("trace.html")),
             }))
         );
     }
