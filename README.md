@@ -218,3 +218,9 @@ Provider-specific captures can be supplied separately with
 combined corpus to exercise LoadTime requests, counter values, memory scopes,
 and metadata-stack restoration. IoStore requires a cooked capture and is
 validated separately with `UTRACE_IOSTORE_FIXTURE`.
+
+The ignored `memory_utrace_fixture_exposes_alloc_and_tag_summaries` test uses
+`UTRACE_MEMORY_FIXTURE`. It requires `Memory.Init`, `Memory.TagSpec`, and
+allocation/free traffic; the checked dashboard aggregates use bounded samples
+and a capped outstanding-address map. The current studio provider capture has
+Memory allocation traffic but no `LLM.TagValue` events.

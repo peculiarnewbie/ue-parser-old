@@ -111,6 +111,21 @@ fn iostore_fixture() -> PathBuf {
         })
 }
 
+fn memory_fixture() -> PathBuf {
+    if let Some(path) = std::env::var_os("UTRACE_MEMORY_FIXTURE").map(PathBuf::from) {
+        return require_file_or_skip(path, "UTRACE_MEMORY_FIXTURE");
+    }
+    let studio_capture =
+        PathBuf::from("D:/Perforce/Arif_Fixtures/Traces/targeted-providers.utrace");
+    if studio_capture.is_file() {
+        return studio_capture;
+    }
+    missing_fixture(
+        "set UTRACE_MEMORY_FIXTURE to a trace with Memory.Init, alloc/free, and tag traffic"
+            .to_owned(),
+    )
+}
+
 fn missing_fixture(message: String) -> ! {
     panic!("{message}");
 }
@@ -1411,6 +1426,72 @@ fn targeted_utrace_fixtures_exercise_provider_lifecycles() {
         metadata_restores > 0,
         "metadata restores must reach the dashboard"
     );
+}
+
+#[test]
+#[ignore = "requires a Memory allocation trace; set UTRACE_MEMORY_FIXTURE"]
+fn memory_utrace_fixture_exposes_alloc_and_tag_summaries() {
+    let fixture = memory_fixture();
+    let inventory_output = binary()
+        .args([
+            "utrace",
+            "inventory",
+            fixture.to_str().unwrap(),
+            "--format=json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        inventory_output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&inventory_output.stderr)
+    );
+    let inventory: Value = serde_json::from_slice(&inventory_output.stdout).unwrap();
+    let has_llm_tag_values = inventory["inventory"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| {
+            event["logger"] == "LLM"
+                && event["event"] == "TagValue"
+                && event["observed_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+        });
+
+    let dashboard_output = binary()
+        .args([
+            "utrace",
+            "dashboard",
+            fixture.to_str().unwrap(),
+            "--format=json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        dashboard_output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&dashboard_output.stderr)
+    );
+    let dashboard: Value = serde_json::from_slice(&dashboard_output.stdout).unwrap();
+    let memory = &dashboard["dashboard"]["memory"];
+    assert_eq!(memory["init"]["version"].as_u64(), Some(2));
+    assert!(!memory["tags"].as_array().unwrap().is_empty());
+    assert!(memory["allocs"]["count"].as_u64().unwrap() > 0);
+    assert!(memory["allocs"]["bytes_allocated"].as_u64().unwrap() > 0);
+    assert!(
+        memory["scopes"].as_array().unwrap().iter().any(|scope| {
+            scope["display"]
+                .as_str()
+                .is_some_and(|display| !display.is_empty())
+        }),
+        "MemoryScope tags should resolve through TagSpec"
+    );
+    if has_llm_tag_values {
+        assert!(memory["llm"]["sample_events"].as_u64().unwrap() > 0);
+    }
 }
 
 #[test]

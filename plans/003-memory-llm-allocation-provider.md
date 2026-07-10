@@ -14,9 +14,17 @@
 - **Priority**: P0 (upgraded — crucial for normal game load analysis)
 - **Effort**: L
 - **Risk**: HIGH (format versioning, huge event volume, callstack ids)
-- **Depends on**: none (parallel with 001/002). **Blocked on fixture capture.**
+- **Depends on**: none (parallel with 001/002). Memory capture available;
+  LLM `TagValue` capture still needed.
 - **Category**: direction
 - **Planned at**: commit `3c97e3c`, 2026-07-11
+
+**Progress (2026-07-11):** `targeted-providers.utrace` supplies a UE v2 Memory
+capture with Init, TagSpec, AllocSystem/FreeSystem, and realloc events. The
+bounded Memory allocation milestone is implemented and fixture-verified. This
+capture declares no LLM events, and allocation-to-tag attribution requires
+preserving scoped-event enter/leave style in serial dispatch; both remain
+explicit follow-up work in this plan.
 
 ## Why this matters
 
@@ -216,12 +224,12 @@ partial provider. Run fmt/clippy/test baseline.
 
 ## Done criteria
 
-- [ ] `src/utrace_memory.rs` exists and is wired
-- [ ] `EVENT_COVERAGE` lists implemented Memory/LLM events (not silent raw)
-- [ ] Dashboard exposes alloc summaries + tag names
-- [ ] `UTRACE_MEMORY_FIXTURE` ignored test exists and passes on a real capture
-- [ ] CPU-frame fixture still passes (Memory sections may remain empty)
-- [ ] Clippy/tests clean; README + matrix updated; plan status DONE
+- [x] `src/utrace_memory.rs` exists and is wired
+- [x] `EVENT_COVERAGE` lists implemented Memory events (not silent raw)
+- [x] Dashboard exposes alloc summaries + tag names
+- [x] `UTRACE_MEMORY_FIXTURE` ignored test exists and passes on a real capture
+- [x] CPU-frame fixture still passes (Memory sections may remain empty)
+- [ ] Clippy/tests clean; README + matrix updated; plan status DONE (pending LLM capture/decoder)
 
 ## STOP conditions
 

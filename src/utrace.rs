@@ -5,6 +5,7 @@ use std::fmt;
 
 use serde::Serialize;
 
+use crate::utrace_memory::{MemoryAllocation, MemoryFree, MemoryInit, MemoryProvider, MemoryTag};
 use crate::{ArchiveError, ArchiveErrorKind, Reader};
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -878,14 +879,114 @@ pub struct TraceThreadTimingSummary {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct MemoryDashboard {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub init: Option<MemoryInitSummary>,
+    pub tag_count: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub tag_overflow: u64,
+    pub tags: Vec<MemoryTagSummary>,
     pub scope_count: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub scope_tag_overflow: u64,
     pub scopes: Vec<MemoryScopeSummary>,
+    pub allocs: MemoryAllocationDashboard,
+    pub llm: MemoryLlmDashboard,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MemoryInitSummary {
+    pub version: u8,
+    pub page_size: u64,
+    pub marker_period: u32,
+    pub min_alignment: u8,
+    pub size_shift: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MemoryTagSummary {
+    pub tag: i32,
+    pub parent: i32,
+    pub display: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct MemoryAllocationDashboard {
+    pub count: u64,
+    pub free_count: u64,
+    pub realloc_alloc_count: u64,
+    pub realloc_free_count: u64,
+    pub bytes_allocated: u64,
+    pub bytes_freed: u64,
+    pub net_bytes: i64,
+    pub unresolved_free: u64,
+    pub outstanding_allocations: u64,
+    pub outstanding_bytes: u64,
+    pub outstanding_overflow: bool,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub outstanding_dropped: u64,
+    pub by_root_heap: Vec<MemoryRootHeapSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<MemoryAllocationSample>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MemoryRootHeapSummary {
+    pub root_heap: u8,
+    pub name: String,
+    pub alloc_count: u64,
+    pub free_count: u64,
+    pub bytes_allocated: u64,
+    pub bytes_freed: u64,
+    pub net_bytes: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MemoryAllocationSample {
+    pub address: u64,
+    pub size: u64,
+    pub root_heap: u8,
+    pub callstack_id: u32,
+    pub kind: MemoryAllocationKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAllocationKind {
+    Alloc,
+    ReallocAlloc,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct MemoryLlmDashboard {
+    pub tag_count: u64,
+    pub tracker_count: u64,
+    pub tag_set_count: u64,
+    pub sample_events: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<MemoryLlmTagSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub latest_values: Vec<MemoryLlmValueSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MemoryLlmTagSummary {
+    pub tag: i32,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MemoryLlmValueSummary {
+    pub tag: i32,
+    pub value: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct MemoryScopeSummary {
     pub tag: i32,
     pub count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -1689,9 +1790,81 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
     },
     EventCoverage {
         logger: "Memory",
+        event: "Init",
+        status: DecodeStatus::Partial,
+        note: "Memory allocation format version and packed-size parameters.",
+    },
+    EventCoverage {
+        logger: "Memory",
+        event: "TagSpec",
+        status: DecodeStatus::Partial,
+        note: "Memory tag catalog with parent ids and display names.",
+    },
+    EventCoverage {
+        logger: "Memory",
         event: "MemoryScope",
         status: DecodeStatus::Partial,
-        note: "Memory scope tag counts; tag catalog and allocation semantics are not decoded.",
+        note: "Memory scope tag counts resolved through the bounded tag catalog.",
+    },
+    EventCoverage {
+        logger: "Memory",
+        event: "Alloc",
+        status: DecodeStatus::Partial,
+        note: "Root-heap allocation summary with bounded outstanding-address tracking.",
+    },
+    EventCoverage {
+        logger: "Memory",
+        event: "AllocSystem",
+        status: DecodeStatus::Partial,
+        note: "System-root allocation summary with bounded outstanding-address tracking.",
+    },
+    EventCoverage {
+        logger: "Memory",
+        event: "AllocVideo",
+        status: DecodeStatus::Partial,
+        note: "Video-root allocation summary with bounded outstanding-address tracking.",
+    },
+    EventCoverage {
+        logger: "Memory",
+        event: "Free",
+        status: DecodeStatus::Partial,
+        note: "Allocation frees paired only against bounded tracked addresses.",
+    },
+    EventCoverage {
+        logger: "Memory",
+        event: "FreeSystem",
+        status: DecodeStatus::Partial,
+        note: "System-root allocation frees paired only against bounded tracked addresses.",
+    },
+    EventCoverage {
+        logger: "Memory",
+        event: "FreeVideo",
+        status: DecodeStatus::Partial,
+        note: "Video-root allocation frees paired only against bounded tracked addresses.",
+    },
+    EventCoverage {
+        logger: "Memory",
+        event: "ReallocAlloc",
+        status: DecodeStatus::Partial,
+        note: "Root-heap reallocation allocation summary.",
+    },
+    EventCoverage {
+        logger: "Memory",
+        event: "ReallocAllocSystem",
+        status: DecodeStatus::Partial,
+        note: "System-root reallocation allocation summary.",
+    },
+    EventCoverage {
+        logger: "Memory",
+        event: "ReallocFree",
+        status: DecodeStatus::Partial,
+        note: "Root-heap reallocation frees paired only against bounded tracked addresses.",
+    },
+    EventCoverage {
+        logger: "Memory",
+        event: "ReallocFreeSystem",
+        status: DecodeStatus::Partial,
+        note: "System-root reallocation frees paired only against bounded tracked addresses.",
     },
     EventCoverage {
         logger: "MetadataStack",
@@ -2579,7 +2752,7 @@ fn read_dashboard_events(
     let mut io_store = IoStoreState::default();
     let mut trace_thread_timing = BTreeMap::<u16, TraceThreadTimingSummary>::new();
     let mut cpu_end_threads = Vec::<CpuEndThreadSummary>::new();
-    let mut memory_scopes = BTreeMap::<i32, u64>::new();
+    let mut memory = MemoryProvider::default();
     let mut metadata_stack = MetadataStackState::default();
     let mut slate_widgets = BTreeMap::<u64, SlateWidgetState>::new();
     let mut trace_channels = BTreeMap::<u32, TraceChannelState>::new();
@@ -2771,9 +2944,26 @@ fn read_dashboard_events(
                         thread_id,
                     )?);
                 }
+                ("Memory", "Init") => {
+                    memory.set_init(decode_memory_init(
+                        event,
+                        raw_event.data,
+                        raw_event.offset + 4,
+                    )?);
+                }
+                ("Memory", "TagSpec") => {
+                    memory.record_tag(decode_memory_tag(
+                        event,
+                        raw_event.data,
+                        raw_event.offset + 4,
+                    )?);
+                }
                 ("Memory", "MemoryScope") => {
-                    let tag = decode_memory_scope(event, raw_event.data, raw_event.offset + 4)?;
-                    *memory_scopes.entry(tag).or_default() += 1;
+                    memory.record_scope(decode_memory_scope(
+                        event,
+                        raw_event.data,
+                        raw_event.offset + 4,
+                    )?);
                 }
                 ("MetadataStack", "ClearScope" | "SaveStack" | "RestoreStack") => {
                     decode_metadata_stack_event(
@@ -2912,9 +3102,34 @@ fn read_dashboard_events(
             trace_thread_timing.insert(timing.thread_id, timing);
         } else if (event.logger.as_str(), event.event.as_str()) == ("CpuProfiler", "EndThread") {
             cpu_end_threads.push(decode_cpu_end_thread(event, &raw_event.data, 0, thread_id)?);
-        } else if (event.logger.as_str(), event.event.as_str()) == ("Memory", "MemoryScope") {
-            let tag = decode_memory_scope(event, &raw_event.data, 0)?;
-            *memory_scopes.entry(tag).or_default() += 1;
+        } else if event.logger.as_str() == "Memory" {
+            match event.event.as_str() {
+                "MemoryScope" => {
+                    memory.record_scope(decode_memory_scope(event, &raw_event.data, 0)?);
+                }
+                "Alloc" | "AllocSystem" | "AllocVideo" | "ReallocAlloc" | "ReallocAllocSystem"
+                | "ReallocAllocVideo" => {
+                    let init = memory.init().ok_or_else(|| {
+                        TraceError::new(
+                            TraceErrorKind::MalformedData,
+                            0,
+                            "Memory.Init",
+                            "allocation event appeared before required Memory.Init",
+                        )
+                    })?;
+                    memory.record_allocation(decode_memory_allocation(
+                        event,
+                        &raw_event.data,
+                        init,
+                        0,
+                    )?);
+                }
+                "Free" | "FreeSystem" | "FreeVideo" | "ReallocFree" | "ReallocFreeSystem"
+                | "ReallocFreeVideo" => {
+                    memory.record_free(decode_memory_free(event, &raw_event.data, 0)?);
+                }
+                _ => {}
+            }
         } else if event.logger.as_str() == "MetadataStack" {
             decode_metadata_stack_event(event, &raw_event.data, &mut metadata_stack, 0)?;
             apply_metadata_stack_event_to_cpu_context(
@@ -3016,7 +3231,7 @@ fn read_dashboard_events(
     decoded.loading = load_time.dashboard();
     decoded.io_store = io_store.dashboard();
     decoded.trace_timing = trace_timing_dashboard(trace_thread_timing);
-    decoded.memory = memory_dashboard(memory_scopes);
+    decoded.memory = memory.dashboard();
     decoded.metadata_stack = metadata_stack.dashboard();
     decoded.slate = slate_dashboard(slate_widgets);
     decoded.channels = trace_channel_dashboard(trace_channels);
@@ -4836,6 +5051,53 @@ fn decode_cpu_end_thread(
     })
 }
 
+fn decode_memory_init(
+    event: &EventTypeInfo,
+    data: &[u8],
+    base_offset: u64,
+) -> Result<MemoryInit, TraceError> {
+    let init = MemoryInit {
+        page_size: read_u64_field(event, data, "PageSize", base_offset)?,
+        marker_period: read_u32_field(event, data, "MarkerPeriod", base_offset)?,
+        version: read_u8_field(event, data, "Version", base_offset)?,
+        min_alignment: read_u8_field(event, data, "MinAlignment", base_offset)?,
+        size_shift: read_u8_field(event, data, "SizeShift", base_offset)?,
+    };
+    if !(1..=2).contains(&init.version) {
+        return Err(TraceError::new(
+            TraceErrorKind::UnsupportedFormat,
+            base_offset,
+            "Memory.Init.Version",
+            format!(
+                "unsupported Memory trace version {}; supported versions are 1 through 2",
+                init.version
+            ),
+        ));
+    }
+    if init.size_shift >= 64 {
+        return Err(TraceError::new(
+            TraceErrorKind::MalformedData,
+            base_offset,
+            "Memory.Init.SizeShift",
+            format!("size shift {} must be less than 64", init.size_shift),
+        ));
+    }
+    Ok(init)
+}
+
+fn decode_memory_tag(
+    event: &EventTypeInfo,
+    data: &[u8],
+    base_offset: u64,
+) -> Result<MemoryTag, TraceError> {
+    let aux = parse_protocol5_aux(data, event_data_size(event), base_offset)?;
+    Ok(MemoryTag {
+        tag: read_i32_field(event, data, "Tag", base_offset)?,
+        parent: read_i32_field(event, data, "Parent", base_offset)?,
+        display: read_aux_string(event, &aux, "Display")?,
+    })
+}
+
 fn decode_memory_scope(
     event: &EventTypeInfo,
     data: &[u8],
@@ -4844,21 +5106,54 @@ fn decode_memory_scope(
     read_i32_field(event, data, "Tag", base_offset)
 }
 
-fn memory_dashboard(scopes: BTreeMap<i32, u64>) -> MemoryDashboard {
-    let mut scopes = scopes
-        .into_iter()
-        .map(|(tag, count)| MemoryScopeSummary { tag, count })
-        .collect::<Vec<_>>();
-    scopes.sort_by(|left, right| {
-        right
-            .count
-            .cmp(&left.count)
-            .then_with(|| left.tag.cmp(&right.tag))
-    });
-    MemoryDashboard {
-        scope_count: scopes.iter().map(|scope| scope.count).sum(),
-        scopes,
-    }
+fn decode_memory_allocation(
+    event: &EventTypeInfo,
+    data: &[u8],
+    init: MemoryInit,
+    base_offset: u64,
+) -> Result<MemoryAllocation, TraceError> {
+    let root_heap = match event.event.as_str() {
+        "AllocSystem" | "ReallocAllocSystem" => 0,
+        "AllocVideo" | "ReallocAllocVideo" => 1,
+        "Alloc" | "ReallocAlloc" => read_u8_field(event, data, "RootHeap", base_offset)?,
+        _ => unreachable!("memory allocation event was prefiltered"),
+    };
+    let packed_size = u64::from(read_u32_field(event, data, "Size", base_offset)?);
+    let size_lower = u64::from(read_u8_field(
+        event,
+        data,
+        "AlignmentPow2_SizeLower",
+        base_offset,
+    )?) & ((1_u64 << init.size_shift) - 1);
+    Ok(MemoryAllocation {
+        address: read_u64_field(event, data, "Address", base_offset)?,
+        size: (packed_size << init.size_shift) | size_lower,
+        root_heap,
+        callstack_id: read_u32_field(event, data, "CallstackId", base_offset)?,
+        kind: if event.event.starts_with("Realloc") {
+            MemoryAllocationKind::ReallocAlloc
+        } else {
+            MemoryAllocationKind::Alloc
+        },
+    })
+}
+
+fn decode_memory_free(
+    event: &EventTypeInfo,
+    data: &[u8],
+    base_offset: u64,
+) -> Result<MemoryFree, TraceError> {
+    let root_heap = match event.event.as_str() {
+        "FreeSystem" | "ReallocFreeSystem" => 0,
+        "FreeVideo" | "ReallocFreeVideo" => 1,
+        "Free" | "ReallocFree" => read_u8_field(event, data, "RootHeap", base_offset)?,
+        _ => unreachable!("memory free event was prefiltered"),
+    };
+    Ok(MemoryFree {
+        address: read_u64_field(event, data, "Address", base_offset)?,
+        root_heap,
+        is_realloc: event.event.starts_with("Realloc"),
+    })
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -8929,7 +9224,10 @@ mod tests {
 
         let memory_data = (-42_i32).to_le_bytes();
         let tag = decode_memory_scope(&memory_scope_event, &memory_data, 0).unwrap();
-        let memory = memory_dashboard([(tag, 2_u64)].into_iter().collect());
+        let mut memory_provider = MemoryProvider::default();
+        memory_provider.record_scope(tag);
+        memory_provider.record_scope(tag);
+        let memory = memory_provider.dashboard();
         assert_eq!(memory.scope_count, 2);
         assert_eq!(memory.scopes[0].tag, -42);
 

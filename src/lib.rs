@@ -13,6 +13,8 @@ pub mod schema;
 pub mod utrace;
 #[cfg(feature = "utrace")]
 pub mod utrace_dispatch;
+#[cfg(feature = "utrace")]
+pub(crate) mod utrace_memory;
 pub mod version;
 
 #[cfg(test)]

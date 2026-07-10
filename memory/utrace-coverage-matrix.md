@@ -66,7 +66,7 @@ The area-level status table below is the human narrative layer on top of that.
 | Stats | partial | `Stats.Spec` | `stats.specs`, `stats.groups`, `stats.stats` | Dashboard decodes UE Stats declarations (id, name, description, group, and floating-point/memory/clear-every-frame flags) and explicitly reports zero sample events for the current fixture. Stat sample values are not decoded yet. |
 | CSV profiler | partial | `CsvProfiler.RegisterCategory`, `CsvProfiler.DefineDeclaredStat`, `CsvProfiler.DefineInlineStat` | `csv.categories`, `csv.stat_defs`, `csv.top_categories` | Dashboard decodes CSV profiler category and stat registration catalogs and explicitly reports zero sample events for the current fixture. CSV sample timelines are not decoded yet. |
 | Trace channels | partial | `Trace.ChannelAnnounce`, `Trace.ChannelToggle` | `channels.channels` | Dashboard decodes trace channel declarations, read-only flags, latest enabled state, and toggle counts. Distinct from the `$Trace` logger used for the prologue and threads. |
-| Memory | partial | `Memory.MemoryScope` | `memory.scopes` | Memory scope tag events are counted. Memory/LLM tag catalogs, allocation streams, and provider semantics are not decoded yet. |
+| Memory | partial | `Memory.Init`, `TagSpec`, `MemoryScope`, `Alloc*`, `Free*`, `ReallocAlloc*`, `ReallocFree*` | `memory.init`, `memory.tags`, `memory.scopes`, `memory.allocs` | Dashboard validates supported Memory trace versions (1–2), resolves scope tag names, unpacks sizes using `SizeShift`, and summarizes allocation/free/reallocation bytes by root heap. Retained allocation samples (40) and outstanding address tracking (262,144 entries) are explicitly bounded; once the outstanding map overflows, later frees may be unresolved. Allocation-to-current-tag attribution needs scoped Memory event style support and remains deferred. The current provider capture has no LLM events, so `memory.llm` stays explicitly empty. |
 | Loading/assets | partial | `LoadTime.ClassInfo`, `LoadTime.StartAsyncLoading`, `LoadTime.SuspendAsyncLoading`, `LoadTime.ResumeAsyncLoading`, `LoadTime.PackageSummary`, `LoadTime.BeginRequest`, `LoadTime.EndRequest`, `LoadTime.NewAsyncPackage`, `LoadTime.DestroyAsyncPackage` | `loading.classes`, `loading.packages`, `loading.requests`, `loading.async_loading` | Class catalog, package summaries, request begin/end pairing with bounded samples, and async loading start/suspend/resume counts are decoded. Full Unreal Insights load-time analyzer semantics (object graphs, package state machines) are not emitted yet. This fixture currently exercises only `ClassInfo`. |
 | IO/file | partial | `IoStore.*` lifecycle events | `io_store.backends`, `io_store.request_samples`, request/byte counters | IoStore backend catalog and request create/start/complete/fail lifecycle are decoded with bounded samples. `File.*` activity and full chunk-resolution timelines are not decoded yet. The current CPU-frame fixture declares no IoStore traffic. |
 | Logs/diagnostics | partial | `Logging.LogCategory`, `Logging.LogMessageSpec`, `Logging.LogMessage`, `Diagnostics.Session2` | `logging.categories`, `logging.message_specs`, `logging.verbosity`, `logging.top_categories`, `logging.top_messages`, `session` | Dashboard decodes the log category catalog (name + default verbosity), message specs (log points) resolved to file/line/format/category, per-verbosity spec and message counts, and message counts per log point. It renders simple `%s` sample log arguments and formats the `Diagnostics.Session2` instance id as a GUID. Full printf argument expansion, per-message timelines, and `Diagnostics.Session` (v1) are not decoded. |
@@ -130,12 +130,13 @@ groups, `LoadTime.ClassInfo`, and the simple declared-only families
 `SlateTrace.AddWidget`) are decoded or counted (partial). Within the
 already-partial families, coroutine restoration, metadata stack restoration,
 and full unbounded timelines remain the biggest semantic gaps. Serial-ordered
-dispatch, GPU submission-latency samples, and bounded CPU/GPU frame timelines are
-now emitted. Provider-specific real captures remain separate from the CPU-frame
+dispatch, GPU submission-latency samples, bounded CPU/GPU frame timelines, and
+bounded Memory allocation summaries are now emitted. Provider-specific real captures remain separate from the CPU-frame
 fixture. Run the ignored `targeted_utrace_fixtures_exercise_provider_lifecycles`
 test with `UTRACE_TARGETED_FIXTURE` or `UTRACE_TARGETED_FIXTURE_DIR`; its
 combined corpus contract requires LoadTime requests, counter values, memory
-scopes, and metadata-stack restoration. IoStore request lifecycles require a
+scopes, and metadata-stack restoration. Memory allocation aggregation is checked
+separately with `UTRACE_MEMORY_FIXTURE`; IoStore request lifecycles require a
 cooked capture and are checked separately with `UTRACE_IOSTORE_FIXTURE`.
 
 Do not add the full coverage matrix back into the CLI JSON unless there is a
