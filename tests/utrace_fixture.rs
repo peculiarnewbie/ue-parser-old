@@ -388,6 +388,51 @@ fn real_utrace_fixture_exposes_cpu_dashboard_summary() {
             .any(|scope| scope["name"].as_str().is_some_and(|name| !name.is_empty())),
         "fixture should expose named CPU scope summaries"
     );
+    // Global inclusive totals must stay within capture_span * thread_count.
+    // thread_count is a documented fudge: inclusive time is summed across
+    // threads, so a busy scope can exceed wall capture span, but not by
+    // orders of magnitude (the pre-fix bug was ~442× on a single thread).
+    {
+        let prologue = &json["dashboard"]["prologue"];
+        let freq = prologue["cycle_frequency"].as_u64().unwrap() as f64;
+        let frames = json["dashboard"]["frames"].as_array().unwrap();
+        let begin_cycles: Vec<u64> = frames
+            .iter()
+            .filter(|frame| frame["kind"] == "begin")
+            .filter_map(|frame| frame["cycle"].as_u64())
+            .collect();
+        let end_cycles: Vec<u64> = frames
+            .iter()
+            .filter(|frame| frame["kind"] == "end")
+            .filter_map(|frame| frame["cycle"].as_u64())
+            .collect();
+        assert!(
+            !begin_cycles.is_empty() && !end_cycles.is_empty(),
+            "fixture should expose begin/end frame markers for capture span"
+        );
+        let capture_span = (end_cycles.iter().copied().max().unwrap()
+            - begin_cycles.iter().copied().min().unwrap()) as f64
+            / freq;
+        let thread_count = json["dashboard"]["cpu"]["threads"]
+            .as_array()
+            .unwrap()
+            .len()
+            .max(1) as f64;
+        let limit = capture_span * thread_count;
+        for scope in json["dashboard"]["cpu"]["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(20)
+        {
+            let total = scope["total_seconds"].as_f64().unwrap();
+            assert!(
+                total <= limit,
+                "top scope {} total_seconds {total} exceeds capture_span ({capture_span}) * thread_count ({thread_count})",
+                scope["name"]
+            );
+        }
+    }
     assert_eq!(
         json["dashboard"]["unmodeled"]["event_types"]
             .as_u64()

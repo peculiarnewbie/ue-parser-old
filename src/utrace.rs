@@ -7,6 +7,10 @@ use serde::Serialize;
 
 use crate::{ArchiveError, ArchiveErrorKind, Reader};
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceMagic {
@@ -281,6 +285,15 @@ pub struct CpuBatchSummary {
     pub coroutine_records: u64,
     pub unmatched_ends: u64,
     pub unterminated_scopes: u64,
+    /// Cold-start relative records that were StartCycle-anchored, then corrected
+    /// when the thread jumped to flush-aligned absolute cycles.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub preamble_timeline_rebases: u64,
+    /// Leave intervals whose duration still exceeded the capture-span safety net.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub implausible_duration_count: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub implausible_duration_cycles: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -7021,25 +7034,65 @@ fn decode_cpu_batch(
     state.batches.count += 1;
     let mut reader = VarintReader::new(data);
     let base_cycle = state.batch_base_cycle.unwrap_or(0);
+    // Slack used to detect StartCycle-anchored preamble → absolute timeline jumps.
+    // One second of cycles when frequency is known; otherwise 10M (UE default-ish).
+    let preamble_slack = state.cycle_frequency.unwrap_or(10_000_000);
 
     while !reader.is_empty() {
         let first = reader.read_u64()?;
         state.batches.decoded_records += 1;
-        let mut cycle = first >> 2;
+        let encoded_cycle = first >> 2;
+        let is_relative = encoded_cycle < state.thread_state.last_cycle;
+        let mut cycle = encoded_cycle;
         // Relative delta against the previous absolute cycle on this thread.
-        if cycle < state.thread_state.last_cycle {
+        if is_relative {
             cycle = cycle.saturating_add(state.thread_state.last_cycle);
         }
         // Late-connect / missing absolute base (Insights ProcessBufferV2).
         if cycle < base_cycle {
             cycle = cycle.saturating_add(base_cycle);
         }
+        // When a cold-start thread was StartCycle-anchored (late-connect) and then
+        // receives a flush-aligned absolute timestamp, open stack entries still
+        // carry preamble starts near BaseCycle. Rebase them across the jump so
+        // inclusive durations do not span the entire pre-frame gap.
+        if base_cycle > 0
+            && state.thread_state.last_cycle > 0
+            // A large relative delta is a legitimate long scope interval.
+            // Only a raw absolute cycle can indicate a flushed CPU buffer
+            // switching from the StartCycle-anchored preamble.
+            && !is_relative
+            && state.thread_state.last_cycle.saturating_sub(base_cycle) < preamble_slack
+            && cycle > state.thread_state.last_cycle
+            && cycle.saturating_sub(state.thread_state.last_cycle) > preamble_slack
+        {
+            let shift = cycle.saturating_sub(state.thread_state.last_cycle);
+            rebase_cpu_stack_starts(&mut state.thread_state.stack, shift);
+            for suspended in state.thread_state.coroutine_stacks.values_mut() {
+                rebase_cpu_stack_starts(suspended, shift);
+            }
+            state.batches.preamble_timeline_rebases =
+                state.batches.preamble_timeline_rebases.saturating_add(1);
+        }
         match first & 0b11 {
             0b00 => {
                 if let Some(entry) = state.thread_state.stack.pop() {
-                    let duration = entry
+                    let mut duration = entry
                         .accumulated_cycles
                         .saturating_add(cycle.saturating_sub(entry.start_cycle));
+                    // Safety net: a single interval should not exceed a generous
+                    // multiple of one second of capture when frequency is known.
+                    // Primary fix is preamble rebase above; this counts leftovers.
+                    let implausible_limit = preamble_slack.saturating_mul(64);
+                    if duration > implausible_limit {
+                        state.batches.implausible_duration_count =
+                            state.batches.implausible_duration_count.saturating_add(1);
+                        state.batches.implausible_duration_cycles = state
+                            .batches
+                            .implausible_duration_cycles
+                            .saturating_add(duration);
+                        duration = implausible_limit;
+                    }
                     match entry.kind {
                         CpuStackEntryKind::PlainSpec(spec_id) => {
                             let total = state.scope_totals.entry(spec_id).or_insert((0, 0));
@@ -7162,24 +7215,24 @@ fn decode_cpu_batch(
                         start_cycle: cycle,
                         accumulated_cycles: 0,
                     });
-                    continue;
+                } else {
+                    let spec_id = u32::try_from(payload >> 1).map_err(|_| {
+                        TraceError::new(
+                            TraceErrorKind::MalformedData,
+                            0,
+                            "CpuProfiler.EventBatchV3.Data",
+                            "scope spec id does not fit in u32",
+                        )
+                    })?;
+                    if !specs.contains_key(&spec_id) {
+                        state.batches.unresolved_specs += 1;
+                    }
+                    state.thread_state.stack.push(CpuStackEntry {
+                        kind: CpuStackEntryKind::PlainSpec(spec_id),
+                        start_cycle: cycle,
+                        accumulated_cycles: 0,
+                    });
                 }
-                let spec_id = u32::try_from(payload >> 1).map_err(|_| {
-                    TraceError::new(
-                        TraceErrorKind::MalformedData,
-                        0,
-                        "CpuProfiler.EventBatchV3.Data",
-                        "scope spec id does not fit in u32",
-                    )
-                })?;
-                if !specs.contains_key(&spec_id) {
-                    state.batches.unresolved_specs += 1;
-                }
-                state.thread_state.stack.push(CpuStackEntry {
-                    kind: CpuStackEntryKind::PlainSpec(spec_id),
-                    start_cycle: cycle,
-                    accumulated_cycles: 0,
-                });
             }
             0b10 => {
                 let depth = reader.read_u64()?;
@@ -7230,6 +7283,12 @@ fn cpu_batch_thread_state_unterminated_scopes(state: &CpuBatchThreadState) -> u6
             .values()
             .map(|stack| u64::try_from(stack.len()).unwrap())
             .sum::<u64>()
+}
+
+fn rebase_cpu_stack_starts(stack: &mut [CpuStackEntry], shift: u64) {
+    for entry in stack {
+        entry.start_cycle = entry.start_cycle.saturating_add(shift);
+    }
 }
 
 fn record_restored_cpu_metadata_scope(
@@ -8969,6 +9028,337 @@ mod tests {
         // Relative deltas 25 then 15 against base 1000 → absolute 1025..1040.
         assert_eq!(scope_totals[&1], (1, 15));
         assert_eq!(thread_state.last_cycle, 1_040);
+        assert_eq!(batches.preamble_timeline_rebases, 0);
+    }
+
+    #[test]
+    fn keeps_long_relative_cpu_intervals_after_start_cycle() {
+        let specs = [(
+            1,
+            CpuScopeSpec {
+                id: 1,
+                name: "LongRunning".to_owned(),
+                file: None,
+                line: None,
+            },
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        let base = 1_000_000_000_u64;
+        let freq = 1_000_000_u64;
+        let mut data = Vec::new();
+        // The first entry is StartCycle-anchored. The leave is a large relative
+        // delta, not a flush-aligned absolute timestamp.
+        push_varint(&mut data, (2 << 2) | 0b01);
+        push_varint(&mut data, 1 << 1);
+        push_varint(&mut data, (5 * freq) << 2);
+
+        let mut batches = CpuBatchSummary::default();
+        let mut scope_totals = BTreeMap::new();
+        let mut metadata_scope_totals = BTreeMap::new();
+        let mut metadata_interval_state = CpuMetadataIntervalState::default();
+        let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
+        let mut thread_state = CpuBatchThreadState::default();
+        let mut frame_scope_totals = BTreeMap::new();
+        let mut thread_scope_totals = BTreeMap::new();
+        let mut state = CpuBatchDecodeState {
+            batches: &mut batches,
+            scope_totals: &mut scope_totals,
+            metadata_scope_totals: &mut metadata_scope_totals,
+            metadata_interval_state: &mut metadata_interval_state,
+            metadata_stack_context: &mut metadata_stack_context,
+            thread_state: &mut thread_state,
+            batch_base_cycle: Some(base),
+            frame_scope_totals: &mut frame_scope_totals,
+            thread_scope_totals: &mut thread_scope_totals,
+            timeline: None,
+            thread_id: 0,
+            cycle_frequency: Some(freq),
+        };
+
+        decode_cpu_batch(&data, &specs, &BTreeMap::new(), &mut state).unwrap();
+
+        assert_eq!(batches.preamble_timeline_rebases, 0);
+        assert_eq!(scope_totals[&1], (1, 5 * freq));
+    }
+
+    #[test]
+    fn updates_last_cycle_after_preamble_metadata_enter() {
+        let specs = [
+            (
+                1,
+                CpuScopeSpec {
+                    id: 1,
+                    name: "Outer".to_owned(),
+                    file: None,
+                    line: None,
+                },
+            ),
+            (
+                7,
+                CpuScopeSpec {
+                    id: 7,
+                    name: "Metadata".to_owned(),
+                    file: None,
+                    line: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let metadata = [(
+            42,
+            CpuMetadataRecord {
+                metadata_id: 42,
+                spec_id: 7,
+                name: "Metadata".to_owned(),
+                rendered_name: None,
+                metadata_bytes: 0,
+                decoded_metadata_bytes: 0,
+                skipped_metadata_bytes: 0,
+                decode_failed: false,
+                values: Vec::new(),
+                strings: Vec::new(),
+            },
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        let base = 1_000_000_000_u64;
+        let freq = 1_000_000_u64;
+        let absolute = base + 5 * freq;
+        let mut data = Vec::new();
+        push_varint(&mut data, (2 << 2) | 0b01);
+        push_varint(&mut data, 1 << 1);
+        // The first absolute record starts an inline metadata scope after the
+        // StartCycle-anchored preamble.
+        push_varint(&mut data, (absolute << 2) | 0b01);
+        push_varint(&mut data, (42 << 1) | 1);
+        push_varint(&mut data, 10 << 2);
+        push_varint(&mut data, 10 << 2);
+
+        let mut batches = CpuBatchSummary::default();
+        let mut scope_totals = BTreeMap::new();
+        let mut metadata_scope_totals = BTreeMap::new();
+        let mut metadata_interval_state = CpuMetadataIntervalState::default();
+        let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
+        let mut thread_state = CpuBatchThreadState::default();
+        let mut frame_scope_totals = BTreeMap::new();
+        let mut thread_scope_totals = BTreeMap::new();
+        let mut state = CpuBatchDecodeState {
+            batches: &mut batches,
+            scope_totals: &mut scope_totals,
+            metadata_scope_totals: &mut metadata_scope_totals,
+            metadata_interval_state: &mut metadata_interval_state,
+            metadata_stack_context: &mut metadata_stack_context,
+            thread_state: &mut thread_state,
+            batch_base_cycle: Some(base),
+            frame_scope_totals: &mut frame_scope_totals,
+            thread_scope_totals: &mut thread_scope_totals,
+            timeline: None,
+            thread_id: 0,
+            cycle_frequency: Some(freq),
+        };
+
+        decode_cpu_batch(&data, &specs, &metadata, &mut state).unwrap();
+
+        assert_eq!(batches.preamble_timeline_rebases, 1);
+        assert_eq!(scope_totals[&1], (1, 20));
+        assert_eq!(metadata_scope_totals[&7], (1, 10));
+        assert_eq!(thread_state.last_cycle, absolute + 20);
+    }
+
+    #[test]
+    fn rebases_preamble_stack_when_absolute_timeline_jumps() {
+        // Cold-start late-connect anchors near BaseCycle, then a flush-aligned
+        // absolute timestamp jumps the thread clock. Without rebasing, the
+        // outer scope duration spans the entire gap (fixture smoking gun).
+        let specs = [
+            (
+                1,
+                CpuScopeSpec {
+                    id: 1,
+                    name: "Outer".to_owned(),
+                    file: None,
+                    line: None,
+                },
+            ),
+            (
+                2,
+                CpuScopeSpec {
+                    id: 2,
+                    name: "Inner".to_owned(),
+                    file: None,
+                    line: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        let base = 1_000_000_u64;
+        let freq = 1_000_000_u64; // 1s slack
+        let mut preamble = Vec::new();
+        // Enter Outer at relative 2 → absolute base+2 (preamble).
+        push_varint(&mut preamble, (2 << 2) | 0b01);
+        push_varint(&mut preamble, 1 << 1);
+        // A buffer flush resets the writer's LastCycle. The next batch starts
+        // with an absolute timestamp, then resumes relative deltas.
+        let absolute = base + 5 * freq;
+        let mut flush_aligned = Vec::new();
+        push_varint(&mut flush_aligned, (absolute << 2) | 0b01);
+        push_varint(&mut flush_aligned, 2 << 1);
+        // Leave Inner after 10 cycles, then Outer.
+        push_varint(&mut flush_aligned, 10 << 2);
+        push_varint(&mut flush_aligned, 10 << 2);
+
+        let mut batches = CpuBatchSummary::default();
+        let mut scope_totals = BTreeMap::new();
+        let mut metadata_scope_totals = BTreeMap::new();
+        let mut metadata_interval_state = CpuMetadataIntervalState::default();
+        let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
+        let mut thread_state = CpuBatchThreadState::default();
+        let mut frame_scope_totals = BTreeMap::new();
+        let mut thread_scope_totals = BTreeMap::new();
+        let mut state = CpuBatchDecodeState {
+            batches: &mut batches,
+            scope_totals: &mut scope_totals,
+            metadata_scope_totals: &mut metadata_scope_totals,
+            metadata_interval_state: &mut metadata_interval_state,
+            metadata_stack_context: &mut metadata_stack_context,
+            thread_state: &mut thread_state,
+            batch_base_cycle: Some(base),
+            frame_scope_totals: &mut frame_scope_totals,
+            thread_scope_totals: &mut thread_scope_totals,
+            timeline: None,
+            thread_id: 0,
+            cycle_frequency: Some(freq),
+        };
+
+        decode_cpu_batch(&preamble, &specs, &BTreeMap::new(), &mut state).unwrap();
+        decode_cpu_batch(&flush_aligned, &specs, &BTreeMap::new(), &mut state).unwrap();
+
+        assert_eq!(batches.count, 2);
+        assert_eq!(batches.preamble_timeline_rebases, 1);
+        assert_eq!(batches.implausible_duration_count, 0);
+        // After rebase, Outer spans only the post-jump work (~20 cycles), not 5s.
+        assert_eq!(scope_totals[&2], (1, 10));
+        assert_eq!(scope_totals[&1], (1, 20));
+        assert!(
+            scope_totals[&1].1 < freq,
+            "outer total must stay under one second after preamble rebase"
+        );
+    }
+
+    #[test]
+    fn nested_cpu_scopes_keep_inclusive_parent_ge_child() {
+        let specs = [
+            (
+                1,
+                CpuScopeSpec {
+                    id: 1,
+                    name: "Parent".to_owned(),
+                    file: None,
+                    line: None,
+                },
+            ),
+            (
+                2,
+                CpuScopeSpec {
+                    id: 2,
+                    name: "Child".to_owned(),
+                    file: None,
+                    line: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        let mut data = Vec::new();
+        push_varint(&mut data, (100 << 2) | 0b01);
+        push_varint(&mut data, 1 << 1);
+        push_varint(&mut data, (110 << 2) | 0b01);
+        push_varint(&mut data, 2 << 1);
+        push_varint(&mut data, 140 << 2);
+        push_varint(&mut data, 200 << 2);
+
+        let mut batches = CpuBatchSummary::default();
+        let mut scope_totals = BTreeMap::new();
+        let mut metadata_scope_totals = BTreeMap::new();
+        let mut metadata_interval_state = CpuMetadataIntervalState::default();
+        let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
+        let mut thread_state = CpuBatchThreadState::default();
+        let mut frame_scope_totals = BTreeMap::new();
+        let mut thread_scope_totals = BTreeMap::new();
+        let mut state = CpuBatchDecodeState {
+            batches: &mut batches,
+            scope_totals: &mut scope_totals,
+            metadata_scope_totals: &mut metadata_scope_totals,
+            metadata_interval_state: &mut metadata_interval_state,
+            metadata_stack_context: &mut metadata_stack_context,
+            thread_state: &mut thread_state,
+            batch_base_cycle: None,
+            frame_scope_totals: &mut frame_scope_totals,
+            thread_scope_totals: &mut thread_scope_totals,
+            timeline: None,
+            thread_id: 0,
+            cycle_frequency: None,
+        };
+
+        decode_cpu_batch(&data, &specs, &BTreeMap::new(), &mut state).unwrap();
+
+        assert_eq!(scope_totals[&2], (1, 30));
+        assert_eq!(scope_totals[&1], (1, 100));
+        assert!(scope_totals[&1].1 >= scope_totals[&2].1);
+    }
+
+    #[test]
+    fn unmatched_cpu_leave_does_not_invent_duration() {
+        let specs = [(
+            1,
+            CpuScopeSpec {
+                id: 1,
+                name: "Only".to_owned(),
+                file: None,
+                line: None,
+            },
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        let mut data = Vec::new();
+        push_varint(&mut data, 50 << 2); // leave with empty stack
+
+        let mut batches = CpuBatchSummary::default();
+        let mut scope_totals = BTreeMap::new();
+        let mut metadata_scope_totals = BTreeMap::new();
+        let mut metadata_interval_state = CpuMetadataIntervalState::default();
+        let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
+        let mut thread_state = CpuBatchThreadState::default();
+        let mut frame_scope_totals = BTreeMap::new();
+        let mut thread_scope_totals = BTreeMap::new();
+        let mut state = CpuBatchDecodeState {
+            batches: &mut batches,
+            scope_totals: &mut scope_totals,
+            metadata_scope_totals: &mut metadata_scope_totals,
+            metadata_interval_state: &mut metadata_interval_state,
+            metadata_stack_context: &mut metadata_stack_context,
+            thread_state: &mut thread_state,
+            batch_base_cycle: Some(1_000),
+            frame_scope_totals: &mut frame_scope_totals,
+            thread_scope_totals: &mut thread_scope_totals,
+            timeline: None,
+            thread_id: 0,
+            cycle_frequency: None,
+        };
+
+        decode_cpu_batch(&data, &specs, &BTreeMap::new(), &mut state).unwrap();
+
+        assert_eq!(batches.unmatched_ends, 1);
+        assert!(scope_totals.is_empty());
+        assert_eq!(batches.implausible_duration_count, 0);
     }
 
     #[test]
