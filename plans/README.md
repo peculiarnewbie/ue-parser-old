@@ -22,7 +22,7 @@ even though that family is absent from the CPU-frame fixture.
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
 | 001 | Fix inflated CPU scope totals | P0 | M | — | DONE |
-| 002 | Bounded timelines + configurable frame caps | P0/P1 | L | 001 | TODO |
+| 002 | Bounded timelines + configurable frame caps | P0/P1 | L | 001 | DONE |
 | 003 | Memory/LLM allocation provider | P0 | L | — (parallel with 001/002 after capture exists) | TODO |
 | 004 | Counter / Stats.EventBatch2 / CSV samples | P1 | M | targeted fixture with samples | TODO |
 | 005 | TaskTrace waits + thread-group membership | P1 | L | 002 helpful for correlating waits to frames | TODO |

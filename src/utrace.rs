@@ -70,6 +70,8 @@ pub struct TraceDashboard {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct FrameCorrelationDashboard {
+    pub total_frame_count: u64,
+    pub truncated: bool,
     pub frames: Vec<CorrelatedFrameSummary>,
 }
 
@@ -460,6 +462,10 @@ pub struct GpuDashboard {
     pub version: Option<u8>,
     pub queues: Vec<GpuQueueSummary>,
     pub frames: Vec<GpuFrameSummary>,
+    pub total_frame_count: u64,
+    pub frames_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<GpuTimelineDashboard>,
     pub work: GpuWorkSummary,
     pub breadcrumbs: GpuBreadcrumbDashboard,
     /// Bounded samples of GPU-start vs CPU-submit times from `EventBeginWork`.
@@ -469,6 +475,37 @@ pub struct GpuDashboard {
     /// field for time conversion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submission_latency: Option<GpuSubmissionLatency>,
+}
+
+/// Bounded GPU work and breadcrumb timeline for one queue-local frame number.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct GpuTimelineDashboard {
+    pub frame_number: u32,
+    pub begin_timestamp: u64,
+    pub end_timestamp: u64,
+    pub interval_count: u64,
+    pub truncated: bool,
+    pub intervals: Vec<GpuTimelineInterval>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum GpuTimelineIntervalKind {
+    Work,
+    Breadcrumb,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GpuTimelineInterval {
+    pub queue_id: u32,
+    pub kind: GpuTimelineIntervalKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_id: Option<u32>,
+    pub name: String,
+    pub start_timestamp: u64,
+    pub end_timestamp: u64,
+    pub duration: u64,
 }
 
 /// Bounded GPU-start vs CPU-submit pairing from `EventBeginWork`.
@@ -2391,6 +2428,12 @@ pub struct DashboardOptions {
     pub timeline_frame: Option<u32>,
     /// Max intervals retained in `cpu.timeline` (default 500).
     pub timeline_limit: Option<usize>,
+    /// Max rows retained in `gpu.frames` and `frame_correlation.frames` (default 120).
+    pub max_frames: Option<usize>,
+    /// When set, retain a bounded GPU timeline for this queue-local frame number.
+    pub gpu_timeline_frame: Option<u32>,
+    /// Max intervals retained in `gpu.timeline` (default 500).
+    pub gpu_timeline_limit: Option<usize>,
 }
 
 pub fn dashboard(source: &[u8]) -> Result<TraceDashboard, TraceError> {
@@ -2554,6 +2597,9 @@ fn read_dashboard_events(
     let mut submission_latency_samples = Vec::<GpuSubmissionLatencySample>::new();
     let mut timeline_collector = options.timeline_frame.map(|frame_number| {
         CpuTimelineCollector::new(frame_number, options.timeline_limit.unwrap_or(500))
+    });
+    let mut gpu_timeline_collector = options.gpu_timeline_frame.map(|frame_number| {
+        GpuTimelineCollector::new(frame_number, options.gpu_timeline_limit.unwrap_or(500))
     });
     let cycle_frequency = importants
         .prologue
@@ -2821,15 +2867,14 @@ fn read_dashboard_events(
                 .or_default()
                 .record(event, &raw_event.data, thread_id)?;
         } else if event.logger.as_str() == "GpuProfiler" {
-            decode_gpu_normal_event(
-                event,
-                &raw_event.data,
-                &gpu_breadcrumb_specs,
-                &mut gpu_queues,
-                &mut gpu_breadcrumb_totals,
-                &mut submission_latency_samples,
-                0,
-            )?;
+            let mut gpu_state = GpuNormalEventState {
+                specs: &gpu_breadcrumb_specs,
+                queues: &mut gpu_queues,
+                breadcrumb_totals: &mut gpu_breadcrumb_totals,
+                submission_latency_samples: &mut submission_latency_samples,
+                timeline: gpu_timeline_collector.as_mut(),
+            };
+            decode_gpu_normal_event(event, &raw_event.data, &mut gpu_state, 0)?;
         } else if event.logger.as_str() == "Counters" {
             decode_counter_value(
                 event,
@@ -2937,14 +2982,20 @@ fn read_dashboard_events(
         .cpu
         .threads
         .sort_by(|left, right| right.total_cycles.cmp(&left.total_cycles));
-    decoded.gpu.frames = gpu_frame_summaries(&gpu_queues);
+    let mut gpu_frames = gpu_frame_summaries(&gpu_queues);
     decoded.frame_correlation = frame_correlation_dashboard(
         &cpu_metadata_rendered_totals,
         frame_scope_totals,
         &spec_by_id,
-        &decoded.gpu.frames,
+        &gpu_frames,
         cycle_frequency,
+        options.max_frames.unwrap_or(120),
     );
+    let (total_frame_count, frames_truncated) =
+        cap_gpu_frame_summaries(&mut gpu_frames, options.max_frames.unwrap_or(120));
+    decoded.gpu.total_frame_count = total_frame_count;
+    decoded.gpu.frames_truncated = frames_truncated;
+    decoded.gpu.frames = gpu_frames;
     decoded.gpu.queues = gpu_queue_summaries(gpu_queues);
     decoded.gpu.work = gpu_work_summary(&decoded.gpu.queues);
     decoded.gpu.breadcrumbs = gpu_breadcrumb_dashboard(
@@ -2953,6 +3004,9 @@ fn read_dashboard_events(
         gpu_breadcrumb_totals,
     );
     decoded.gpu.submission_latency = gpu_submission_latency(submission_latency_samples);
+    if let Some(collector) = gpu_timeline_collector {
+        decoded.gpu.timeline = Some(collector.into_dashboard());
+    }
     if let Some(collector) = timeline_collector {
         decoded.cpu.timeline = Some(collector.into_dashboard(cycle_frequency));
     }
@@ -3160,15 +3214,25 @@ fn normalize_gpu_breadcrumb_name(
     (name, name_format)
 }
 
+struct GpuNormalEventState<'a> {
+    specs: &'a BTreeMap<u32, GpuBreadcrumbSpec>,
+    queues: &'a mut BTreeMap<u32, GpuQueueState>,
+    breadcrumb_totals: &'a mut BTreeMap<u32, GpuBreadcrumbTotal>,
+    submission_latency_samples: &'a mut Vec<GpuSubmissionLatencySample>,
+    timeline: Option<&'a mut GpuTimelineCollector>,
+}
+
 fn decode_gpu_normal_event(
     event: &EventTypeInfo,
     data: &[u8],
-    specs: &BTreeMap<u32, GpuBreadcrumbSpec>,
-    queues: &mut BTreeMap<u32, GpuQueueState>,
-    breadcrumb_totals: &mut BTreeMap<u32, GpuBreadcrumbTotal>,
-    submission_latency_samples: &mut Vec<GpuSubmissionLatencySample>,
+    state: &mut GpuNormalEventState<'_>,
     base_offset: u64,
 ) -> Result<(), TraceError> {
+    let specs = state.specs;
+    let queues = &mut *state.queues;
+    let breadcrumb_totals = &mut *state.breadcrumb_totals;
+    let submission_latency_samples = &mut *state.submission_latency_samples;
+    let mut timeline = state.timeline.as_deref_mut();
     match event.event.as_str() {
         "EventFrameBoundary" => {
             let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
@@ -3262,6 +3326,23 @@ fn decode_gpu_normal_event(
                     duration,
                     begin.rendered_name.as_deref(),
                 );
+                if let Some(timeline) = timeline.as_mut() {
+                    let name = begin
+                        .rendered_name
+                        .clone()
+                        .or_else(|| specs.get(&begin.spec_id).map(|spec| spec.name.clone()))
+                        .unwrap_or_else(|| format!("#{}", begin.spec_id));
+                    timeline.record(
+                        queue.current_frame,
+                        queue_id,
+                        GpuTimelineIntervalKind::Breadcrumb,
+                        Some(begin.spec_id),
+                        name,
+                        begin.gpu_timestamp_top,
+                        gpu_timestamp_bop,
+                        duration,
+                    );
+                }
                 let total = breadcrumb_totals.entry(begin.spec_id).or_default();
                 total.count += 1;
                 if begin.metadata_bytes > 0 {
@@ -3282,6 +3363,23 @@ fn decode_gpu_normal_event(
                 duration,
                 begin.rendered_name.as_deref(),
             );
+            if let Some(timeline) = timeline.as_mut() {
+                let name = begin
+                    .rendered_name
+                    .clone()
+                    .or_else(|| specs.get(&begin.spec_id).map(|spec| spec.name.clone()))
+                    .unwrap_or_else(|| format!("#{}", begin.spec_id));
+                timeline.record(
+                    queue.current_frame,
+                    queue_id,
+                    GpuTimelineIntervalKind::Breadcrumb,
+                    Some(begin.spec_id),
+                    name,
+                    begin.gpu_timestamp_top,
+                    gpu_timestamp_bop,
+                    duration,
+                );
+            }
             if begin.metadata_bytes > 0 {
                 queue.breadcrumb_metadata_count += 1;
                 queue.breadcrumb_metadata_bytes = queue
@@ -3390,6 +3488,18 @@ fn decode_gpu_normal_event(
             let duration = gpu_timestamp_bop - begin.gpu_timestamp_top;
             queue.work_total_cycles = queue.work_total_cycles.saturating_add(duration);
             record_gpu_frame_work(queue, begin.gpu_timestamp_top, gpu_timestamp_bop, duration);
+            if let Some(timeline) = timeline.as_mut() {
+                timeline.record(
+                    queue.current_frame,
+                    queue_id,
+                    GpuTimelineIntervalKind::Work,
+                    None,
+                    "Work".to_owned(),
+                    begin.gpu_timestamp_top,
+                    gpu_timestamp_bop,
+                    duration,
+                );
+            }
         }
         "EventWait" => {
             let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
@@ -3573,8 +3683,14 @@ fn gpu_frame_summaries(queues: &BTreeMap<u32, GpuQueueState>) -> Vec<GpuFrameSum
             .cmp(&right.queue_id)
             .then_with(|| left.frame_number.cmp(&right.frame_number))
     });
-    summaries.truncate(120);
     summaries
+}
+
+fn cap_gpu_frame_summaries(summaries: &mut Vec<GpuFrameSummary>, max_frames: usize) -> (u64, bool) {
+    let total_frame_count = u64::try_from(summaries.len()).unwrap_or(u64::MAX);
+    let truncated = summaries.len() > max_frames;
+    summaries.truncate(max_frames);
+    (total_frame_count, truncated)
 }
 
 fn gpu_frame_top_breadcrumbs(
@@ -3788,6 +3904,7 @@ fn frame_correlation_dashboard(
     specs: &BTreeMap<u32, CpuScopeSpec>,
     gpu_frames: &[GpuFrameSummary],
     cycle_frequency: Option<u64>,
+    max_frames: usize,
 ) -> FrameCorrelationDashboard {
     let mut frames = BTreeMap::<u32, CorrelatedFrameSummary>::new();
     for ((_, rendered_name), &(count, total_cycles)) in cpu_metadata_scope_totals {
@@ -3881,8 +3998,14 @@ fn frame_correlation_dashboard(
         }
     }
     frames.sort_by_key(|frame| frame.frame_number);
-    frames.truncate(120);
-    FrameCorrelationDashboard { frames }
+    let total_frame_count = u64::try_from(frames.len()).unwrap_or(u64::MAX);
+    let truncated = frames.len() > max_frames;
+    frames.truncate(max_frames);
+    FrameCorrelationDashboard {
+        total_frame_count,
+        truncated,
+        frames,
+    }
 }
 
 fn parse_rendered_frame_number(name: &str) -> Option<u32> {
@@ -6386,6 +6509,82 @@ struct CpuBatchDecodeState<'a> {
 }
 
 #[derive(Clone, Debug)]
+struct GpuTimelineCollector {
+    frame_number: u32,
+    limit: usize,
+    begin_timestamp: Option<u64>,
+    end_timestamp: Option<u64>,
+    interval_count: u64,
+    truncated: bool,
+    intervals: Vec<GpuTimelineInterval>,
+}
+
+impl GpuTimelineCollector {
+    fn new(frame_number: u32, limit: usize) -> Self {
+        Self {
+            frame_number,
+            limit,
+            begin_timestamp: None,
+            end_timestamp: None,
+            interval_count: 0,
+            truncated: false,
+            intervals: Vec::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        active_frame: Option<u32>,
+        queue_id: u32,
+        kind: GpuTimelineIntervalKind,
+        spec_id: Option<u32>,
+        name: String,
+        start_timestamp: u64,
+        end_timestamp: u64,
+        duration: u64,
+    ) {
+        if active_frame != Some(self.frame_number) {
+            return;
+        }
+        self.begin_timestamp = Some(
+            self.begin_timestamp
+                .map_or(start_timestamp, |begin| begin.min(start_timestamp)),
+        );
+        self.end_timestamp = Some(
+            self.end_timestamp
+                .map_or(end_timestamp, |end| end.max(end_timestamp)),
+        );
+        self.interval_count = self.interval_count.saturating_add(1);
+        if self.intervals.len() >= self.limit {
+            self.truncated = true;
+            return;
+        }
+        self.intervals.push(GpuTimelineInterval {
+            queue_id,
+            kind,
+            spec_id,
+            name,
+            start_timestamp,
+            end_timestamp,
+            duration,
+        });
+    }
+
+    fn into_dashboard(self) -> GpuTimelineDashboard {
+        let begin_timestamp = self.begin_timestamp.unwrap_or(0);
+        GpuTimelineDashboard {
+            frame_number: self.frame_number,
+            begin_timestamp,
+            end_timestamp: self.end_timestamp.unwrap_or(begin_timestamp),
+            interval_count: self.interval_count,
+            truncated: self.truncated,
+            intervals: self.intervals,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct CpuTimelineCollector {
     frame_number: u32,
     limit: usize,
@@ -8571,6 +8770,105 @@ mod tests {
         let summary = gpu_submission_latency(samples).expect("latency summary");
         assert_eq!(summary.min_delay_cycles, -i128::from(u64::MAX));
         assert_eq!(summary.max_delay_cycles, i128::from(u64::MAX));
+    }
+
+    #[test]
+    fn frame_summaries_expose_total_count_before_bounded_retention() {
+        let mut queue = GpuQueueState::default();
+        for frame_number in 0..121 {
+            queue.frames.insert(frame_number, GpuFrameState::default());
+        }
+        let queues = [(7, queue)].into_iter().collect::<BTreeMap<_, _>>();
+        let mut frames = gpu_frame_summaries(&queues);
+
+        let (total_frame_count, truncated) = cap_gpu_frame_summaries(&mut frames, 120);
+
+        assert_eq!(total_frame_count, 121);
+        assert!(truncated);
+        assert_eq!(frames.len(), 120);
+    }
+
+    #[test]
+    fn frame_correlation_exposes_total_count_before_bounded_retention() {
+        let cpu_metadata_scope_totals = (1..=3)
+            .map(|frame_number| {
+                (
+                    (frame_number, format!("Frame {frame_number}")),
+                    (1, u64::from(frame_number)),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let dashboard = frame_correlation_dashboard(
+            &cpu_metadata_scope_totals,
+            BTreeMap::new(),
+            &BTreeMap::new(),
+            &[],
+            None,
+            2,
+        );
+
+        assert_eq!(dashboard.total_frame_count, 3);
+        assert!(dashboard.truncated);
+        assert_eq!(dashboard.frames.len(), 2);
+        assert_eq!(dashboard.frames[0].frame_number, 1);
+        assert_eq!(dashboard.frames[1].frame_number, 2);
+    }
+
+    #[test]
+    fn gpu_timeline_retains_paired_intervals_with_a_bound() {
+        let mut timeline = GpuTimelineCollector::new(17, 2);
+        timeline.record(
+            Some(17),
+            3,
+            GpuTimelineIntervalKind::Work,
+            None,
+            "Work".to_owned(),
+            100,
+            120,
+            20,
+        );
+        timeline.record(
+            Some(17),
+            3,
+            GpuTimelineIntervalKind::Breadcrumb,
+            Some(9),
+            "RenderPass".to_owned(),
+            125,
+            140,
+            15,
+        );
+        timeline.record(
+            Some(17),
+            3,
+            GpuTimelineIntervalKind::Work,
+            None,
+            "Work".to_owned(),
+            145,
+            170,
+            25,
+        );
+        timeline.record(
+            Some(18),
+            3,
+            GpuTimelineIntervalKind::Work,
+            None,
+            "OtherFrame".to_owned(),
+            200,
+            220,
+            20,
+        );
+
+        let dashboard = timeline.into_dashboard();
+
+        assert_eq!(dashboard.frame_number, 17);
+        assert_eq!(dashboard.begin_timestamp, 100);
+        assert_eq!(dashboard.end_timestamp, 170);
+        assert_eq!(dashboard.interval_count, 3);
+        assert!(dashboard.truncated);
+        assert_eq!(dashboard.intervals.len(), 2);
+        assert_eq!(dashboard.intervals[0].kind, GpuTimelineIntervalKind::Work);
+        assert_eq!(dashboard.intervals[1].spec_id, Some(9));
     }
 
     #[test]

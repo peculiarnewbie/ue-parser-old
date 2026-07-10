@@ -197,11 +197,11 @@ On `basic-cpu-frame.utrace`:
 
 ## Done criteria
 
-- [ ] No silent truncate without `truncated` + `total_frame_count` (or named equivalent)
-- [ ] CLI exposes `--max-frames` and `--timeline-limit`
-- [ ] `gpu.timeline` available for `--gpu-frame`
-- [ ] Fixture tests cover truncation and at least one GPU timeline frame
-- [ ] Clippy/tests clean; `plans/README.md` → DONE
+- [x] No silent truncate without `truncated` + `total_frame_count` (or named equivalent)
+- [x] CLI exposes `--max-frames` and `--timeline-limit`
+- [x] `gpu.timeline` available for `--gpu-frame`
+- [x] Fixture tests cover truncation and at least one GPU timeline frame
+- [x] Clippy/tests clean; `plans/README.md` → DONE
 
 ## STOP conditions
 

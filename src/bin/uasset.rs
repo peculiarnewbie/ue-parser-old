@@ -67,6 +67,10 @@ struct InspectOptions {
     format: OutputFormat,
     /// When set on `utrace dashboard`, retain a bounded CPU timeline for this frame.
     timeline_frame: Option<u32>,
+    timeline_limit: usize,
+    max_frames: usize,
+    gpu_timeline_frame: Option<u32>,
+    gpu_timeline_limit: usize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -96,6 +100,7 @@ enum Command {
 enum UtraceCommand {
     Inspect(InspectOptions),
     Dashboard(InspectOptions),
+    DashboardHelp,
     Inventory(InspectOptions),
     Coverage(CoverageOptions),
     Html(UtraceHtmlOptions),
@@ -146,9 +151,18 @@ impl Command {
                 Self::Inspect(options) => Ok(Self::Utrace(UtraceCommand::Inspect(options))),
                 _ => unreachable!("parse_inspect only returns Inspect"),
             },
-            Some("dashboard") => Ok(Self::Utrace(UtraceCommand::Dashboard(
-                Self::parse_utrace_dashboard(arguments.collect())?,
-            ))),
+            Some("dashboard") => {
+                let dashboard_arguments = arguments.collect::<Vec<_>>();
+                if dashboard_arguments.len() == 1
+                    && matches!(dashboard_arguments[0].to_str(), Some("-h" | "--help"))
+                {
+                    Ok(Self::Utrace(UtraceCommand::DashboardHelp))
+                } else {
+                    Ok(Self::Utrace(UtraceCommand::Dashboard(
+                        Self::parse_utrace_dashboard(dashboard_arguments)?,
+                    )))
+                }
+            }
             Some("inventory") => match Self::parse_inspect(arguments.collect())? {
                 Self::Inspect(options) => Ok(Self::Utrace(UtraceCommand::Inventory(options))),
                 _ => unreachable!("parse_inspect only returns Inspect"),
@@ -201,6 +215,10 @@ impl Command {
             input: input.ok_or_else(|| "inspect requires a file path or `-`".to_owned())?,
             format,
             timeline_frame: None,
+            timeline_limit: 500,
+            max_frames: 120,
+            gpu_timeline_frame: None,
+            gpu_timeline_limit: 500,
         }))
     }
 
@@ -208,6 +226,10 @@ impl Command {
         let mut format = OutputFormat::Text;
         let mut input = None;
         let mut timeline_frame = None;
+        let mut timeline_limit = 500;
+        let mut max_frames = 120;
+        let mut gpu_timeline_frame = None;
+        let mut gpu_timeline_limit = 500;
         let mut index = 0;
 
         while index < arguments.len() {
@@ -236,6 +258,58 @@ impl Command {
                         "--frame",
                     )?);
                 }
+                Some("--timeline-limit") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--timeline-limit requires a count".to_owned())?;
+                    timeline_limit = parse_usize_arg(value, "--timeline-limit")?;
+                }
+                Some(value) if value.starts_with("--timeline-limit=") => {
+                    timeline_limit = parse_usize_arg(
+                        OsString::from(&value["--timeline-limit=".len()..]).as_os_str(),
+                        "--timeline-limit",
+                    )?;
+                }
+                Some("--max-frames") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--max-frames requires a count".to_owned())?;
+                    max_frames = parse_usize_arg(value, "--max-frames")?;
+                }
+                Some(value) if value.starts_with("--max-frames=") => {
+                    max_frames = parse_usize_arg(
+                        OsString::from(&value["--max-frames=".len()..]).as_os_str(),
+                        "--max-frames",
+                    )?;
+                }
+                Some("--gpu-frame") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--gpu-frame requires a frame number".to_owned())?;
+                    gpu_timeline_frame = Some(parse_u32_arg(value, "--gpu-frame")?);
+                }
+                Some(value) if value.starts_with("--gpu-frame=") => {
+                    gpu_timeline_frame = Some(parse_u32_arg(
+                        OsString::from(&value["--gpu-frame=".len()..]).as_os_str(),
+                        "--gpu-frame",
+                    )?);
+                }
+                Some("--gpu-timeline-limit") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--gpu-timeline-limit requires a count".to_owned())?;
+                    gpu_timeline_limit = parse_usize_arg(value, "--gpu-timeline-limit")?;
+                }
+                Some(value) if value.starts_with("--gpu-timeline-limit=") => {
+                    gpu_timeline_limit = parse_usize_arg(
+                        OsString::from(&value["--gpu-timeline-limit=".len()..]).as_os_str(),
+                        "--gpu-timeline-limit",
+                    )?;
+                }
                 Some("-h" | "--help") => {
                     return Err("use `uasset help` for command usage".to_owned());
                 }
@@ -255,6 +329,10 @@ impl Command {
             input: input.ok_or_else(|| "dashboard requires a file path or `-`".to_owned())?,
             format,
             timeline_frame,
+            timeline_limit,
+            max_frames,
+            gpu_timeline_frame,
+            gpu_timeline_limit,
         })
     }
 
@@ -374,6 +452,14 @@ fn parse_u32_arg(value: &std::ffi::OsStr, flag: &str) -> Result<u32, String> {
         .map_err(|_| format!("{flag} requires an unsigned integer, got {text:?}"))
 }
 
+fn parse_usize_arg(value: &std::ffi::OsStr, flag: &str) -> Result<usize, String> {
+    let Some(text) = value.to_str() else {
+        return Err(format!("{flag} value is not valid UTF-8"));
+    };
+    text.parse::<usize>()
+        .map_err(|_| format!("{flag} requires a non-negative integer, got {text:?}"))
+}
+
 fn inspect(options: &InspectOptions) -> u8 {
     let input_name = options.input.display_name();
     let bytes = match read_input(&options.input) {
@@ -418,6 +504,7 @@ fn run_utrace(command: UtraceCommand) -> u8 {
     match command {
         UtraceCommand::Inspect(options) => inspect_utrace(&options),
         UtraceCommand::Dashboard(options) => dashboard_utrace(&options),
+        UtraceCommand::DashboardHelp => write_stdout(UTRACE_DASHBOARD_HELP.as_bytes()),
         UtraceCommand::Inventory(options) => inventory_utrace(&options),
         UtraceCommand::Coverage(options) => coverage_utrace(&options),
         UtraceCommand::Html(options) => html_utrace(&options),
@@ -486,7 +573,10 @@ fn dashboard_utrace(options: &InspectOptions) -> u8 {
         &bytes,
         uasset_parser::utrace::DashboardOptions {
             timeline_frame: options.timeline_frame,
-            timeline_limit: Some(500),
+            timeline_limit: Some(options.timeline_limit),
+            max_frames: Some(options.max_frames),
+            gpu_timeline_frame: options.gpu_timeline_frame,
+            gpu_timeline_limit: Some(options.gpu_timeline_limit),
         },
     ) {
         Ok(dashboard) => dashboard,
@@ -2829,7 +2919,7 @@ uasset - inspect classic Unreal Engine asset packages
 Usage:
   uasset inspect <path|-> [--format text|json]
   uasset utrace inspect <path|-> [--format text|json]
-  uasset utrace dashboard <path|-> [--format text|json] [--frame <n>]
+  uasset utrace dashboard <path|-> [--format text|json] [--frame <n>] [--timeline-limit <n>] [--max-frames <n>] [--gpu-frame <n>] [--gpu-timeline-limit <n>]
   uasset utrace inventory <path|-> [--format text|json]
   uasset utrace coverage <path|-> [--universe <file>] [--format text|json]
   uasset utrace html <path|-> [--output <file>]
@@ -2856,6 +2946,18 @@ Exit codes:
   64         Invalid command-line usage
 ";
 
+const UTRACE_DASHBOARD_HELP: &str = "\
+Usage: uasset utrace dashboard <path|-> [options]
+
+Options:
+  --format <text|json>        Output format (default: text).
+  --frame <n>                 Retain a CPU metadata-frame timeline.
+  --timeline-limit <n>        Max retained CPU timeline intervals (default: 500).
+  --max-frames <n>            Max retained GPU/correlated frame rows (default: 120).
+  --gpu-frame <n>             Retain a queue-local GPU-frame timeline.
+  --gpu-timeline-limit <n>    Max retained GPU timeline intervals (default: 500).
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2873,6 +2975,10 @@ mod tests {
                 input: Input::File(PathBuf::from("asset.uasset")),
                 format: OutputFormat::Json,
                 timeline_frame: None,
+                timeline_limit: 500,
+                max_frames: 120,
+                gpu_timeline_frame: None,
+                gpu_timeline_limit: 500,
             })
         );
     }
@@ -2885,6 +2991,10 @@ mod tests {
                 input: Input::Stdin,
                 format: OutputFormat::Text,
                 timeline_frame: None,
+                timeline_limit: 500,
+                max_frames: 120,
+                gpu_timeline_frame: None,
+                gpu_timeline_limit: 500,
             })
         );
     }
@@ -2909,6 +3019,10 @@ mod tests {
                 input: Input::File(PathBuf::from("trace.utrace")),
                 format: OutputFormat::Json,
                 timeline_frame: None,
+                timeline_limit: 500,
+                max_frames: 120,
+                gpu_timeline_frame: None,
+                gpu_timeline_limit: 500,
             }))
         );
     }
@@ -2928,7 +3042,46 @@ mod tests {
                 input: Input::File(PathBuf::from("trace.utrace")),
                 format: OutputFormat::Json,
                 timeline_frame: Some(366400),
+                timeline_limit: 500,
+                max_frames: 120,
+                gpu_timeline_frame: None,
+                gpu_timeline_limit: 500,
             }))
+        );
+    }
+
+    #[test]
+    fn parses_utrace_dashboard_bounds_and_gpu_timeline_options() {
+        assert_eq!(
+            Command::parse(vec![
+                "utrace".into(),
+                "dashboard".into(),
+                "trace.utrace".into(),
+                "--timeline-limit=25".into(),
+                "--max-frames".into(),
+                "10".into(),
+                "--gpu-frame=42".into(),
+                "--gpu-timeline-limit".into(),
+                "5".into(),
+            ])
+            .unwrap(),
+            Command::Utrace(UtraceCommand::Dashboard(InspectOptions {
+                input: Input::File(PathBuf::from("trace.utrace")),
+                format: OutputFormat::Text,
+                timeline_frame: None,
+                timeline_limit: 25,
+                max_frames: 10,
+                gpu_timeline_frame: Some(42),
+                gpu_timeline_limit: 5,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_utrace_dashboard_help() {
+        assert_eq!(
+            Command::parse(vec!["utrace".into(), "dashboard".into(), "--help".into()]).unwrap(),
+            Command::Utrace(UtraceCommand::DashboardHelp)
         );
     }
 
@@ -2946,6 +3099,10 @@ mod tests {
                 input: Input::File(PathBuf::from("trace.utrace")),
                 format: OutputFormat::Json,
                 timeline_frame: None,
+                timeline_limit: 500,
+                max_frames: 120,
+                gpu_timeline_frame: None,
+                gpu_timeline_limit: 500,
             }))
         );
     }
@@ -2964,6 +3121,10 @@ mod tests {
                 input: Input::File(PathBuf::from("trace.utrace")),
                 format: OutputFormat::Json,
                 timeline_frame: None,
+                timeline_limit: 500,
+                max_frames: 120,
+                gpu_timeline_frame: None,
+                gpu_timeline_limit: 500,
             }))
         );
     }

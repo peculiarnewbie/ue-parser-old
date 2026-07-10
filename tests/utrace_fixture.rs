@@ -629,6 +629,32 @@ fn real_utrace_fixture_exposes_cpu_dashboard_summary() {
         breadcrumbs["unterminated_scopes"].as_u64().is_some(),
         "fixture should report unterminated GPU breadcrumbs"
     );
+    let correlated_frames = json["dashboard"]["frame_correlation"]["frames"]
+        .as_array()
+        .expect("fixture dashboard should expose frame correlation rows");
+    let frame_correlation = &json["dashboard"]["frame_correlation"];
+    assert!(
+        correlated_frames.len() <= 120,
+        "default frame correlation must retain at most 120 rows"
+    );
+    assert!(
+        frame_correlation["total_frame_count"].as_u64().unwrap() >= 1_000,
+        "fixture should report the uncapped correlated-frame count"
+    );
+    assert_eq!(frame_correlation["truncated"].as_bool(), Some(true));
+    let gpu_frames = json["dashboard"]["gpu"]["frames"]
+        .as_array()
+        .expect("fixture dashboard should expose GPU frame rows");
+    let gpu_dashboard = &json["dashboard"]["gpu"];
+    assert!(
+        gpu_frames.len() <= 120,
+        "default GPU frame output must retain at most 120 rows"
+    );
+    assert!(
+        gpu_dashboard["total_frame_count"].as_u64().unwrap()
+            >= u64::try_from(gpu_frames.len()).unwrap()
+    );
+    assert_eq!(gpu_dashboard["frames_truncated"].as_bool(), Some(true));
     // Targeted captures for IoStore traffic, LoadTime request lifecycles, counter
     // samples, memory allocs, and metadata restore are still outstanding; this
     // fixture only characterizes the surfaces that are present (or explicitly empty).
@@ -684,6 +710,76 @@ fn real_utrace_fixture_exposes_cpu_dashboard_summary() {
             lo >= begin && hi <= end,
             "retained interval must lie within the reported frame window"
         );
+    }
+
+    let capped_output = binary()
+        .args([
+            "utrace",
+            "dashboard",
+            fixture.to_str().unwrap(),
+            "--format=json",
+            "--max-frames=2",
+            "--timeline-limit=2",
+            &format!("--frame={frame_number}"),
+        ])
+        .output()
+        .expect("capped dashboard should run");
+    assert_eq!(
+        capped_output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&capped_output.stderr)
+    );
+    let capped_json: Value = serde_json::from_slice(&capped_output.stdout).unwrap();
+    let capped_correlation = &capped_json["dashboard"]["frame_correlation"];
+    assert_eq!(capped_correlation["frames"].as_array().unwrap().len(), 2);
+    assert_eq!(capped_correlation["truncated"].as_bool(), Some(true));
+    assert!(capped_correlation["total_frame_count"].as_u64().unwrap() > 2);
+    let capped_gpu = &capped_json["dashboard"]["gpu"];
+    assert!(capped_gpu["frames"].as_array().unwrap().len() <= 2);
+    assert_eq!(capped_gpu["frames_truncated"].as_bool(), Some(true));
+    let capped_timeline = &capped_json["dashboard"]["cpu"]["timeline"];
+    assert!(capped_timeline["interval_count"].as_u64().unwrap() > 2);
+    assert_eq!(capped_timeline["intervals"].as_array().unwrap().len(), 2);
+    assert_eq!(capped_timeline["truncated"].as_bool(), Some(true));
+
+    let gpu_frame_number = gpu_frames
+        .iter()
+        .filter(|frame| frame["work_count"].as_u64().is_some_and(|count| count > 0))
+        .max_by_key(|frame| frame["work_count"].as_u64().unwrap())
+        .and_then(|frame| frame["frame_number"].as_u64())
+        .expect("fixture should expose a GPU frame with paired work")
+        as u32;
+    let gpu_timeline_output = binary()
+        .args([
+            "utrace",
+            "dashboard",
+            fixture.to_str().unwrap(),
+            "--format=json",
+            &format!("--gpu-frame={gpu_frame_number}"),
+            "--gpu-timeline-limit=2",
+        ])
+        .output()
+        .expect("GPU timeline dashboard should run");
+    assert_eq!(
+        gpu_timeline_output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&gpu_timeline_output.stderr)
+    );
+    let gpu_timeline_json: Value = serde_json::from_slice(&gpu_timeline_output.stdout).unwrap();
+    let gpu_timeline = &gpu_timeline_json["dashboard"]["gpu"]["timeline"];
+    assert_eq!(
+        gpu_timeline["frame_number"].as_u64(),
+        Some(u64::from(gpu_frame_number))
+    );
+    assert!(
+        gpu_timeline["interval_count"].as_u64().unwrap() > 0,
+        "selected GPU frame should retain paired intervals"
+    );
+    assert!(gpu_timeline["intervals"].as_array().unwrap().len() <= 2);
+    if gpu_timeline["interval_count"].as_u64().unwrap() > 2 {
+        assert_eq!(gpu_timeline["truncated"].as_bool(), Some(true));
     }
 
     let absent_output = binary()
