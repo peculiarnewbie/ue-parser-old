@@ -1,5 +1,6 @@
 #![cfg(feature = "utrace")]
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -62,6 +63,54 @@ fn first_utrace_in(dir: &Path) -> Option<PathBuf> {
     traces.into_iter().next()
 }
 
+fn targeted_fixtures() -> Vec<PathBuf> {
+    if let Some(path) = std::env::var_os("UTRACE_TARGETED_FIXTURE").map(PathBuf::from) {
+        return vec![require_file_or_skip(path, "UTRACE_TARGETED_FIXTURE")];
+    }
+    if let Some(dir) = std::env::var_os("UTRACE_TARGETED_FIXTURE_DIR").map(PathBuf::from) {
+        let mut traces = std::fs::read_dir(&dir)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", dir.display()))
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("utrace"))
+            })
+            .collect::<Vec<_>>();
+        traces.sort();
+        if !traces.is_empty() {
+            return traces;
+        }
+        missing_fixture(format!(
+            "UTRACE_TARGETED_FIXTURE_DIR did not contain a .utrace file: {}",
+            dir.display()
+        ));
+    }
+    let studio_capture =
+        PathBuf::from("D:/Perforce/Arif_Fixtures/Traces/targeted-providers.utrace");
+    if studio_capture.is_file() {
+        return vec![studio_capture];
+    }
+    missing_fixture(
+        "set UTRACE_TARGETED_FIXTURE or UTRACE_TARGETED_FIXTURE_DIR to targeted provider captures"
+            .to_owned(),
+    )
+}
+
+fn iostore_fixture() -> PathBuf {
+    std::env::var_os("UTRACE_IOSTORE_FIXTURE")
+        .map(PathBuf::from)
+        .map(|path| require_file_or_skip(path, "UTRACE_IOSTORE_FIXTURE"))
+        .unwrap_or_else(|| {
+            missing_fixture(
+                "set UTRACE_IOSTORE_FIXTURE to a cooked trace with IoStore request traffic"
+                    .to_owned(),
+            )
+        })
+}
+
 fn missing_fixture(message: String) -> ! {
     panic!("{message}");
 }
@@ -89,7 +138,7 @@ fn real_utrace_fixture_exposes_header_prologue_threads_and_registry() {
     );
 
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["schema_version"], 2);
     assert_eq!(json["status"], "ok");
     assert_eq!(json["trace"]["header"]["transport"], 4);
     assert!(
@@ -158,7 +207,7 @@ fn real_utrace_fixture_exposes_cpu_dashboard_summary() {
     );
 
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["schema_version"], 2);
     assert_eq!(json["status"], "ok");
     assert!(
         json["dashboard"]["cpu"]["specs"].as_array().unwrap().len() > 100,
@@ -481,6 +530,134 @@ fn real_utrace_fixture_exposes_cpu_dashboard_summary() {
                 && class["class"].as_u64().is_some()),
         "fixture should decode LoadTime.ClassInfo names and class pointers"
     );
+    assert!(
+        loading["package_count"].as_u64().is_some(),
+        "fixture dashboard should expose LoadTime package summary fields"
+    );
+    assert!(
+        loading["requests"]["begun"].as_u64().is_some(),
+        "fixture dashboard should expose LoadTime request lifecycle counters"
+    );
+    let io_store = &json["dashboard"]["io_store"];
+    assert_eq!(
+        io_store["requests_created"].as_u64().unwrap(),
+        0,
+        "current CPU-frame fixture has no IoStore traffic; keep the decoder surface explicit"
+    );
+    assert!(
+        io_store["backends"].as_array().is_some(),
+        "fixture dashboard should expose IoStore backend catalog field"
+    );
+    let dispatch = &json["dashboard"]["dispatch"];
+    assert_eq!(
+        dispatch["serial_ordered"].as_bool(),
+        Some(true),
+        "fixture dashboard should dispatch normal events in serial order"
+    );
+    assert!(
+        dispatch["dispatched_event_count"].as_u64().unwrap() > 0,
+        "fixture should dispatch normal events"
+    );
+    assert!(
+        dispatch["synced_event_count"].as_u64().unwrap() > 0,
+        "fixture should retain synced serials"
+    );
+    let submission_latency = &json["dashboard"]["gpu"]["submission_latency"];
+    assert!(
+        submission_latency["sample_count"].as_u64().unwrap() > 0,
+        "fixture should collect GPU submission-latency samples from EventBeginWork"
+    );
+    assert!(
+        submission_latency["median_delay_cycles"].as_i64().is_some(),
+        "fixture should expose median GPU-start vs CPU-submit delay"
+    );
+    let breadcrumbs = &json["dashboard"]["gpu"]["breadcrumbs"];
+    assert!(
+        breadcrumbs["negative_durations"].as_u64().is_some(),
+        "fixture should report GPU breadcrumb anomaly counters"
+    );
+    assert!(
+        breadcrumbs["unmatched_ends"].as_u64().is_some(),
+        "fixture should report unmatched GPU breadcrumb ends"
+    );
+    assert!(
+        breadcrumbs["unterminated_scopes"].as_u64().is_some(),
+        "fixture should report unterminated GPU breadcrumbs"
+    );
+    // Targeted captures for IoStore traffic, LoadTime request lifecycles, counter
+    // samples, memory allocs, and metadata restore are still outstanding; this
+    // fixture only characterizes the surfaces that are present (or explicitly empty).
+    let frame_number = json["dashboard"]["frame_correlation"]["frames"][1]["frame_number"]
+        .as_u64()
+        .expect("fixture should expose correlated frames for timeline sampling")
+        as u32;
+    let timeline_output = binary()
+        .args([
+            "utrace",
+            "dashboard",
+            fixture.to_str().unwrap(),
+            "--format=json",
+            &format!("--frame={frame_number}"),
+        ])
+        .output()
+        .expect("timeline dashboard should run");
+    assert_eq!(
+        timeline_output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&timeline_output.stderr)
+    );
+    let timeline_json: Value = serde_json::from_slice(&timeline_output.stdout).unwrap();
+    let timeline = &timeline_json["dashboard"]["cpu"]["timeline"];
+    assert_eq!(
+        timeline["frame_number"].as_u64(),
+        Some(u64::from(frame_number))
+    );
+    assert!(
+        timeline["interval_count"].as_u64().unwrap() > 0,
+        "selected correlated frame should retain CPU intervals"
+    );
+    assert!(
+        timeline["intervals"].as_array().unwrap().len() <= 500,
+        "timeline must stay within the default 500-interval cap"
+    );
+    if timeline["interval_count"].as_u64().unwrap() > 500 {
+        assert_eq!(timeline["truncated"].as_bool(), Some(true));
+    }
+    let begin = timeline["begin_cycle"].as_u64().unwrap();
+    let end = timeline["end_cycle"].as_u64().unwrap();
+    assert!(end >= begin, "timeline window bounds must be ordered");
+    for interval in timeline["intervals"].as_array().unwrap() {
+        assert!(interval["thread_id"].as_u64().is_some());
+        assert!(interval["spec_id"].as_u64().is_some());
+        assert!(interval["duration"].as_u64().is_some());
+        let start = interval["start_cycle"].as_u64().unwrap();
+        let stop = interval["end_cycle"].as_u64().unwrap();
+        let lo = start.min(stop);
+        let hi = start.max(stop);
+        assert!(
+            lo >= begin && hi <= end,
+            "retained interval must lie within the reported frame window"
+        );
+    }
+
+    let absent_output = binary()
+        .args([
+            "utrace",
+            "dashboard",
+            fixture.to_str().unwrap(),
+            "--format=json",
+            "--frame=1",
+        ])
+        .output()
+        .expect("absent-frame dashboard should run");
+    assert_eq!(absent_output.status.code(), Some(0));
+    let absent_json: Value = serde_json::from_slice(&absent_output.stdout).unwrap();
+    let absent = &absent_json["dashboard"]["cpu"]["timeline"];
+    assert_eq!(absent["frame_number"].as_u64(), Some(1));
+    assert_eq!(absent["interval_count"].as_u64(), Some(0));
+    assert!(absent["intervals"].as_array().unwrap().is_empty());
+
     let channels = &json["dashboard"]["channels"];
     assert!(
         channels["count"].as_u64().unwrap() > 0,
@@ -940,7 +1117,7 @@ fn real_utrace_fixture_exposes_event_inventory() {
     );
 
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["schema_version"], 2);
     assert_eq!(json["status"], "ok");
     assert!(
         json["inventory"]["summary"]["declared_event_types"]
@@ -995,4 +1172,134 @@ fn real_utrace_fixture_exposes_event_inventory() {
             .is_some_and(|name| !name.is_empty()),
         "counter spec sample should decode aux string fields"
     );
+}
+
+#[test]
+#[ignore = "requires targeted .utrace captures; set UTRACE_TARGETED_FIXTURE or UTRACE_TARGETED_FIXTURE_DIR"]
+fn targeted_utrace_fixtures_exercise_provider_lifecycles() {
+    let mut observed = BTreeSet::<String>::new();
+    let mut counter_samples = 0_u64;
+    let mut load_packages = 0_u64;
+    let mut load_requests = 0_u64;
+    let mut memory_scopes = 0_usize;
+    let mut metadata_restores = 0_usize;
+    for fixture in targeted_fixtures() {
+        let output = binary()
+            .args([
+                "utrace",
+                "inventory",
+                fixture.to_str().unwrap(),
+                "--format=json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}: {}",
+            fixture.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+        for event in json["inventory"]["events"].as_array().unwrap() {
+            if event["observed_count"].as_u64().unwrap_or(0) == 0 {
+                continue;
+            }
+            let logger = event["logger"].as_str().unwrap();
+            let name = event["event"].as_str().unwrap();
+            observed.insert(format!("{logger}.{name}"));
+        }
+
+        let output = binary()
+            .args([
+                "utrace",
+                "dashboard",
+                fixture.to_str().unwrap(),
+                "--format=json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}: {}",
+            fixture.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let dashboard = &json["dashboard"];
+        counter_samples += dashboard["counters"]["samples"].as_u64().unwrap();
+        load_packages += dashboard["loading"]["package_count"].as_u64().unwrap();
+        load_requests += dashboard["loading"]["requests"]["completed"]
+            .as_u64()
+            .unwrap();
+        memory_scopes += dashboard["memory"]["scopes"].as_array().unwrap().len();
+        metadata_restores += dashboard["metadata_stack"]["restored_stacks"]
+            .as_array()
+            .unwrap()
+            .len();
+    }
+
+    for required in [
+        "LoadTime.PackageSummary",
+        "LoadTime.BeginRequest",
+        "LoadTime.EndRequest",
+        "Counters.SetValueInt",
+        "Memory.MemoryScope",
+        "MetadataStack.RestoreStack",
+    ] {
+        assert!(
+            observed.contains(required),
+            "targeted fixture corpus did not observe {required}; observed={observed:?}"
+        );
+    }
+    assert!(
+        counter_samples > 0,
+        "counter values must reach the dashboard"
+    );
+    assert!(
+        load_packages > 0,
+        "package summaries must reach the dashboard"
+    );
+    assert!(
+        load_requests > 0,
+        "load requests must pair in the dashboard"
+    );
+    assert!(memory_scopes > 0, "memory scopes must reach the dashboard");
+    assert!(
+        metadata_restores > 0,
+        "metadata restores must reach the dashboard"
+    );
+}
+
+#[test]
+#[ignore = "requires a cooked IoStore trace; set UTRACE_IOSTORE_FIXTURE"]
+fn iostore_utrace_fixture_exercises_request_lifecycle() {
+    let fixture = iostore_fixture();
+    let output = binary()
+        .args([
+            "utrace",
+            "dashboard",
+            fixture.to_str().unwrap(),
+            "--format=json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let io_store = &json["dashboard"]["io_store"];
+    assert!(io_store["requests_created"].as_u64().unwrap() > 0);
+    assert!(io_store["requests_started"].as_u64().unwrap() > 0);
+    assert!(
+        io_store["requests_completed"].as_u64().unwrap()
+            + io_store["requests_failed"].as_u64().unwrap()
+            + io_store["requests_unresolved"].as_u64().unwrap()
+            > 0
+    );
+    assert!(!io_store["request_samples"].as_array().unwrap().is_empty());
 }

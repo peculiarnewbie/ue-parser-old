@@ -492,6 +492,19 @@ fn decode_container_element(
     path: &str,
     depth: usize,
 ) -> Result<Option<PropertyValue>, PropertyError> {
+    if type_spec.name == "SoftObjectProperty" && !context.package.soft_object_paths.is_empty() {
+        let mut element_payload = payload.take_bounded(4, path)?;
+        return decode_typed_value(
+            source,
+            type_spec,
+            PropertyTagFlags::default(),
+            &mut element_payload,
+            context,
+            path,
+            depth,
+        );
+    }
+
     if let Some(byte_count) = fixed_serialized_size(type_spec.name, type_spec.tree) {
         let mut element_payload = payload.take_bounded(
             u64::try_from(byte_count).expect("fixed payload size fits in u64"),
@@ -1180,6 +1193,56 @@ mod tests {
             PropertyValue::SoftObjectPath(
                 "/Engine/EngineResources/DefaultTexture.DefaultTexture".into()
             )
+        );
+    }
+
+    #[test]
+    fn decodes_indexed_soft_object_path_array_elements() {
+        let names = vec!["ArrayProperty".into(), "SoftObjectProperty".into()];
+        let mut package = test_package(names);
+        package.soft_object_paths = vec![
+            String::new(),
+            "/Game/Characters/Hero.Hero".into(),
+            "/Game/Characters/Villain.Villain".into(),
+        ];
+        let mut payload = Vec::new();
+        push_i32(&mut payload, 2);
+        push_i32(&mut payload, 1);
+        push_i32(&mut payload, 2);
+        let source = payload.to_vec();
+        let mut record = PropertyRecord {
+            name: crate::test_support::name_ref(0, 0),
+            type_name: PropertyTypeName {
+                name: crate::test_support::name_ref(0, 0),
+                parameters: vec![PropertyTypeName {
+                    name: crate::test_support::name_ref(1, 0),
+                    parameters: Vec::new(),
+                }],
+            },
+            array_index: 0,
+            flags: PropertyTagFlags(0),
+            property_guid: None,
+            extensions: None,
+            payload: Span::new(0, source.len() as u64).expect("payload span"),
+            value: PropertyValue::Raw {
+                reason: RawReason::UnsupportedType,
+            },
+        };
+        let schemas = EmptySchemas;
+        let context = DecodeContext {
+            package: &package,
+            versions: &package.summary.versions,
+            schemas: &schemas,
+        };
+
+        decode_property_record(&source, &mut record, &context, 0).expect("decode");
+
+        assert_eq!(
+            record.value,
+            PropertyValue::Array(vec![
+                PropertyValue::SoftObjectPath("/Game/Characters/Hero.Hero".into()),
+                PropertyValue::SoftObjectPath("/Game/Characters/Villain.Villain".into()),
+            ])
         );
     }
 

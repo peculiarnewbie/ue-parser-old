@@ -25,7 +25,7 @@ use uasset_parser::{Package, PackageSummary};
 
 const SCHEMA_VERSION: u32 = 6;
 #[cfg(feature = "utrace")]
-const UTRACE_SCHEMA_VERSION: u32 = 1;
+const UTRACE_SCHEMA_VERSION: u32 = 2;
 const EXIT_SUCCESS: u8 = 0;
 const EXIT_MALFORMED: u8 = 2;
 const EXIT_UNSUPPORTED: u8 = 3;
@@ -65,6 +65,8 @@ enum OutputFormat {
 struct InspectOptions {
     input: Input,
     format: OutputFormat,
+    /// When set on `utrace dashboard`, retain a bounded CPU timeline for this frame.
+    timeline_frame: Option<u32>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -144,10 +146,9 @@ impl Command {
                 Self::Inspect(options) => Ok(Self::Utrace(UtraceCommand::Inspect(options))),
                 _ => unreachable!("parse_inspect only returns Inspect"),
             },
-            Some("dashboard") => match Self::parse_inspect(arguments.collect())? {
-                Self::Inspect(options) => Ok(Self::Utrace(UtraceCommand::Dashboard(options))),
-                _ => unreachable!("parse_inspect only returns Inspect"),
-            },
+            Some("dashboard") => Ok(Self::Utrace(UtraceCommand::Dashboard(
+                Self::parse_utrace_dashboard(arguments.collect())?,
+            ))),
             Some("inventory") => match Self::parse_inspect(arguments.collect())? {
                 Self::Inspect(options) => Ok(Self::Utrace(UtraceCommand::Inventory(options))),
                 _ => unreachable!("parse_inspect only returns Inspect"),
@@ -199,7 +200,62 @@ impl Command {
         Ok(Self::Inspect(InspectOptions {
             input: input.ok_or_else(|| "inspect requires a file path or `-`".to_owned())?,
             format,
+            timeline_frame: None,
         }))
+    }
+
+    fn parse_utrace_dashboard(arguments: Vec<OsString>) -> Result<InspectOptions, String> {
+        let mut format = OutputFormat::Text;
+        let mut input = None;
+        let mut timeline_frame = None;
+        let mut index = 0;
+
+        while index < arguments.len() {
+            let argument = &arguments[index];
+            match argument.to_str() {
+                Some("--format") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--format requires text or json".to_owned())?;
+                    format = parse_format(value)?;
+                }
+                Some(value) if value.starts_with("--format=") => {
+                    format = parse_format(OsString::from(&value["--format=".len()..]).as_os_str())?;
+                }
+                Some("--frame") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--frame requires a frame number".to_owned())?;
+                    timeline_frame = Some(parse_u32_arg(value, "--frame")?);
+                }
+                Some(value) if value.starts_with("--frame=") => {
+                    timeline_frame = Some(parse_u32_arg(
+                        OsString::from(&value["--frame=".len()..]).as_os_str(),
+                        "--frame",
+                    )?);
+                }
+                Some("-h" | "--help") => {
+                    return Err("use `uasset help` for command usage".to_owned());
+                }
+                Some(value) if value.starts_with('-') && value != "-" => {
+                    return Err(format!("unknown dashboard option {value:?}"));
+                }
+                _ if input.is_some() => {
+                    return Err("dashboard accepts exactly one input".to_owned());
+                }
+                Some("-") => input = Some(Input::Stdin),
+                _ => input = Some(Input::File(PathBuf::from(argument))),
+            }
+            index += 1;
+        }
+
+        Ok(InspectOptions {
+            input: input.ok_or_else(|| "dashboard requires a file path or `-`".to_owned())?,
+            format,
+            timeline_frame,
+        })
     }
 
     fn parse_coverage(arguments: Vec<OsString>) -> Result<CoverageOptions, String> {
@@ -310,6 +366,14 @@ fn parse_format(value: &std::ffi::OsStr) -> Result<OutputFormat, String> {
     }
 }
 
+fn parse_u32_arg(value: &std::ffi::OsStr, flag: &str) -> Result<u32, String> {
+    let Some(text) = value.to_str() else {
+        return Err(format!("{flag} value is not valid UTF-8"));
+    };
+    text.parse::<u32>()
+        .map_err(|_| format!("{flag} requires an unsigned integer, got {text:?}"))
+}
+
 fn inspect(options: &InspectOptions) -> u8 {
     let input_name = options.input.display_name();
     let bytes = match read_input(&options.input) {
@@ -418,7 +482,13 @@ fn dashboard_utrace(options: &InspectOptions) -> u8 {
         }
     };
 
-    let dashboard = match uasset_parser::utrace::dashboard(&bytes) {
+    let dashboard = match uasset_parser::utrace::dashboard_with_options(
+        &bytes,
+        uasset_parser::utrace::DashboardOptions {
+            timeline_frame: options.timeline_frame,
+            timeline_limit: Some(500),
+        },
+    ) {
         Ok(dashboard) => dashboard,
         Err(error) => {
             let exit_code = exit_code_for_trace_error(&error);
@@ -896,6 +966,26 @@ pre { overflow: auto; border: 1px solid var(--border); border-radius: 6px; paddi
         "Region completions",
         dashboard.annotations.regions.completed,
     );
+    html_kv_row(
+        &mut rendered,
+        "Load packages",
+        dashboard.loading.package_count,
+    );
+    html_kv_row(
+        &mut rendered,
+        "Load requests",
+        dashboard.loading.requests.completed,
+    );
+    html_kv_row(
+        &mut rendered,
+        "IoStore requests",
+        dashboard.io_store.requests_created,
+    );
+    html_kv_row(
+        &mut rendered,
+        "IoStore bytes",
+        dashboard.io_store.bytes_completed,
+    );
     html_kv_row(&mut rendered, "Trace channels", dashboard.channels.count);
     rendered.push_str("</tbody></table>\n");
 
@@ -1236,12 +1326,73 @@ fn render_utrace_dashboard_text_output(output: &UtraceDashboardOutput) -> String
     }
     writeln!(
         rendered,
-        "loading: classes={}",
-        output.dashboard.loading.class_count
+        "loading: classes={} packages={} requests_begun={} requests_completed={} request_cycles={} async_starts={} async_suspends={} async_resumes={}",
+        output.dashboard.loading.class_count,
+        output.dashboard.loading.package_count,
+        output.dashboard.loading.requests.begun,
+        output.dashboard.loading.requests.completed,
+        output.dashboard.loading.requests.total_cycles,
+        output.dashboard.loading.async_loading.starts,
+        output.dashboard.loading.async_loading.suspends,
+        output.dashboard.loading.async_loading.resumes
     )
     .unwrap();
     for class in output.dashboard.loading.classes.iter().take(10) {
         writeln!(rendered, "load class 0x{:x}: {:?}", class.class, class.name).unwrap();
+    }
+    for package in output.dashboard.loading.packages.iter().take(10) {
+        writeln!(
+            rendered,
+            "load package 0x{:x} {:?}: header={} imports={} exports={} priority={:?}",
+            package.async_package,
+            package.name,
+            package.total_header_size,
+            package.import_count,
+            package.export_count,
+            package.priority
+        )
+        .unwrap();
+    }
+    for request in output.dashboard.loading.requests.samples.iter().take(10) {
+        writeln!(
+            rendered,
+            "load request {}: start={} end={} duration={}",
+            request.request_id, request.start_cycle, request.end_cycle, request.duration_cycles
+        )
+        .unwrap();
+    }
+    writeln!(
+        rendered,
+        "iostore: backends={} created={} started={} completed={} failed={} unresolved={} requested_bytes={} completed_bytes={}",
+        output.dashboard.io_store.backend_count,
+        output.dashboard.io_store.requests_created,
+        output.dashboard.io_store.requests_started,
+        output.dashboard.io_store.requests_completed,
+        output.dashboard.io_store.requests_failed,
+        output.dashboard.io_store.requests_unresolved,
+        output.dashboard.io_store.bytes_requested,
+        output.dashboard.io_store.bytes_completed
+    )
+    .unwrap();
+    for backend in output.dashboard.io_store.backends.iter().take(10) {
+        writeln!(
+            rendered,
+            "iostore backend 0x{:x} {:?}: starts={}",
+            backend.backend_handle, backend.name, backend.starts
+        )
+        .unwrap();
+    }
+    for request in output.dashboard.io_store.request_samples.iter().take(10) {
+        writeln!(
+            rendered,
+            "iostore request 0x{:x}: status={:?} backend={:?} size={} completed={:?}",
+            request.request_handle,
+            request.status,
+            request.backend_name,
+            request.size,
+            request.completed_size
+        )
+        .unwrap();
     }
     writeln!(
         rendered,
@@ -2678,7 +2829,7 @@ uasset - inspect classic Unreal Engine asset packages
 Usage:
   uasset inspect <path|-> [--format text|json]
   uasset utrace inspect <path|-> [--format text|json]
-  uasset utrace dashboard <path|-> [--format text|json]
+  uasset utrace dashboard <path|-> [--format text|json] [--frame <n>]
   uasset utrace inventory <path|-> [--format text|json]
   uasset utrace coverage <path|-> [--universe <file>] [--format text|json]
   uasset utrace html <path|-> [--output <file>]
@@ -2721,6 +2872,7 @@ mod tests {
             Command::Inspect(InspectOptions {
                 input: Input::File(PathBuf::from("asset.uasset")),
                 format: OutputFormat::Json,
+                timeline_frame: None,
             })
         );
     }
@@ -2732,6 +2884,7 @@ mod tests {
             Command::Inspect(InspectOptions {
                 input: Input::Stdin,
                 format: OutputFormat::Text,
+                timeline_frame: None,
             })
         );
     }
@@ -2755,6 +2908,26 @@ mod tests {
             Command::Utrace(UtraceCommand::Inspect(InspectOptions {
                 input: Input::File(PathBuf::from("trace.utrace")),
                 format: OutputFormat::Json,
+                timeline_frame: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_utrace_dashboard_frame_option() {
+        assert_eq!(
+            Command::parse(vec![
+                "utrace".into(),
+                "dashboard".into(),
+                "trace.utrace".into(),
+                "--frame=366400".into(),
+                "--format=json".into()
+            ])
+            .unwrap(),
+            Command::Utrace(UtraceCommand::Dashboard(InspectOptions {
+                input: Input::File(PathBuf::from("trace.utrace")),
+                format: OutputFormat::Json,
+                timeline_frame: Some(366400),
             }))
         );
     }
@@ -2772,6 +2945,7 @@ mod tests {
             Command::Utrace(UtraceCommand::Dashboard(InspectOptions {
                 input: Input::File(PathBuf::from("trace.utrace")),
                 format: OutputFormat::Json,
+                timeline_frame: None,
             }))
         );
     }
@@ -2789,6 +2963,7 @@ mod tests {
             Command::Utrace(UtraceCommand::Inventory(InspectOptions {
                 input: Input::File(PathBuf::from("trace.utrace")),
                 format: OutputFormat::Json,
+                timeline_frame: None,
             }))
         );
     }

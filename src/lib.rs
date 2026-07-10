@@ -11,6 +11,8 @@ pub mod property;
 pub mod schema;
 #[cfg(feature = "utrace")]
 pub mod utrace;
+#[cfg(feature = "utrace")]
+pub mod utrace_dispatch;
 pub mod version;
 
 #[cfg(test)]

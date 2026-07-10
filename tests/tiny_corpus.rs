@@ -128,7 +128,7 @@ fn cli_inspects_committed_minimal_utrace_fixture() {
     assert!(output.stderr.is_empty());
 
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["schema_version"], 2);
     assert_eq!(json["status"], "ok");
     assert_eq!(json["trace"]["prologue"]["start_cycle"], 100);
     assert_eq!(json["trace"]["prologue"]["cycle_frequency"], 1_000_000);

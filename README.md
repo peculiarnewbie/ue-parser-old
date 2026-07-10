@@ -202,3 +202,10 @@ absence a failure:
 ```text
 UTRACE_REQUIRE_FIXTURE=1 cargo test --test utrace_fixture --features utrace
 ```
+
+Provider-specific captures can be supplied separately with
+`UTRACE_TARGETED_FIXTURE` or `UTRACE_TARGETED_FIXTURE_DIR`. The ignored
+`targeted_utrace_fixtures_exercise_provider_lifecycles` test requires the
+combined corpus to exercise LoadTime requests, counter values, memory scopes,
+and metadata-stack restoration. IoStore requires a cooked capture and is
+validated separately with `UTRACE_IOSTORE_FIXTURE`.

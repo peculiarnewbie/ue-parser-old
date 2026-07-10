@@ -159,7 +159,7 @@ fn utrace_json_malformed_trace_uses_stderr_and_exit_code_two() {
     assert!(output.stdout.is_empty());
 
     let json: Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["schema_version"], 2);
     assert_eq!(json["status"], "error");
     assert_eq!(json["path"], "-");
     assert_eq!(json["kind"], "malformed_data");
@@ -187,7 +187,7 @@ fn utrace_json_success_decodes_prologue_and_threads() {
     assert!(output.stderr.is_empty());
 
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["schema_version"], 2);
     assert_eq!(json["status"], "ok");
     assert_eq!(json["trace"]["prologue"]["start_cycle"], 100);
     assert_eq!(json["trace"]["prologue"]["cycle_frequency"], 1_000_000);
@@ -232,7 +232,7 @@ fn utrace_coverage_json_contract_cross_references_universe() {
     );
 
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["schema_version"], 2);
     assert_eq!(json["status"], "ok");
     assert_eq!(json["coverage"]["summary"]["declared_event_types"], 2);
     assert_eq!(json["coverage"]["summary"]["decoded_event_types"], 2);

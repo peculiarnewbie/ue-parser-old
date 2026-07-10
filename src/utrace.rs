@@ -46,6 +46,7 @@ pub struct TraceDashboard {
     pub stats: StatsDashboard,
     pub csv: CsvDashboard,
     pub loading: LoadingDashboard,
+    pub io_store: IoStoreDashboard,
     pub trace_timing: TraceTimingDashboard,
     pub memory: MemoryDashboard,
     pub metadata_stack: MetadataStackDashboard,
@@ -57,6 +58,8 @@ pub struct TraceDashboard {
     pub unmodeled: UnmodeledTraceDashboard,
     pub frame_correlation: FrameCorrelationDashboard,
     pub frames: Vec<FrameMarker>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<crate::utrace_dispatch::SerialDispatchSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionInfo>,
 }
@@ -224,6 +227,37 @@ pub struct CpuDashboard {
     pub threads: Vec<CpuThreadSummary>,
     pub named_events: Vec<CpuNamedEventSummary>,
     pub end_threads: Vec<CpuEndThreadSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<CpuTimelineDashboard>,
+}
+
+/// Bounded CPU timeline for one selected frame window.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct CpuTimelineDashboard {
+    pub frame_number: u32,
+    pub begin_cycle: u64,
+    pub end_cycle: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<f64>,
+    pub interval_count: u64,
+    pub truncated: bool,
+    pub intervals: Vec<CpuTimelineInterval>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CpuTimelineInterval {
+    pub thread_id: u16,
+    pub spec_id: u32,
+    pub name: String,
+    pub start_cycle: u64,
+    pub end_cycle: u64,
+    pub duration: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendered_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -415,6 +449,36 @@ pub struct GpuDashboard {
     pub frames: Vec<GpuFrameSummary>,
     pub work: GpuWorkSummary,
     pub breadcrumbs: GpuBreadcrumbDashboard,
+    /// Bounded samples of GPU-start vs CPU-submit times from `EventBeginWork`.
+    /// This is submission latency / queue delay, not clock-domain calibration:
+    /// `CPUTimestamp` is when work was submitted, `GPUTimestampTOP` is when it
+    /// began executing (see UE `GPUProfiler.h`). Insights does not use the CPU
+    /// field for time conversion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submission_latency: Option<GpuSubmissionLatency>,
+}
+
+/// Bounded GPU-start vs CPU-submit pairing from `EventBeginWork`.
+///
+/// This is not clock calibration: the two timestamps measure different events
+/// (execution begin vs CPU submission).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct GpuSubmissionLatency {
+    pub sample_count: u64,
+    /// Median (GPU TOP − CPU submit) in cycles; positive means GPU started after submit.
+    pub median_delay_cycles: i128,
+    pub min_delay_cycles: i128,
+    pub max_delay_cycles: i128,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<GpuSubmissionLatencySample>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GpuSubmissionLatencySample {
+    pub queue_id: u32,
+    pub gpu_timestamp_top: u64,
+    pub cpu_submit_timestamp: u64,
+    pub delay_cycles: i128,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -644,12 +708,110 @@ pub struct CsvDashboard {
 pub struct LoadingDashboard {
     pub class_count: u64,
     pub classes: Vec<LoadTimeClassSummary>,
+    pub package_count: u64,
+    pub packages: Vec<LoadTimePackageSummary>,
+    pub requests: LoadTimeRequestDashboard,
+    pub async_loading: LoadTimeAsyncLoadingSummary,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LoadTimeClassSummary {
     pub class: u64,
     pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LoadTimePackageSummary {
+    pub async_package: u64,
+    pub name: String,
+    pub total_header_size: u32,
+    pub import_count: u32,
+    pub export_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct LoadTimeRequestDashboard {
+    pub begun: u64,
+    pub ended: u64,
+    pub completed: u64,
+    pub unmatched_ends: u64,
+    pub open: u64,
+    pub total_cycles: u64,
+    pub samples: Vec<LoadTimeRequestSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LoadTimeRequestSummary {
+    pub request_id: u64,
+    pub start_cycle: u64,
+    pub end_cycle: u64,
+    pub duration_cycles: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct LoadTimeAsyncLoadingSummary {
+    pub starts: u64,
+    pub suspends: u64,
+    pub resumes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_cycle: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_cycle: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct IoStoreDashboard {
+    pub backend_count: u64,
+    pub backends: Vec<IoStoreBackendSummary>,
+    pub requests_created: u64,
+    pub requests_started: u64,
+    pub requests_completed: u64,
+    pub requests_failed: u64,
+    pub requests_unresolved: u64,
+    pub bytes_requested: u64,
+    pub bytes_completed: u64,
+    pub request_samples: Vec<IoStoreRequestSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct IoStoreBackendSummary {
+    pub backend_handle: u64,
+    pub name: String,
+    pub starts: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct IoStoreRequestSummary {
+    pub request_handle: u64,
+    pub batch_handle: u64,
+    pub chunk_id_hash: u32,
+    pub chunk_type: u8,
+    pub offset: u64,
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_handle: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_name: Option<String>,
+    pub create_cycle: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_cycle: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complete_cycle: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_size: Option<u64>,
+    pub status: IoStoreRequestStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IoStoreRequestStatus {
+    Created,
+    Started,
+    Completed,
+    Failed,
+    Unresolved,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -1055,7 +1217,7 @@ pub enum TraceErrorKind {
 }
 
 impl TraceError {
-    fn new(
+    pub(crate) fn new(
         kind: TraceErrorKind,
         offset: u64,
         path: impl Into<String>,
@@ -1130,38 +1292,6 @@ pub fn inspect(source: &[u8]) -> Result<TraceInspect, TraceError> {
         events,
         prologue: decoded_importants.prologue,
         thread_info: decoded_importants.thread_info,
-    })
-}
-
-pub fn dashboard(source: &[u8]) -> Result<TraceDashboard, TraceError> {
-    let mut reader = Reader::new(source);
-    let header = read_header(&mut reader)?;
-    let decoded = read_packets(&mut reader)?;
-    let events = read_event_registry(&header, &decoded.streams)?;
-    let decoded_importants = read_known_important_events(&header, &decoded.streams, &events)?;
-    let dashboard = read_dashboard_events(&header, &decoded.streams, &events, &decoded_importants)?;
-    Ok(TraceDashboard {
-        header,
-        prologue: decoded_importants.prologue,
-        thread_info: decoded_importants.thread_info,
-        cpu: dashboard.cpu,
-        gpu: dashboard.gpu,
-        counters: dashboard.counters,
-        stats: dashboard.stats,
-        csv: dashboard.csv,
-        loading: dashboard.loading,
-        trace_timing: dashboard.trace_timing,
-        memory: dashboard.memory,
-        metadata_stack: dashboard.metadata_stack,
-        slate: dashboard.slate,
-        channels: dashboard.channels,
-        thread_groups: dashboard.thread_groups,
-        annotations: dashboard.annotations,
-        logging: dashboard.logging,
-        unmodeled: dashboard.unmodeled,
-        frame_correlation: dashboard.frame_correlation,
-        frames: dashboard.frames,
-        session: dashboard.session,
     })
 }
 
@@ -1379,7 +1509,7 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
         logger: "CpuProfiler",
         event: "EventBatchV3",
         status: DecodeStatus::Partial,
-        note: "Scope enter/leave intervals aggregated to cycle totals; per-thread batch, coroutine, and base-cycle state are reconstructed, but full timelines are not emitted.",
+        note: "Scope enter/leave intervals aggregated to cycle totals; per-thread batch, coroutine, and late-connect base-cycle state follow Insights ProcessBufferV2. Optional bounded per-frame timelines via dashboard --frame.",
     },
     EventCoverage {
         logger: "CpuProfiler",
@@ -1434,6 +1564,78 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
         event: "ClassInfo",
         status: DecodeStatus::Partial,
         note: "Load-time class catalog: class pointer and name.",
+    },
+    EventCoverage {
+        logger: "LoadTime",
+        event: "PackageSummary",
+        status: DecodeStatus::Partial,
+        note: "Async package summary: package pointer, name, header size, import/export counts, and optional priority.",
+    },
+    EventCoverage {
+        logger: "LoadTime",
+        event: "BeginRequest",
+        status: DecodeStatus::Partial,
+        note: "Async loading request begin cycle keyed by request id.",
+    },
+    EventCoverage {
+        logger: "LoadTime",
+        event: "EndRequest",
+        status: DecodeStatus::Partial,
+        note: "Async loading request end cycle paired with begin events into bounded duration samples.",
+    },
+    EventCoverage {
+        logger: "LoadTime",
+        event: "StartAsyncLoading",
+        status: DecodeStatus::Partial,
+        note: "Async loading start count and cycle bounds.",
+    },
+    EventCoverage {
+        logger: "LoadTime",
+        event: "SuspendAsyncLoading",
+        status: DecodeStatus::Partial,
+        note: "Async loading suspend count and cycle bounds.",
+    },
+    EventCoverage {
+        logger: "LoadTime",
+        event: "ResumeAsyncLoading",
+        status: DecodeStatus::Partial,
+        note: "Async loading resume count and cycle bounds.",
+    },
+    EventCoverage {
+        logger: "IoStore",
+        event: "BackendName",
+        status: DecodeStatus::Partial,
+        note: "IoStore backend handle and name catalog.",
+    },
+    EventCoverage {
+        logger: "IoStore",
+        event: "RequestCreate",
+        status: DecodeStatus::Partial,
+        note: "IoStore request creation metadata: request, batch, chunk, offset, and requested size.",
+    },
+    EventCoverage {
+        logger: "IoStore",
+        event: "RequestStarted",
+        status: DecodeStatus::Partial,
+        note: "IoStore request start cycle and backend association.",
+    },
+    EventCoverage {
+        logger: "IoStore",
+        event: "RequestCompleted",
+        status: DecodeStatus::Partial,
+        note: "IoStore request completion cycle and completed byte count.",
+    },
+    EventCoverage {
+        logger: "IoStore",
+        event: "RequestFailed",
+        status: DecodeStatus::Partial,
+        note: "IoStore failed request count and sample status.",
+    },
+    EventCoverage {
+        logger: "IoStore",
+        event: "RequestUnresolved",
+        status: DecodeStatus::Partial,
+        note: "IoStore unresolved request count and sample status.",
     },
     EventCoverage {
         logger: "Memory",
@@ -1541,19 +1743,19 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
         logger: "GpuProfiler",
         event: "EventBeginBreadcrumb",
         status: DecodeStatus::Partial,
-        note: "GPU breadcrumb begin paired into intervals; CBOR metadata not expanded.",
+        note: "GPU breadcrumb begin paired into intervals with bounded CBOR metadata expansion.",
     },
     EventCoverage {
         logger: "GpuProfiler",
         event: "EventEndBreadcrumb",
         status: DecodeStatus::Partial,
-        note: "GPU breadcrumb end paired into intervals.",
+        note: "GPU breadcrumb end paired into intervals; zero timestamps ignored without touching the open stack (Insights parity); negative durations counted but still closed.",
     },
     EventCoverage {
         logger: "GpuProfiler",
         event: "EventBeginWork",
         status: DecodeStatus::Partial,
-        note: "GPU work begin paired into intervals and timestamp bounds.",
+        note: "GPU work begin paired into intervals; CPUTimestamp retained for submission-latency samples (not clock calibration).",
     },
     EventCoverage {
         logger: "GpuProfiler",
@@ -2153,6 +2355,7 @@ struct DecodedDashboardEvents {
     stats: StatsDashboard,
     csv: CsvDashboard,
     loading: LoadingDashboard,
+    io_store: IoStoreDashboard,
     trace_timing: TraceTimingDashboard,
     memory: MemoryDashboard,
     metadata_stack: MetadataStackDashboard,
@@ -2164,7 +2367,65 @@ struct DecodedDashboardEvents {
     unmodeled: UnmodeledTraceDashboard,
     frame_correlation: FrameCorrelationDashboard,
     frames: Vec<FrameMarker>,
+    dispatch: Option<crate::utrace_dispatch::SerialDispatchSummary>,
     session: Option<SessionInfo>,
+}
+
+/// Options for dashboard decode beyond the default aggregate summary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DashboardOptions {
+    /// When set, retain a bounded CPU timeline for this metadata frame number.
+    pub timeline_frame: Option<u32>,
+    /// Max intervals retained in `cpu.timeline` (default 500).
+    pub timeline_limit: Option<usize>,
+}
+
+pub fn dashboard(source: &[u8]) -> Result<TraceDashboard, TraceError> {
+    dashboard_with_options(source, DashboardOptions::default())
+}
+
+pub fn dashboard_with_options(
+    source: &[u8],
+    options: DashboardOptions,
+) -> Result<TraceDashboard, TraceError> {
+    let mut reader = Reader::new(source);
+    let header = read_header(&mut reader)?;
+    let decoded = read_packets(&mut reader)?;
+    let events = read_event_registry(&header, &decoded.streams)?;
+    let decoded_importants = read_known_important_events(&header, &decoded.streams, &events)?;
+    let dashboard = read_dashboard_events(
+        &header,
+        &decoded.streams,
+        &events,
+        &decoded_importants,
+        decoded.summary.sync_count,
+        options,
+    )?;
+    Ok(TraceDashboard {
+        header,
+        prologue: decoded_importants.prologue,
+        thread_info: decoded_importants.thread_info,
+        cpu: dashboard.cpu,
+        gpu: dashboard.gpu,
+        counters: dashboard.counters,
+        stats: dashboard.stats,
+        csv: dashboard.csv,
+        loading: dashboard.loading,
+        io_store: dashboard.io_store,
+        trace_timing: dashboard.trace_timing,
+        memory: dashboard.memory,
+        metadata_stack: dashboard.metadata_stack,
+        slate: dashboard.slate,
+        channels: dashboard.channels,
+        thread_groups: dashboard.thread_groups,
+        annotations: dashboard.annotations,
+        logging: dashboard.logging,
+        unmodeled: dashboard.unmodeled,
+        frame_correlation: dashboard.frame_correlation,
+        frames: dashboard.frames,
+        dispatch: dashboard.dispatch,
+        session: dashboard.session,
+    })
 }
 
 fn read_known_important_events(
@@ -2226,6 +2487,8 @@ fn read_dashboard_events(
     streams: &BTreeMap<u16, Vec<u8>>,
     events: &[EventTypeInfo],
     importants: &DecodedImportantEvents,
+    sync_count: u64,
+    options: DashboardOptions,
 ) -> Result<DecodedDashboardEvents, TraceError> {
     if header.protocol < 5 {
         return Ok(DecodedDashboardEvents::default());
@@ -2256,7 +2519,8 @@ fn read_dashboard_events(
     let mut stat_specs = BTreeMap::<u32, StatSpec>::new();
     let mut csv_categories = BTreeMap::<i32, CsvCategory>::new();
     let mut csv_stats = BTreeMap::<u64, CsvStat>::new();
-    let mut load_time_classes = BTreeMap::<u64, String>::new();
+    let mut load_time = LoadTimeState::default();
+    let mut io_store = IoStoreState::default();
     let mut trace_thread_timing = BTreeMap::<u16, TraceThreadTimingSummary>::new();
     let mut cpu_end_threads = Vec::<CpuEndThreadSummary>::new();
     let mut memory_scopes = BTreeMap::<i32, u64>::new();
@@ -2274,11 +2538,19 @@ fn read_dashboard_events(
     let mut unresolved_log_messages = 0_u64;
     let mut unmodeled_events = BTreeMap::<(String, String), GenericEventState>::new();
     let mut session: Option<SessionInfo> = None;
+    let mut submission_latency_samples = Vec::<GpuSubmissionLatencySample>::new();
+    let mut timeline_collector = options.timeline_frame.map(|frame_number| {
+        CpuTimelineCollector::new(frame_number, options.timeline_limit.unwrap_or(500))
+    });
     let cycle_frequency = importants
         .prologue
         .as_ref()
         .map(|prologue| prologue.cycle_frequency)
         .filter(|frequency| *frequency > 0);
+    let prologue_start_cycle = importants
+        .prologue
+        .as_ref()
+        .map(|prologue| prologue.start_cycle);
 
     for thread_id in [0_u16, 1_u16] {
         let Some(stream) = streams.get(&thread_id) else {
@@ -2323,9 +2595,28 @@ fn read_dashboard_events(
                     csv_stats.insert(stat.stat_id, stat);
                 }
                 ("LoadTime", "ClassInfo") => {
-                    let class_info =
-                        decode_load_time_class_info(event, raw_event.data, raw_event.offset + 4)?;
-                    load_time_classes.insert(class_info.class, class_info.name);
+                    decode_load_time_event(
+                        event,
+                        raw_event.data,
+                        &mut load_time,
+                        raw_event.offset + 4,
+                    )?;
+                }
+                ("LoadTime", _) => {
+                    decode_load_time_event(
+                        event,
+                        raw_event.data,
+                        &mut load_time,
+                        raw_event.offset + 4,
+                    )?;
+                }
+                ("IoStore", _) => {
+                    decode_io_store_event(
+                        event,
+                        raw_event.data,
+                        &mut io_store,
+                        raw_event.offset + 4,
+                    )?;
                 }
                 ("$Trace", "ThreadTiming") => {
                     let timing = decode_trace_thread_timing(
@@ -2446,145 +2737,140 @@ fn read_dashboard_events(
         }
     }
 
-    let mut normal_events_by_thread = Vec::<(u16, Vec<OwnedRawEvent>)>::new();
-    for (thread_id, stream) in streams {
-        if *thread_id > 1 {
-            normal_events_by_thread
-                .push((*thread_id, read_protocol5_normal_events(stream, &registry)?));
+    let (dispatched_events, dispatch_summary) =
+        crate::utrace_dispatch::dispatch_normal_events(streams, &registry, sync_count)?;
+    decoded.dispatch = Some(dispatch_summary);
+
+    for raw_event in &dispatched_events {
+        let Some(event) = registry.get(&raw_event.uid).copied() else {
+            continue;
+        };
+        if decode_status_for(event) == DecodeStatus::Raw {
+            continue;
+        }
+        if (event.logger.as_str(), event.event.as_str()) == ("CpuProfiler", "Metadata") {
+            let mut record = decode_cpu_metadata_record(event, &raw_event.data, 0)?;
+            enrich_cpu_metadata_record(&metadata_spec_by_id, &mut record);
+            metadata_by_id.insert(record.metadata_id, record);
         }
     }
 
-    for (_, raw_events) in &normal_events_by_thread {
-        for raw_event in raw_events {
-            let Some(event) = registry.get(&raw_event.uid).copied() else {
-                continue;
-            };
-            if decode_status_for(event) == DecodeStatus::Raw {
-                continue;
-            }
-            if (event.logger.as_str(), event.event.as_str()) == ("CpuProfiler", "Metadata") {
-                let mut record = decode_cpu_metadata_record(event, &raw_event.data, 0)?;
-                enrich_cpu_metadata_record(&metadata_spec_by_id, &mut record);
-                metadata_by_id.insert(record.metadata_id, record);
-            }
+    for raw_event in &dispatched_events {
+        let thread_id = raw_event.thread_id;
+        let Some(event) = registry.get(&raw_event.uid).copied() else {
+            continue;
+        };
+        if decode_status_for(event) == DecodeStatus::Raw {
+            unmodeled_events
+                .entry((event.logger.clone(), event.event.clone()))
+                .or_default()
+                .record(event, &raw_event.data, thread_id)?;
+            continue;
         }
-    }
-
-    for (thread_id, raw_events) in &normal_events_by_thread {
-        for raw_event in raw_events {
-            let Some(event) = registry.get(&raw_event.uid).copied() else {
+        if (event.logger.as_str(), event.event.as_str()) == ("CpuProfiler", "EventBatchV3") {
+            let Some(data) = read_aux_bytes(event, &raw_event.data, "Data", 0)? else {
                 continue;
             };
-            if decode_status_for(event) == DecodeStatus::Raw {
-                unmodeled_events
-                    .entry((event.logger.clone(), event.event.clone()))
-                    .or_default()
-                    .record(event, &raw_event.data, *thread_id)?;
-                continue;
-            }
-            if (event.logger.as_str(), event.event.as_str()) == ("CpuProfiler", "EventBatchV3") {
-                let Some(data) = read_aux_bytes(event, &raw_event.data, "Data", 0)? else {
-                    continue;
-                };
-                let mut batch_state = CpuBatchDecodeState {
-                    batches: &mut decoded.cpu.batches,
-                    scope_totals: &mut scope_totals,
-                    metadata_scope_totals: &mut metadata_scope_totals,
-                    metadata_interval_state: &mut metadata_interval_state,
-                    metadata_stack_context: metadata_stack_contexts.entry(*thread_id).or_default(),
-                    thread_state: cpu_batch_thread_states.entry(*thread_id).or_default(),
-                    batch_base_cycle: raw_event.scope_cycle,
-                    frame_scope_totals: &mut frame_scope_totals,
-                    thread_scope_totals: thread_scope_totals.entry(*thread_id).or_default(),
-                };
-                decode_cpu_batch(&data, &spec_by_id, &metadata_by_id, &mut batch_state)?;
-            } else if (event.logger.as_str(), event.event.as_str()) == ("Misc", "BeginFrame") {
-                decoded.frames.push(decode_frame_marker(
-                    event,
-                    &raw_event.data,
-                    0,
-                    *thread_id,
-                    FrameMarkerKind::Begin,
-                )?);
-            } else if (event.logger.as_str(), event.event.as_str()) == ("Misc", "EndFrame") {
-                decoded.frames.push(decode_frame_marker(
-                    event,
-                    &raw_event.data,
-                    0,
-                    *thread_id,
-                    FrameMarkerKind::End,
-                )?);
-            } else if event.logger.as_str() == "Cpu" {
-                cpu_named_events
-                    .entry(event.event.clone())
-                    .or_default()
-                    .record(event, &raw_event.data, *thread_id)?;
-            } else if event.logger.as_str() == "GpuProfiler" {
-                decode_gpu_normal_event(
-                    event,
-                    &raw_event.data,
-                    &gpu_breadcrumb_specs,
-                    &mut gpu_queues,
-                    &mut gpu_breadcrumb_totals,
-                    0,
-                )?;
-            } else if event.logger.as_str() == "Counters" {
-                decode_counter_value(
-                    event,
-                    &raw_event.data,
-                    &counter_specs,
-                    &mut counter_states,
-                    &mut unresolved_counter_samples,
-                    0,
-                )?;
-            } else if event.logger.as_str() == "Misc" {
-                decode_misc_annotation_event(
-                    event,
-                    &raw_event.data,
-                    &bookmark_specs,
-                    &mut bookmark_states,
-                    &mut unresolved_bookmark_events,
-                    &mut region_state,
-                    0,
-                )?;
-            } else if (event.logger.as_str(), event.event.as_str()) == ("Logging", "LogMessage") {
-                decode_log_message(
-                    event,
-                    &raw_event.data,
-                    &log_message_specs,
-                    &mut log_message_states,
-                    &mut unresolved_log_messages,
-                    0,
-                )?;
-            } else if (event.logger.as_str(), event.event.as_str()) == ("$Trace", "ThreadTiming") {
-                let timing = decode_trace_thread_timing(event, &raw_event.data, 0, *thread_id)?;
-                trace_thread_timing.insert(timing.thread_id, timing);
-            } else if (event.logger.as_str(), event.event.as_str()) == ("CpuProfiler", "EndThread")
-            {
-                cpu_end_threads.push(decode_cpu_end_thread(
-                    event,
-                    &raw_event.data,
-                    0,
-                    *thread_id,
-                )?);
-            } else if (event.logger.as_str(), event.event.as_str()) == ("Memory", "MemoryScope") {
-                let tag = decode_memory_scope(event, &raw_event.data, 0)?;
-                *memory_scopes.entry(tag).or_default() += 1;
-            } else if event.logger.as_str() == "MetadataStack" {
-                decode_metadata_stack_event(event, &raw_event.data, &mut metadata_stack, 0)?;
-                apply_metadata_stack_event_to_cpu_context(
-                    event,
-                    &raw_event.data,
-                    metadata_stack_contexts.entry(*thread_id).or_default(),
-                    0,
-                )?;
-            } else if (event.logger.as_str(), event.event.as_str()) == ("SlateTrace", "AddWidget") {
-                let widget = decode_slate_add_widget(event, &raw_event.data, 0)?;
-                slate_widgets
-                    .entry(widget.widget_id)
-                    .or_default()
-                    .record(widget.cycle);
-            }
+            let mut batch_state = CpuBatchDecodeState {
+                batches: &mut decoded.cpu.batches,
+                scope_totals: &mut scope_totals,
+                metadata_scope_totals: &mut metadata_scope_totals,
+                metadata_interval_state: &mut metadata_interval_state,
+                metadata_stack_context: metadata_stack_contexts.entry(thread_id).or_default(),
+                thread_state: cpu_batch_thread_states.entry(thread_id).or_default(),
+                batch_base_cycle: raw_event.scope_cycle.or(prologue_start_cycle),
+                frame_scope_totals: &mut frame_scope_totals,
+                thread_scope_totals: thread_scope_totals.entry(thread_id).or_default(),
+                timeline: timeline_collector.as_mut(),
+                thread_id,
+                cycle_frequency,
+            };
+            decode_cpu_batch(&data, &spec_by_id, &metadata_by_id, &mut batch_state)?;
+        } else if (event.logger.as_str(), event.event.as_str()) == ("Misc", "BeginFrame") {
+            decoded.frames.push(decode_frame_marker(
+                event,
+                &raw_event.data,
+                0,
+                thread_id,
+                FrameMarkerKind::Begin,
+            )?);
+        } else if (event.logger.as_str(), event.event.as_str()) == ("Misc", "EndFrame") {
+            decoded.frames.push(decode_frame_marker(
+                event,
+                &raw_event.data,
+                0,
+                thread_id,
+                FrameMarkerKind::End,
+            )?);
+        } else if event.logger.as_str() == "Cpu" {
+            cpu_named_events
+                .entry(event.event.clone())
+                .or_default()
+                .record(event, &raw_event.data, thread_id)?;
+        } else if event.logger.as_str() == "GpuProfiler" {
+            decode_gpu_normal_event(
+                event,
+                &raw_event.data,
+                &gpu_breadcrumb_specs,
+                &mut gpu_queues,
+                &mut gpu_breadcrumb_totals,
+                &mut submission_latency_samples,
+                0,
+            )?;
+        } else if event.logger.as_str() == "Counters" {
+            decode_counter_value(
+                event,
+                &raw_event.data,
+                &counter_specs,
+                &mut counter_states,
+                &mut unresolved_counter_samples,
+                0,
+            )?;
+        } else if event.logger.as_str() == "Misc" {
+            decode_misc_annotation_event(
+                event,
+                &raw_event.data,
+                &bookmark_specs,
+                &mut bookmark_states,
+                &mut unresolved_bookmark_events,
+                &mut region_state,
+                0,
+            )?;
+        } else if (event.logger.as_str(), event.event.as_str()) == ("Logging", "LogMessage") {
+            decode_log_message(
+                event,
+                &raw_event.data,
+                &log_message_specs,
+                &mut log_message_states,
+                &mut unresolved_log_messages,
+                0,
+            )?;
+        } else if event.logger.as_str() == "LoadTime" {
+            decode_load_time_event(event, &raw_event.data, &mut load_time, 0)?;
+        } else if event.logger.as_str() == "IoStore" {
+            decode_io_store_event(event, &raw_event.data, &mut io_store, 0)?;
+        } else if (event.logger.as_str(), event.event.as_str()) == ("$Trace", "ThreadTiming") {
+            let timing = decode_trace_thread_timing(event, &raw_event.data, 0, thread_id)?;
+            trace_thread_timing.insert(timing.thread_id, timing);
+        } else if (event.logger.as_str(), event.event.as_str()) == ("CpuProfiler", "EndThread") {
+            cpu_end_threads.push(decode_cpu_end_thread(event, &raw_event.data, 0, thread_id)?);
+        } else if (event.logger.as_str(), event.event.as_str()) == ("Memory", "MemoryScope") {
+            let tag = decode_memory_scope(event, &raw_event.data, 0)?;
+            *memory_scopes.entry(tag).or_default() += 1;
+        } else if event.logger.as_str() == "MetadataStack" {
+            decode_metadata_stack_event(event, &raw_event.data, &mut metadata_stack, 0)?;
+            apply_metadata_stack_event_to_cpu_context(
+                event,
+                &raw_event.data,
+                metadata_stack_contexts.entry(thread_id).or_default(),
+                0,
+            )?;
+        } else if (event.logger.as_str(), event.event.as_str()) == ("SlateTrace", "AddWidget") {
+            let widget = decode_slate_add_widget(event, &raw_event.data, 0)?;
+            slate_widgets
+                .entry(widget.widget_id)
+                .or_default()
+                .record(widget.cycle);
         }
     }
 
@@ -2653,10 +2939,15 @@ fn read_dashboard_events(
         &gpu_breadcrumb_specs,
         gpu_breadcrumb_totals,
     );
+    decoded.gpu.submission_latency = gpu_submission_latency(submission_latency_samples);
+    if let Some(collector) = timeline_collector {
+        decoded.cpu.timeline = Some(collector.into_dashboard(cycle_frequency));
+    }
     decoded.counters = counter_dashboard(counter_specs, counter_states, unresolved_counter_samples);
     decoded.stats = stats_dashboard(stat_specs);
     decoded.csv = csv_dashboard(csv_categories, csv_stats);
-    decoded.loading = loading_dashboard(load_time_classes);
+    decoded.loading = load_time.dashboard();
+    decoded.io_store = io_store.dashboard();
     decoded.trace_timing = trace_timing_dashboard(trace_thread_timing);
     decoded.memory = memory_dashboard(memory_scopes);
     decoded.metadata_stack = metadata_stack.dashboard();
@@ -2862,6 +3153,7 @@ fn decode_gpu_normal_event(
     specs: &BTreeMap<u32, GpuBreadcrumbSpec>,
     queues: &mut BTreeMap<u32, GpuQueueState>,
     breadcrumb_totals: &mut BTreeMap<u32, GpuBreadcrumbTotal>,
+    submission_latency_samples: &mut Vec<GpuSubmissionLatencySample>,
     base_offset: u64,
 ) -> Result<(), TraceError> {
     match event.event.as_str() {
@@ -2878,6 +3170,7 @@ fn decode_gpu_normal_event(
             let spec_id = read_u32_field(event, data, "SpecId", base_offset)?;
             let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
             let gpu_timestamp_top = read_u64_field(event, data, "GPUTimestampTOP", base_offset)?;
+            // Insights ignores events whose timestamp could not be determined.
             if gpu_timestamp_top == 0 {
                 return Ok(());
             }
@@ -2928,10 +3221,12 @@ fn decode_gpu_normal_event(
         "EventEndBreadcrumb" => {
             let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
             let gpu_timestamp_bop = read_u64_field(event, data, "GPUTimestampBOP", base_offset)?;
+            let queue = queues.entry(queue_id).or_default();
+            // Insights ignores events whose timestamp could not be determined
+            // before touching the open stack, leaving the begin unterminated.
             if gpu_timestamp_bop == 0 {
                 return Ok(());
             }
-            let queue = queues.entry(queue_id).or_default();
             update_min_max(
                 &mut queue.min_gpu_timestamp,
                 &mut queue.max_gpu_timestamp,
@@ -2943,6 +3238,25 @@ fn decode_gpu_normal_event(
             };
             if gpu_timestamp_bop < begin.gpu_timestamp_top {
                 queue.negative_breadcrumb_durations += 1;
+                // Insights still closes the interval; count the anomaly but do not
+                // leave the begin open (which would inflate unterminated counts).
+                let duration = 0;
+                queue.breadcrumb_count += 1;
+                record_gpu_frame_breadcrumb(
+                    queue,
+                    begin.gpu_timestamp_top,
+                    gpu_timestamp_bop,
+                    duration,
+                    begin.rendered_name.as_deref(),
+                );
+                let total = breadcrumb_totals.entry(begin.spec_id).or_default();
+                total.count += 1;
+                if begin.metadata_bytes > 0 {
+                    total.metadata_events += 1;
+                    total.metadata_bytes = total
+                        .metadata_bytes
+                        .saturating_add(u64::try_from(begin.metadata_bytes).unwrap());
+                }
                 return Ok(());
             }
             let duration = gpu_timestamp_bop - begin.gpu_timestamp_top;
@@ -3021,6 +3335,16 @@ fn decode_gpu_normal_event(
                 gpu_timestamp_top,
                 cpu_timestamp,
             });
+            if gpu_timestamp_top != 0 && cpu_timestamp != 0 && submission_latency_samples.len() < 64
+            {
+                let delay_cycles = submission_delay_cycles(gpu_timestamp_top, cpu_timestamp);
+                submission_latency_samples.push(GpuSubmissionLatencySample {
+                    queue_id,
+                    gpu_timestamp_top,
+                    cpu_submit_timestamp: cpu_timestamp,
+                    delay_cycles,
+                });
+            }
             update_min_max(
                 &mut queue.min_gpu_timestamp,
                 &mut queue.max_gpu_timestamp,
@@ -3983,6 +4307,31 @@ struct LoadTimeClassInfo {
     name: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LoadTimeState {
+    classes: BTreeMap<u64, String>,
+    packages: BTreeMap<u64, LoadTimePackageSummary>,
+    open_requests: BTreeMap<u64, u64>,
+    requests: LoadTimeRequestDashboard,
+    async_loading: LoadTimeAsyncLoadingSummary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoadTimePackageInfo {
+    async_package: u64,
+    total_header_size: u32,
+    import_count: u32,
+    export_count: u32,
+    name: String,
+    priority: Option<i32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoadTimeRequestEvent {
+    cycle: u64,
+    request_id: u64,
+}
+
 fn decode_load_time_class_info(
     event: &EventTypeInfo,
     data: &[u8],
@@ -3995,20 +4344,325 @@ fn decode_load_time_class_info(
     })
 }
 
-fn loading_dashboard(classes: BTreeMap<u64, String>) -> LoadingDashboard {
-    let mut classes = classes
-        .into_iter()
-        .map(|(class, name)| LoadTimeClassSummary { class, name })
-        .collect::<Vec<_>>();
-    classes.sort_by(|left, right| {
-        left.name
-            .cmp(&right.name)
-            .then_with(|| left.class.cmp(&right.class))
-    });
+fn decode_load_time_package_summary(
+    event: &EventTypeInfo,
+    data: &[u8],
+    base_offset: u64,
+) -> Result<LoadTimePackageInfo, TraceError> {
+    let aux = parse_protocol5_aux(data, event_data_size(event), base_offset)?;
+    Ok(LoadTimePackageInfo {
+        async_package: read_pointer_field(event, data, "AsyncPackage", base_offset)?,
+        total_header_size: read_u32_field(event, data, "TotalHeaderSize", base_offset)?,
+        import_count: read_u32_field(event, data, "ImportCount", base_offset)?,
+        export_count: read_u32_field(event, data, "ExportCount", base_offset)?,
+        name: read_aux_text(event, &aux, "Name")?,
+        priority: read_optional_i32_field(event, data, "Priority", base_offset)?,
+    })
+}
 
-    LoadingDashboard {
-        class_count: u64::try_from(classes.len()).unwrap(),
-        classes,
+fn decode_load_time_request_event(
+    event: &EventTypeInfo,
+    data: &[u8],
+    base_offset: u64,
+) -> Result<LoadTimeRequestEvent, TraceError> {
+    Ok(LoadTimeRequestEvent {
+        cycle: read_u64_field(event, data, "Cycle", base_offset)?,
+        request_id: read_u64_field(event, data, "RequestId", base_offset)?,
+    })
+}
+
+fn decode_load_time_cycle(
+    event: &EventTypeInfo,
+    data: &[u8],
+    base_offset: u64,
+) -> Result<u64, TraceError> {
+    read_u64_field(event, data, "Cycle", base_offset)
+}
+
+fn decode_load_time_event(
+    event: &EventTypeInfo,
+    data: &[u8],
+    state: &mut LoadTimeState,
+    base_offset: u64,
+) -> Result<(), TraceError> {
+    match event.event.as_str() {
+        "ClassInfo" => {
+            let class_info = decode_load_time_class_info(event, data, base_offset)?;
+            state.classes.insert(class_info.class, class_info.name);
+        }
+        "PackageSummary" => {
+            let package = decode_load_time_package_summary(event, data, base_offset)?;
+            state.packages.insert(
+                package.async_package,
+                LoadTimePackageSummary {
+                    async_package: package.async_package,
+                    name: package.name,
+                    total_header_size: package.total_header_size,
+                    import_count: package.import_count,
+                    export_count: package.export_count,
+                    priority: package.priority,
+                },
+            );
+        }
+        "BeginRequest" => {
+            let request = decode_load_time_request_event(event, data, base_offset)?;
+            state.requests.begun += 1;
+            state
+                .open_requests
+                .insert(request.request_id, request.cycle);
+        }
+        "EndRequest" => {
+            let request = decode_load_time_request_event(event, data, base_offset)?;
+            state.requests.ended += 1;
+            let Some(start_cycle) = state.open_requests.remove(&request.request_id) else {
+                state.requests.unmatched_ends += 1;
+                return Ok(());
+            };
+            let duration = request.cycle.saturating_sub(start_cycle);
+            state.requests.completed += 1;
+            state.requests.total_cycles = state.requests.total_cycles.saturating_add(duration);
+            if state.requests.samples.len() < 40 {
+                state.requests.samples.push(LoadTimeRequestSummary {
+                    request_id: request.request_id,
+                    start_cycle,
+                    end_cycle: request.cycle,
+                    duration_cycles: duration,
+                });
+            }
+        }
+        "StartAsyncLoading" | "SuspendAsyncLoading" | "ResumeAsyncLoading" => {
+            let cycle = decode_load_time_cycle(event, data, base_offset)?;
+            match event.event.as_str() {
+                "StartAsyncLoading" => state.async_loading.starts += 1,
+                "SuspendAsyncLoading" => state.async_loading.suspends += 1,
+                "ResumeAsyncLoading" => state.async_loading.resumes += 1,
+                _ => unreachable!("matched async loading events"),
+            }
+            state.async_loading.first_cycle = Some(
+                state
+                    .async_loading
+                    .first_cycle
+                    .map_or(cycle, |first| first.min(cycle)),
+            );
+            state.async_loading.last_cycle = Some(
+                state
+                    .async_loading
+                    .last_cycle
+                    .map_or(cycle, |last| last.max(cycle)),
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+impl LoadTimeState {
+    fn dashboard(mut self) -> LoadingDashboard {
+        self.requests.open = u64::try_from(self.open_requests.len()).unwrap();
+        let mut classes = self
+            .classes
+            .into_iter()
+            .map(|(class, name)| LoadTimeClassSummary { class, name })
+            .collect::<Vec<_>>();
+        classes.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.class.cmp(&right.class))
+        });
+
+        let package_count = u64::try_from(self.packages.len()).unwrap();
+        let mut packages = self.packages.into_values().collect::<Vec<_>>();
+        packages.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.async_package.cmp(&right.async_package))
+        });
+        packages.truncate(80);
+
+        LoadingDashboard {
+            class_count: u64::try_from(classes.len()).unwrap(),
+            classes,
+            package_count,
+            packages,
+            requests: self.requests,
+            async_loading: self.async_loading,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct IoStoreState {
+    backends: BTreeMap<u64, IoStoreBackendState>,
+    requests: BTreeMap<u64, IoStoreRequestState>,
+    requests_created: u64,
+    requests_started: u64,
+    requests_completed: u64,
+    requests_failed: u64,
+    requests_unresolved: u64,
+    bytes_requested: u64,
+    bytes_completed: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct IoStoreBackendState {
+    name: String,
+    starts: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IoStoreRequestState {
+    request_handle: u64,
+    batch_handle: u64,
+    chunk_id_hash: u32,
+    chunk_type: u8,
+    offset: u64,
+    size: u64,
+    backend_handle: Option<u64>,
+    create_cycle: u64,
+    start_cycle: Option<u64>,
+    complete_cycle: Option<u64>,
+    completed_size: Option<u64>,
+    status: IoStoreRequestStatus,
+}
+
+fn decode_io_store_event(
+    event: &EventTypeInfo,
+    data: &[u8],
+    state: &mut IoStoreState,
+    base_offset: u64,
+) -> Result<(), TraceError> {
+    match event.event.as_str() {
+        "BackendName" => {
+            let aux = parse_protocol5_aux(data, event_data_size(event), base_offset)?;
+            let backend_handle = read_u64_field(event, data, "BackendHandle", base_offset)?;
+            let name = read_aux_text(event, &aux, "Name")?;
+            state.backends.entry(backend_handle).or_default().name = name;
+        }
+        "RequestCreate" => {
+            let request = IoStoreRequestState {
+                create_cycle: read_u64_field(event, data, "Cycle", base_offset)?,
+                request_handle: read_u64_field(event, data, "RequestHandle", base_offset)?,
+                batch_handle: read_u64_field(event, data, "BatchHandle", base_offset)?,
+                chunk_id_hash: read_u32_field(event, data, "ChunkIdHash", base_offset)?,
+                chunk_type: read_u8_field(event, data, "ChunkType", base_offset)?,
+                offset: read_u64_field(event, data, "Offset", base_offset)?,
+                size: read_u64_field(event, data, "Size", base_offset)?,
+                backend_handle: None,
+                start_cycle: None,
+                complete_cycle: None,
+                completed_size: None,
+                status: IoStoreRequestStatus::Created,
+            };
+            state.requests_created += 1;
+            state.bytes_requested = state.bytes_requested.saturating_add(request.size);
+            state.requests.insert(request.request_handle, request);
+        }
+        "RequestStarted" => {
+            let cycle = read_u64_field(event, data, "Cycle", base_offset)?;
+            let request_handle = read_u64_field(event, data, "RequestHandle", base_offset)?;
+            let backend_handle = read_u64_field(event, data, "BackendHandle", base_offset)?;
+            state.requests_started += 1;
+            state.backends.entry(backend_handle).or_default().starts += 1;
+            if let Some(request) = state.requests.get_mut(&request_handle) {
+                request.backend_handle = Some(backend_handle);
+                request.start_cycle = Some(cycle);
+                request.status = IoStoreRequestStatus::Started;
+            }
+        }
+        "RequestCompleted" => {
+            let cycle = read_u64_field(event, data, "Cycle", base_offset)?;
+            let request_handle = read_u64_field(event, data, "RequestHandle", base_offset)?;
+            let size = read_u64_field(event, data, "Size", base_offset)?;
+            state.requests_completed += 1;
+            state.bytes_completed = state.bytes_completed.saturating_add(size);
+            if let Some(request) = state.requests.get_mut(&request_handle) {
+                request.complete_cycle = Some(cycle);
+                request.completed_size = Some(size);
+                request.status = IoStoreRequestStatus::Completed;
+            }
+        }
+        "RequestFailed" => {
+            let _cycle = read_u64_field(event, data, "Cycle", base_offset)?;
+            let request_handle = read_u64_field(event, data, "RequestHandle", base_offset)?;
+            state.requests_failed += 1;
+            if let Some(request) = state.requests.get_mut(&request_handle) {
+                request.status = IoStoreRequestStatus::Failed;
+            }
+        }
+        "RequestUnresolved" => {
+            let _cycle = read_u64_field(event, data, "Cycle", base_offset)?;
+            let request_handle = read_u64_field(event, data, "RequestHandle", base_offset)?;
+            state.requests_unresolved += 1;
+            if let Some(request) = state.requests.get_mut(&request_handle) {
+                request.status = IoStoreRequestStatus::Unresolved;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+impl IoStoreState {
+    fn dashboard(self) -> IoStoreDashboard {
+        let backend_names = self
+            .backends
+            .iter()
+            .map(|(handle, backend)| (*handle, backend.name.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut backends = self
+            .backends
+            .iter()
+            .map(|(backend_handle, backend)| IoStoreBackendSummary {
+                backend_handle: *backend_handle,
+                name: backend.name.clone(),
+                starts: backend.starts,
+            })
+            .collect::<Vec<_>>();
+        backends.sort_by(|left, right| {
+            right
+                .starts
+                .cmp(&left.starts)
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.backend_handle.cmp(&right.backend_handle))
+        });
+
+        let mut request_samples = self
+            .requests
+            .into_values()
+            .map(|request| IoStoreRequestSummary {
+                backend_name: request
+                    .backend_handle
+                    .and_then(|handle| backend_names.get(&handle).cloned())
+                    .filter(|name| !name.is_empty()),
+                request_handle: request.request_handle,
+                batch_handle: request.batch_handle,
+                chunk_id_hash: request.chunk_id_hash,
+                chunk_type: request.chunk_type,
+                offset: request.offset,
+                size: request.size,
+                backend_handle: request.backend_handle,
+                create_cycle: request.create_cycle,
+                start_cycle: request.start_cycle,
+                complete_cycle: request.complete_cycle,
+                completed_size: request.completed_size,
+                status: request.status,
+            })
+            .collect::<Vec<_>>();
+        request_samples.sort_by(|left, right| left.create_cycle.cmp(&right.create_cycle));
+        request_samples.truncate(40);
+
+        IoStoreDashboard {
+            backend_count: u64::try_from(backends.len()).unwrap(),
+            backends,
+            requests_created: self.requests_created,
+            requests_started: self.requests_started,
+            requests_completed: self.requests_completed,
+            requests_failed: self.requests_failed,
+            requests_unresolved: self.requests_unresolved,
+            bytes_requested: self.bytes_requested,
+            bytes_completed: self.bytes_completed,
+            request_samples,
+        }
     }
 }
 
@@ -5713,6 +6367,120 @@ struct CpuBatchDecodeState<'a> {
     batch_base_cycle: Option<u64>,
     frame_scope_totals: &'a mut BTreeMap<u32, BTreeMap<u32, (u64, u64)>>,
     thread_scope_totals: &'a mut BTreeMap<u32, (u64, u64)>,
+    timeline: Option<&'a mut CpuTimelineCollector>,
+    thread_id: u16,
+    cycle_frequency: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct CpuTimelineCollector {
+    frame_number: u32,
+    limit: usize,
+    begin_cycle: Option<u64>,
+    end_cycle: Option<u64>,
+    interval_count: u64,
+    truncated: bool,
+    intervals: Vec<CpuTimelineInterval>,
+}
+
+impl CpuTimelineCollector {
+    fn new(frame_number: u32, limit: usize) -> Self {
+        Self {
+            frame_number,
+            limit: limit.max(1),
+            begin_cycle: None,
+            end_cycle: None,
+            interval_count: 0,
+            truncated: false,
+            intervals: Vec::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        thread_id: u16,
+        spec_id: u32,
+        name: String,
+        start_cycle: u64,
+        end_cycle: u64,
+        duration: u64,
+        metadata_id: Option<u32>,
+        rendered_name: Option<String>,
+        cycle_frequency: Option<u64>,
+        active_frame: Option<u32>,
+    ) {
+        if active_frame != Some(self.frame_number) {
+            return;
+        }
+        self.begin_cycle = Some(
+            self.begin_cycle
+                .map_or(start_cycle, |begin| begin.min(start_cycle)),
+        );
+        self.end_cycle = Some(self.end_cycle.map_or(end_cycle, |end| end.max(end_cycle)));
+        self.interval_count += 1;
+        if self.intervals.len() >= self.limit {
+            self.truncated = true;
+            return;
+        }
+        self.intervals.push(CpuTimelineInterval {
+            thread_id,
+            spec_id,
+            name,
+            start_cycle,
+            end_cycle,
+            duration,
+            duration_seconds: cycle_frequency.map(|frequency| duration as f64 / frequency as f64),
+            metadata_id,
+            rendered_name,
+        });
+    }
+
+    fn into_dashboard(self, cycle_frequency: Option<u64>) -> CpuTimelineDashboard {
+        let begin_cycle = self.begin_cycle.unwrap_or(0);
+        let end_cycle = self.end_cycle.unwrap_or(begin_cycle);
+        CpuTimelineDashboard {
+            frame_number: self.frame_number,
+            begin_cycle,
+            end_cycle,
+            duration_seconds: cycle_frequency
+                .map(|frequency| end_cycle.saturating_sub(begin_cycle) as f64 / frequency as f64),
+            interval_count: self.interval_count,
+            truncated: self.truncated,
+            intervals: self.intervals,
+        }
+    }
+}
+
+fn gpu_submission_latency(
+    mut samples: Vec<GpuSubmissionLatencySample>,
+) -> Option<GpuSubmissionLatency> {
+    if samples.is_empty() {
+        return None;
+    }
+    let sample_count = u64::try_from(samples.len()).unwrap_or(u64::MAX);
+    let mut delays = samples
+        .iter()
+        .map(|sample| sample.delay_cycles)
+        .collect::<Vec<_>>();
+    delays.sort_unstable();
+    let median_delay_cycles = delays[delays.len() / 2];
+    let min_delay_cycles = *delays.first().unwrap();
+    let max_delay_cycles = *delays.last().unwrap();
+    if samples.len() > 16 {
+        samples.truncate(16);
+    }
+    Some(GpuSubmissionLatency {
+        sample_count,
+        median_delay_cycles,
+        min_delay_cycles,
+        max_delay_cycles,
+        samples,
+    })
+}
+
+fn submission_delay_cycles(gpu_timestamp_top: u64, cpu_submit_timestamp: u64) -> i128 {
+    i128::from(gpu_timestamp_top) - i128::from(cpu_submit_timestamp)
 }
 
 fn decode_cpu_metadata_spec(
@@ -6252,18 +7020,19 @@ fn decode_cpu_batch(
 ) -> Result<(), TraceError> {
     state.batches.count += 1;
     let mut reader = VarintReader::new(data);
-    if state.thread_state.last_cycle == 0 {
-        if let Some(base_cycle) = state.batch_base_cycle {
-            state.thread_state.last_cycle = base_cycle;
-        }
-    }
+    let base_cycle = state.batch_base_cycle.unwrap_or(0);
 
     while !reader.is_empty() {
         let first = reader.read_u64()?;
         state.batches.decoded_records += 1;
         let mut cycle = first >> 2;
+        // Relative delta against the previous absolute cycle on this thread.
         if cycle < state.thread_state.last_cycle {
             cycle = cycle.saturating_add(state.thread_state.last_cycle);
+        }
+        // Late-connect / missing absolute base (Insights ProcessBufferV2).
+        if cycle < base_cycle {
+            cycle = cycle.saturating_add(base_cycle);
         }
         match first & 0b11 {
             0b00 => {
@@ -6293,6 +7062,26 @@ fn decode_cpu_batch(
                                 );
                             }
                             record_cpu_frame_scope(spec_id, duration, metadata, state);
+                            if let Some(timeline) = state.timeline.as_mut() {
+                                let name = specs
+                                    .get(&spec_id)
+                                    .map(|spec| spec.name.clone())
+                                    .unwrap_or_else(|| format!("#{spec_id}"));
+                                let active_frame =
+                                    state.metadata_stack_context.active_frame_number(metadata);
+                                timeline.record(
+                                    state.thread_id,
+                                    spec_id,
+                                    name,
+                                    entry.start_cycle,
+                                    cycle,
+                                    duration,
+                                    None,
+                                    None,
+                                    state.cycle_frequency,
+                                    active_frame,
+                                );
+                            }
                         }
                         CpuStackEntryKind::Metadata {
                             metadata_id,
@@ -6314,6 +7103,29 @@ fn decode_cpu_batch(
                                 metadata,
                                 state.metadata_interval_state,
                             );
+                            if let Some(timeline) = state.timeline.as_mut() {
+                                let name = specs
+                                    .get(&spec_id)
+                                    .map(|spec| spec.name.clone())
+                                    .unwrap_or_else(|| format!("#{spec_id}"));
+                                let rendered = metadata
+                                    .get(&metadata_id)
+                                    .and_then(|record| record.rendered_name.clone());
+                                let active_frame =
+                                    state.metadata_stack_context.active_frame_number(metadata);
+                                timeline.record(
+                                    state.thread_id,
+                                    spec_id,
+                                    name,
+                                    entry.start_cycle,
+                                    cycle,
+                                    duration,
+                                    Some(metadata_id),
+                                    rendered,
+                                    state.cycle_frequency,
+                                    active_frame,
+                                );
+                            }
                             state.metadata_stack_context.leave_inline(metadata_id);
                         }
                         CpuStackEntryKind::Metadata {
@@ -6599,6 +7411,19 @@ fn read_optional_u32_field(
     }
 }
 
+fn read_optional_i32_field(
+    event: &EventTypeInfo,
+    data: &[u8],
+    name: &str,
+    base_offset: u64,
+) -> Result<Option<i32>, TraceError> {
+    if event.fields.iter().any(|field| field.name == name) {
+        Ok(Some(read_i32_field(event, data, name, base_offset)?))
+    } else {
+        Ok(None)
+    }
+}
+
 fn read_i32_field(
     event: &EventTypeInfo,
     data: &[u8],
@@ -6823,6 +7648,21 @@ fn read_aux_string(
         )
     })?;
     Ok(decode_ansi_bytes(bytes))
+}
+
+fn read_aux_text(
+    event: &EventTypeInfo,
+    aux: &BTreeMap<u8, Vec<u8>>,
+    name: &str,
+) -> Result<String, TraceError> {
+    optional_aux_text(event, aux, name)?.ok_or_else(|| {
+        TraceError::new(
+            TraceErrorKind::MalformedData,
+            0,
+            format!("{}.{}", event.event, name),
+            "event payload is missing required aux text",
+        )
+    })
 }
 
 fn optional_aux_string(
@@ -7450,11 +8290,228 @@ mod tests {
         assert_eq!(class_info.class, 0x1234);
         assert_eq!(class_info.name, "BlueprintGeneratedClass");
 
-        let dashboard =
-            loading_dashboard([(class_info.class, class_info.name)].into_iter().collect());
+        let mut state = LoadTimeState::default();
+        state.classes.insert(class_info.class, class_info.name);
+        let dashboard = state.dashboard();
         assert_eq!(dashboard.class_count, 1);
         assert_eq!(dashboard.classes[0].class, 0x1234);
         assert_eq!(dashboard.classes[0].name, "BlueprintGeneratedClass");
+    }
+
+    #[test]
+    fn summarizes_load_time_packages_and_requests() {
+        let package_event = test_event_type(
+            36,
+            "LoadTime",
+            "PackageSummary",
+            &[
+                regular_field(0, 8, UINT64, "AsyncPackage"),
+                regular_field(8, 4, UINT32, "TotalHeaderSize"),
+                regular_field(12, 4, UINT32, "ImportCount"),
+                regular_field(16, 4, UINT32, "ExportCount"),
+                regular_field(20, 0, WIDE_STRING, "Name"),
+                regular_field(20, 4, INT32, "Priority"),
+            ],
+        );
+        let begin_event = test_event_type(
+            37,
+            "LoadTime",
+            "BeginRequest",
+            &[
+                regular_field(0, 8, UINT64, "Cycle"),
+                regular_field(8, 8, UINT64, "RequestId"),
+            ],
+        );
+        let end_event = test_event_type(
+            38,
+            "LoadTime",
+            "EndRequest",
+            &[
+                regular_field(0, 8, UINT64, "Cycle"),
+                regular_field(8, 8, UINT64, "RequestId"),
+            ],
+        );
+        let start_async_event = test_event_type(
+            39,
+            "LoadTime",
+            "StartAsyncLoading",
+            &[regular_field(0, 8, UINT64, "Cycle")],
+        );
+        let suspend_async_event = test_event_type(
+            40,
+            "LoadTime",
+            "SuspendAsyncLoading",
+            &[regular_field(0, 8, UINT64, "Cycle")],
+        );
+        let resume_async_event = test_event_type(
+            41,
+            "LoadTime",
+            "ResumeAsyncLoading",
+            &[regular_field(0, 8, UINT64, "Cycle")],
+        );
+
+        let mut state = LoadTimeState::default();
+
+        let mut package_data = Vec::new();
+        package_data.extend_from_slice(&0xabc_u64.to_le_bytes());
+        package_data.extend_from_slice(&512_u32.to_le_bytes());
+        package_data.extend_from_slice(&3_u32.to_le_bytes());
+        package_data.extend_from_slice(&7_u32.to_le_bytes());
+        package_data.extend_from_slice(&42_i32.to_le_bytes());
+        package_data.extend_from_slice(&aux(4, &wide("/Game/Map")));
+        package_data.push(3);
+        decode_load_time_event(&package_event, &package_data, &mut state, 0).unwrap();
+
+        let mut begin_data = Vec::new();
+        begin_data.extend_from_slice(&100_u64.to_le_bytes());
+        begin_data.extend_from_slice(&77_u64.to_le_bytes());
+        decode_load_time_event(&begin_event, &begin_data, &mut state, 0).unwrap();
+
+        let mut end_data = Vec::new();
+        end_data.extend_from_slice(&140_u64.to_le_bytes());
+        end_data.extend_from_slice(&77_u64.to_le_bytes());
+        decode_load_time_event(&end_event, &end_data, &mut state, 0).unwrap();
+
+        decode_load_time_event(&start_async_event, &10_u64.to_le_bytes(), &mut state, 0).unwrap();
+        decode_load_time_event(&suspend_async_event, &30_u64.to_le_bytes(), &mut state, 0).unwrap();
+        decode_load_time_event(&resume_async_event, &50_u64.to_le_bytes(), &mut state, 0).unwrap();
+
+        let dashboard = state.dashboard();
+        assert_eq!(dashboard.package_count, 1);
+        assert_eq!(dashboard.packages[0].async_package, 0xabc);
+        assert_eq!(dashboard.packages[0].name, "/Game/Map");
+        assert_eq!(dashboard.packages[0].priority, Some(42));
+        assert_eq!(dashboard.requests.begun, 1);
+        assert_eq!(dashboard.requests.completed, 1);
+        assert_eq!(dashboard.requests.total_cycles, 40);
+        assert_eq!(dashboard.requests.samples[0].request_id, 77);
+        assert_eq!(dashboard.async_loading.starts, 1);
+        assert_eq!(dashboard.async_loading.suspends, 1);
+        assert_eq!(dashboard.async_loading.resumes, 1);
+        assert_eq!(dashboard.async_loading.first_cycle, Some(10));
+        assert_eq!(dashboard.async_loading.last_cycle, Some(50));
+    }
+
+    #[test]
+    fn summarizes_io_store_request_lifecycle() {
+        let backend_event = test_event_type(
+            42,
+            "IoStore",
+            "BackendName",
+            &[
+                regular_field(0, 8, UINT64, "BackendHandle"),
+                regular_field(8, 0, WIDE_STRING, "Name"),
+            ],
+        );
+        let create_event = test_event_type(
+            43,
+            "IoStore",
+            "RequestCreate",
+            &[
+                regular_field(0, 8, UINT64, "Cycle"),
+                regular_field(8, 8, UINT64, "RequestHandle"),
+                regular_field(16, 8, UINT64, "BatchHandle"),
+                regular_field(24, 4, UINT32, "ChunkIdHash"),
+                regular_field(28, 1, UINT8, "ChunkType"),
+                regular_field(29, 4, UINT32, "CallstackId"),
+                regular_field(33, 8, UINT64, "Offset"),
+                regular_field(41, 8, UINT64, "Size"),
+            ],
+        );
+        let started_event = test_event_type(
+            44,
+            "IoStore",
+            "RequestStarted",
+            &[
+                regular_field(0, 8, UINT64, "Cycle"),
+                regular_field(8, 8, UINT64, "RequestHandle"),
+                regular_field(16, 8, UINT64, "BackendHandle"),
+            ],
+        );
+        let completed_event = test_event_type(
+            45,
+            "IoStore",
+            "RequestCompleted",
+            &[
+                regular_field(0, 8, UINT64, "Cycle"),
+                regular_field(8, 8, UINT64, "RequestHandle"),
+                regular_field(16, 8, UINT64, "Size"),
+            ],
+        );
+
+        let mut state = IoStoreState::default();
+
+        let mut backend_data = Vec::new();
+        backend_data.extend_from_slice(&0xbeef_u64.to_le_bytes());
+        backend_data.extend_from_slice(&aux(1, &wide("FileBackend")));
+        backend_data.push(3);
+        decode_io_store_event(&backend_event, &backend_data, &mut state, 0).unwrap();
+
+        let mut create_data = Vec::new();
+        create_data.extend_from_slice(&100_u64.to_le_bytes());
+        create_data.extend_from_slice(&0x111_u64.to_le_bytes());
+        create_data.extend_from_slice(&0x222_u64.to_le_bytes());
+        create_data.extend_from_slice(&0x333_u32.to_le_bytes());
+        create_data.push(4);
+        create_data.extend_from_slice(&0_u32.to_le_bytes());
+        create_data.extend_from_slice(&16_u64.to_le_bytes());
+        create_data.extend_from_slice(&4096_u64.to_le_bytes());
+        decode_io_store_event(&create_event, &create_data, &mut state, 0).unwrap();
+
+        let mut started_data = Vec::new();
+        started_data.extend_from_slice(&120_u64.to_le_bytes());
+        started_data.extend_from_slice(&0x111_u64.to_le_bytes());
+        started_data.extend_from_slice(&0xbeef_u64.to_le_bytes());
+        decode_io_store_event(&started_event, &started_data, &mut state, 0).unwrap();
+
+        let mut completed_data = Vec::new();
+        completed_data.extend_from_slice(&160_u64.to_le_bytes());
+        completed_data.extend_from_slice(&0x111_u64.to_le_bytes());
+        completed_data.extend_from_slice(&2048_u64.to_le_bytes());
+        decode_io_store_event(&completed_event, &completed_data, &mut state, 0).unwrap();
+
+        let dashboard = state.dashboard();
+        assert_eq!(dashboard.backend_count, 1);
+        assert_eq!(dashboard.backends[0].name, "FileBackend");
+        assert_eq!(dashboard.backends[0].starts, 1);
+        assert_eq!(dashboard.requests_created, 1);
+        assert_eq!(dashboard.requests_started, 1);
+        assert_eq!(dashboard.requests_completed, 1);
+        assert_eq!(dashboard.bytes_requested, 4096);
+        assert_eq!(dashboard.bytes_completed, 2048);
+        assert_eq!(dashboard.request_samples[0].request_handle, 0x111);
+        assert_eq!(
+            dashboard.request_samples[0].backend_name.as_deref(),
+            Some("FileBackend")
+        );
+        assert_eq!(
+            dashboard.request_samples[0].status,
+            IoStoreRequestStatus::Completed
+        );
+    }
+
+    #[test]
+    fn submission_latency_handles_extreme_file_timestamps_without_overflow() {
+        assert_eq!(submission_delay_cycles(u64::MAX, 0), i128::from(u64::MAX));
+        assert_eq!(submission_delay_cycles(0, u64::MAX), -i128::from(u64::MAX));
+        let samples = vec![
+            GpuSubmissionLatencySample {
+                queue_id: 0,
+                gpu_timestamp_top: u64::MAX,
+                cpu_submit_timestamp: 0,
+                delay_cycles: i128::from(u64::MAX),
+            },
+            GpuSubmissionLatencySample {
+                queue_id: 1,
+                gpu_timestamp_top: 0,
+                cpu_submit_timestamp: u64::MAX,
+                delay_cycles: -i128::from(u64::MAX),
+            },
+        ];
+
+        let summary = gpu_submission_latency(samples).expect("latency summary");
+        assert_eq!(summary.min_delay_cycles, -i128::from(u64::MAX));
+        assert_eq!(summary.max_delay_cycles, i128::from(u64::MAX));
     }
 
     #[test]
@@ -7795,6 +8852,9 @@ mod tests {
             batch_base_cycle: None,
             frame_scope_totals: &mut frame_scope_totals,
             thread_scope_totals: &mut thread_scope_totals,
+            timeline: None,
+            thread_id: 0,
+            cycle_frequency: None,
         };
 
         decode_cpu_batch(&data, &specs, &BTreeMap::new(), &mut state).unwrap();
@@ -7847,6 +8907,9 @@ mod tests {
                 batch_base_cycle: None,
                 frame_scope_totals: &mut frame_scope_totals,
                 thread_scope_totals: &mut thread_scope_totals,
+                timeline: None,
+                thread_id: 0,
+                cycle_frequency: None,
             };
             decode_cpu_batch(batch, &specs, &BTreeMap::new(), &mut state).unwrap();
         }
@@ -7895,11 +8958,15 @@ mod tests {
             batch_base_cycle: Some(1_000),
             frame_scope_totals: &mut frame_scope_totals,
             thread_scope_totals: &mut thread_scope_totals,
+            timeline: None,
+            thread_id: 0,
+            cycle_frequency: None,
         };
 
         decode_cpu_batch(&data, &specs, &BTreeMap::new(), &mut state).unwrap();
 
         assert_eq!(batches.intervals, 1);
+        // Relative deltas 25 then 15 against base 1000 → absolute 1025..1040.
         assert_eq!(scope_totals[&1], (1, 15));
         assert_eq!(thread_state.last_cycle, 1_040);
     }
@@ -7997,6 +9064,9 @@ mod tests {
                 batch_base_cycle: None,
                 frame_scope_totals: &mut frame_scope_totals,
                 thread_scope_totals: &mut thread_scope_totals,
+                timeline: None,
+                thread_id: 0,
+                cycle_frequency: None,
             };
 
             decode_cpu_batch(&data, &specs, &metadata, &mut state).unwrap();
