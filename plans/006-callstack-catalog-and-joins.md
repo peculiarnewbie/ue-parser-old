@@ -12,9 +12,13 @@
 - **Priority**: P0
 - **Effort**: L (multi-day, but much smaller than symbolization)
 - **Risk**: MED (large catalogs and aux-array wire decoding)
-- **Depends on**: none; integrate carefully with plan 003 if it is still active
+- **Depends on**: none; plan 003 is DONE — join via existing `MemoryAllocationSample.callstack_id`
 - **Category**: direction
 - **Planned at**: commit `82a0968`, 2026-07-12
+- **Status**: DONE
+- **Drift check**: `utrace.rs` / coverage matrix grew (memory LLM + dashboard), but
+  bookmark `callstack_count` and allocation `callstack_id` fields are unchanged;
+  `CallstackSpec` still absent. Safe to proceed.
 
 ## Why this matters
 

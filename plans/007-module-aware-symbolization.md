@@ -11,9 +11,54 @@
 - **Priority**: P0
 - **Effort**: L/XL (platform and toolchain dependent)
 - **Risk**: HIGH (wrong-build symbols are worse than unresolved addresses)
-- **Depends on**: plan 006
+- **Depends on**: plan 006 (DONE)
 - **Category**: direction
 - **Planned at**: commit `82a0968`, 2026-07-12
+- **Status**: DONE (2026-07-12)
+- **Delivered**:
+  - `src/utrace_modules.rs` — ModuleInit/Load/Unload, base-shift reconstruct, map → mapped/unmapped/ambiguous, ImageId → GUID+age
+  - `src/utrace_symbols.rs` — `SymbolResolver` seam, bounded `SymbolCache`, `map_frame`, CLI enrichment; `PdbSymbolResolver` behind `utrace-symbols`
+  - Dashboard `modules` + callstack `mapped_frames` (raw hex `frames` preserved)
+  - CLI repeatable `--symbol-path` (errors without `utrace-symbols`)
+  - Tiny probe PDB unit tests (build `tests/fixtures/symbols/probe.rs` at test time)
+  - Ignored fixture: studio `targeted-providers.utrace` fallback; ≥3 module-mapped frames; optional `UTRACE_SYMBOL_PATH` symbolization
+
+## Spike decision (2026-07-12) — PROCEED
+
+### Fixture facts (`targeted-providers.utrace`)
+
+| Event | Observed | Declared fields | Sample notes |
+|-------|----------|-----------------|--------------|
+| `Diagnostics.ModuleInit` | 1 | `SymbolFormat: ansi_string`, `ModuleBaseShift: uint8` | `SymbolFormat="pdb"`, `ModuleBaseShift=0` |
+| `Diagnostics.ModuleLoad` | 601 | `Name: wide_string`, `Base: uint64`, `Size: uint32`, `ImageId: array` | e.g. `UnrealEditor-Cmd.exe`, Size=524288, ImageId 20 bytes |
+| `Diagnostics.ModuleUnload` | 7 | `Base: uint64` | present |
+| `Memory.CallstackSpec` | 963344 | (plan 006) | retained catalog available |
+
+ImageId sample hex: `7fce1bf5888c1e43ada14a8298916b8c01000000` = Microsoft in-memory GUID (16) + Age LE u32 (=1).
+
+### Insights parity (`ModuleAnalysis.cpp`)
+
+- Base reconstruction: if `ModuleBaseShift == 0`, use `Base` as `uint64`; else treat `Base` as `uint32` and compute `Base << ModuleBaseShift`.
+- Module provider is only created after `ModuleInit` supplies `SymbolFormat`.
+- Windows emitter (`WindowsModuleDiagnostics.cpp`) copies CodeView RSDS Guid+Age into ImageId (20 bytes).
+
+### Backend choice
+
+| Option | License | Offline | Identity check | Line info | Verdict |
+|--------|---------|---------|----------------|-----------|---------|
+| `pdb-addr2line` 0.12 + `pdb` 0.8 | Apache-2.0 / MIT-Apache | yes | GUID+age via `PDBInformation` (convert MS GUID byte order) | yes + inlines | **Selected** |
+| `symbolic` (Sentry) | MIT | yes | yes | yes | heavier; defer |
+| DIA/dbghelp FFI | MS | yes | yes | yes | avoid unsafe + platform glue for v1 |
+
+**Proven**: local `UnrealEditor-Cmd.pdb` age=1 and GUID `f51bce7f-8c88-431e-ada1-4a8298916b8c` match the fixture ImageId after MS→UUID field conversion. Wrong/mutated PDB can be rejected.
+
+**Gate result**: proceed with module catalog + optional Windows/PDB resolver. Non-`pdb` `SymbolFormat` values stay module+offset only (no fake decoding).
+
+### Architecture
+
+- Library (`utrace`): decode modules, map PC → `{module, relative_address}`; filesystem-free.
+- Optional feature `utrace-symbols`: `pdb-addr2line` backend.
+- CLI: repeatable `--symbol-path`; never network-search by default.
 
 ## Why this matters
 
@@ -98,6 +143,25 @@ Allow memory and bookmark views to look up resolved stacks by id. Document the
 supported platform/toolchain, symbol search order, privacy implications of
 source paths, cache bounds, and the fact that optimized/inlined frames may not
 match source expectations exactly.
+
+#### Limitations (shipped)
+
+- **Platform**: Windows/PDB only (`SymbolFormat::Pdb`). `dwarf` / `psym` /
+  `other` stay module+offset; no fake decoding.
+- **Search order** (`--symbol-path`, repeatable): for each root, try
+  `{stem}.pdb` then `{module basename with .pdb}`. No recursive walk, no
+  network / symbol-server fetch.
+- **Identity**: PDB GUID+age must match traced ImageId (MS→UUID conversion).
+  Mismatch → `identity_mismatch`; missing file → `symbols_missing` /
+  `module_offset` remains valid.
+- **Privacy**: resolved `file` paths come from the PDB and may contain local
+  studio absolute paths; treat dashboard JSON as sensitive when symbols are on.
+- **Cache**: bounded per-identity relative-address cache; does not grow with
+  every allocation sample (only retained catalog stacks are enriched).
+- **Inlines / optimized code**: `pdb-addr2line` may report inline frames; names
+  need not match naive source expectations. Raw PCs always remain in `frames`.
+- **Library boundary**: `utrace` parsing stays filesystem-free; only the CLI
+  (or app) opens PDBs when `--symbol-path` is set.
 
 ## Final verification
 

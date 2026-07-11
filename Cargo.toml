@@ -16,6 +16,7 @@ path = "src/bin/uasset.rs"
 
 [dependencies]
 lz4_flex = { version = "0.11", optional = true, default-features = false }
+pdb-addr2line = { version = "0.12", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
@@ -23,6 +24,7 @@ serde_json = "1.0"
 default = ["uasset"]
 uasset = []
 utrace = ["dep:lz4_flex"]
+utrace-symbols = ["utrace", "dep:pdb-addr2line"]
 
 [lints.rust]
 unsafe_code = "forbid"

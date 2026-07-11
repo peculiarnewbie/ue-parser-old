@@ -72,7 +72,7 @@ The area-level status table below is the human narrative layer on top of that.
 | Logs/diagnostics | partial | `Logging.LogCategory`, `Logging.LogMessageSpec`, `Logging.LogMessage`, `Diagnostics.Session2` | `logging.categories`, `logging.message_specs`, `logging.verbosity`, `logging.top_categories`, `logging.top_messages`, `session` | Dashboard decodes the log category catalog (name + default verbosity), message specs (log points) resolved to file/line/format/category, per-verbosity spec and message counts, and message counts per log point. It renders simple `%s` sample log arguments and formats the `Diagnostics.Session2` instance id as a GUID. Full printf argument expansion, per-message timelines, and `Diagnostics.Session` (v1) are not decoded. |
 | Metadata stack | partial | `MetadataStack.ClearScope`, `MetadataStack.SaveStack`, `MetadataStack.RestoreStack` | `metadata_stack`, `cpu.metadata` | Clear-scope events, saved stack ids, restored stack ids, per-id save/restore counts, and restores without an observed save are counted. Per-thread restored metadata contexts are conservatively applied to later plain CPU profiler scopes and surfaced through `cpu.batches.restored_metadata_scopes`; event ordering is preserved across CPU batch flushes. |
 | Slate | partial | `SlateTrace.AddWidget` | `slate.widgets` | Widget add events are counted by widget id with cycle bounds. Full Slate analysis is not decoded yet. |
-| Callstacks | not parsed | `Callstack.*` | none | Callstack symbols and stack references are not decoded yet. |
+| Callstacks | partial | `Memory.CallstackSpec`, `Diagnostics.ModuleInit` / `ModuleLoad` / `ModuleUnload` | `callstacks`, `modules`, `memory.allocs.samples.callstack`, `annotations.bookmarks[].callstack_samples` | Bounded raw PC catalog + id joins (`none` / `resolved` / `missing` / `catalog_truncated`). Module mapping fills `mapped_frames` (module+offset / unmapped / ambiguous). Optional Windows PDB symbolization via feature `utrace-symbols` + CLI `--symbol-path` (GUID+age checked; no network). |
 
 ## Current dashboard subset
 
@@ -101,6 +101,10 @@ emits:
 - load-time class catalog plus package/request/async-loading summaries when present
 - IoStore backend/request lifecycle summaries when present
 - memory scope tag counts
+- bounded raw callstack catalog with hex program-counter frames, module-mapped
+  `mapped_frames`, optional PDB enrichment via `--symbol-path`, and id joins on
+  allocation/bookmark samples
+- module catalog (`Diagnostics.Module*`) with GUID+age identity when present
 - metadata stack clear/save/restore counts
 - Slate widget add counts
 - trace channel summaries
@@ -149,9 +153,9 @@ The parser is already useful for automated summaries and first-pass hitch
 triage. For day-to-day performance investigation, these are the main remaining
 gaps, in priority order:
 
-1. **Callstacks and symbolization** — decode `Callstack.*`, resolve modules and
-   addresses, and attach readable stacks to allocations, bookmarks, and other
-   callstack-bearing events.
+1. **Readable callstack depth** — module+offset and optional PDB names land on
+   retained catalog stacks; still no capture-wide symbol index, DWARF backends,
+   or Insights-parity UI for every dropped stack beyond the retain caps.
 2. **Capture-wide timeline queries** — support indexed arbitrary time ranges,
    filtering, searching, zooming, and repeated frame navigation without
    reparsing the full capture. Keep storage bounded or use a sidecar rather than
