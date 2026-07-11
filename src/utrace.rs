@@ -5,7 +5,10 @@ use std::fmt;
 
 use serde::Serialize;
 
-use crate::utrace_memory::{MemoryAllocation, MemoryFree, MemoryInit, MemoryProvider, MemoryTag};
+use crate::utrace_memory::{
+    LlmTag, LlmTagSet, LlmTracker, MemoryAllocation, MemoryFree, MemoryInit, MemoryProvider,
+    MemoryTag,
+};
 use crate::{ArchiveError, ArchiveErrorKind, Reader};
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -963,21 +966,46 @@ pub struct MemoryLlmDashboard {
     pub tracker_count: u64,
     pub tag_set_count: u64,
     pub sample_events: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub tag_overflow: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<MemoryLlmTagSummary>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trackers: Vec<MemoryLlmTrackerSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tag_sets: Vec<MemoryLlmTagSetSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub latest_values: Vec<MemoryLlmValueSummary>,
+    pub latest_values_overflow: bool,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub latest_values_dropped: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct MemoryLlmTagSummary {
-    pub tag: i32,
+    pub tag: i64,
+    pub parent: i64,
+    pub tag_set: u8,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MemoryLlmTrackerSummary {
+    pub tracker_id: u8,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MemoryLlmTagSetSummary {
+    pub tag_set: u8,
     pub name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct MemoryLlmValueSummary {
-    pub tag: i32,
+    pub tracker_id: u8,
+    pub cycle: u64,
+    pub tag: i64,
     pub value: i64,
 }
 
@@ -1856,6 +1884,12 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
     },
     EventCoverage {
         logger: "Memory",
+        event: "ReallocAllocVideo",
+        status: DecodeStatus::Partial,
+        note: "Video-root reallocation allocation summary.",
+    },
+    EventCoverage {
+        logger: "Memory",
         event: "ReallocFree",
         status: DecodeStatus::Partial,
         note: "Root-heap reallocation frees paired only against bounded tracked addresses.",
@@ -1865,6 +1899,36 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
         event: "ReallocFreeSystem",
         status: DecodeStatus::Partial,
         note: "System-root reallocation frees paired only against bounded tracked addresses.",
+    },
+    EventCoverage {
+        logger: "Memory",
+        event: "ReallocFreeVideo",
+        status: DecodeStatus::Partial,
+        note: "Video-root reallocation frees paired only against bounded tracked addresses.",
+    },
+    EventCoverage {
+        logger: "LLM",
+        event: "TagsSpec",
+        status: DecodeStatus::Partial,
+        note: "Bounded LLM tag catalog with parent and tag-set metadata.",
+    },
+    EventCoverage {
+        logger: "LLM",
+        event: "TrackerSpec",
+        status: DecodeStatus::Partial,
+        note: "LLM tracker catalog with names.",
+    },
+    EventCoverage {
+        logger: "LLM",
+        event: "TagSetSpec",
+        status: DecodeStatus::Partial,
+        note: "LLM tag-set catalog with names.",
+    },
+    EventCoverage {
+        logger: "LLM",
+        event: "TagValue",
+        status: DecodeStatus::Partial,
+        note: "Latest LLM tag values by tracker with bounded retained tags per sample and globally.",
     },
     EventCoverage {
         logger: "MetadataStack",
@@ -2965,6 +3029,27 @@ fn read_dashboard_events(
                         raw_event.offset + 4,
                     )?);
                 }
+                ("LLM", "TagsSpec") => {
+                    memory.record_llm_tag(decode_llm_tag(
+                        event,
+                        raw_event.data,
+                        raw_event.offset + 4,
+                    )?);
+                }
+                ("LLM", "TrackerSpec") => {
+                    memory.record_llm_tracker(decode_llm_tracker(
+                        event,
+                        raw_event.data,
+                        raw_event.offset + 4,
+                    )?);
+                }
+                ("LLM", "TagSetSpec") => {
+                    memory.record_llm_tag_set(decode_llm_tag_set(
+                        event,
+                        raw_event.data,
+                        raw_event.offset + 4,
+                    )?);
+                }
                 ("MetadataStack", "ClearScope" | "SaveStack" | "RestoreStack") => {
                     decode_metadata_stack_event(
                         event,
@@ -3130,6 +3215,14 @@ fn read_dashboard_events(
                 }
                 _ => {}
             }
+        } else if (event.logger.as_str(), event.event.as_str()) == ("LLM", "TagValue") {
+            let sample = decode_llm_tag_values(event, &raw_event.data, 0)?;
+            memory.record_llm_tag_values(
+                sample.tracker_id,
+                sample.cycle,
+                &sample.values,
+                sample.dropped_values,
+            );
         } else if event.logger.as_str() == "MetadataStack" {
             decode_metadata_stack_event(event, &raw_event.data, &mut metadata_stack, 0)?;
             apply_metadata_stack_event_to_cpu_context(
@@ -5153,6 +5246,171 @@ fn decode_memory_free(
         address: read_u64_field(event, data, "Address", base_offset)?,
         root_heap,
         is_realloc: event.event.starts_with("Realloc"),
+    })
+}
+
+const MAX_LLM_VALUES_PER_EVENT: usize = 4_096;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LlmTagValueSample {
+    tracker_id: u8,
+    cycle: u64,
+    values: Vec<(i64, i64)>,
+    dropped_values: u64,
+}
+
+fn decode_llm_tag(
+    event: &EventTypeInfo,
+    data: &[u8],
+    base_offset: u64,
+) -> Result<LlmTag, TraceError> {
+    let aux = parse_protocol5_aux(data, event_data_size(event), base_offset)?;
+    Ok(LlmTag {
+        tag: read_llm_tag_id_field(event, data, "TagId", base_offset)?,
+        parent: read_llm_tag_id_field(event, data, "ParentId", base_offset)?,
+        tag_set: read_u8_field(event, data, "TagSetId", base_offset)?,
+        name: read_aux_string(event, &aux, "Name")?,
+    })
+}
+
+fn decode_llm_tracker(
+    event: &EventTypeInfo,
+    data: &[u8],
+    base_offset: u64,
+) -> Result<LlmTracker, TraceError> {
+    let aux = parse_protocol5_aux(data, event_data_size(event), base_offset)?;
+    Ok(LlmTracker {
+        tracker_id: read_u8_field(event, data, "TrackerId", base_offset)?,
+        name: read_aux_string(event, &aux, "Name")?,
+    })
+}
+
+fn decode_llm_tag_set(
+    event: &EventTypeInfo,
+    data: &[u8],
+    base_offset: u64,
+) -> Result<LlmTagSet, TraceError> {
+    let aux = parse_protocol5_aux(data, event_data_size(event), base_offset)?;
+    Ok(LlmTagSet {
+        tag_set: read_u8_field(event, data, "TagSetId", base_offset)?,
+        name: read_aux_string(event, &aux, "Name")?,
+    })
+}
+
+fn decode_llm_tag_values(
+    event: &EventTypeInfo,
+    data: &[u8],
+    base_offset: u64,
+) -> Result<LlmTagValueSample, TraceError> {
+    let aux = parse_protocol5_aux(data, event_data_size(event), base_offset)?;
+    let tags = read_required_aux_bytes(event, &aux, "Tags")?;
+    let values = read_required_aux_bytes(event, &aux, "Values")?;
+    if values.len() % size_of::<i64>() != 0 {
+        return Err(TraceError::new(
+            TraceErrorKind::MalformedData,
+            base_offset,
+            "LLM.TagValue.Values",
+            format!(
+                "{} byte Values array is not a whole number of i64 values",
+                values.len()
+            ),
+        ));
+    }
+
+    let count = values.len() / size_of::<i64>();
+    let tag_width = if tags.len() == count * size_of::<i64>() {
+        size_of::<i64>()
+    } else if tags.len() == count * size_of::<u32>() {
+        size_of::<u32>()
+    } else {
+        return Err(TraceError::new(
+            TraceErrorKind::MalformedData,
+            base_offset,
+            "LLM.TagValue.Tags",
+            format!(
+                "{} byte Tags array does not match {count} i64 values",
+                tags.len()
+            ),
+        ));
+    };
+
+    let retained_count = count.min(MAX_LLM_VALUES_PER_EVENT);
+    let mut decoded = Vec::with_capacity(retained_count);
+    for index in 0..retained_count {
+        let tag_offset = index * tag_width;
+        let tag = match tag_width {
+            4 => i64::from(u32::from_le_bytes(
+                tags[tag_offset..tag_offset + 4]
+                    .try_into()
+                    .expect("LLM tag width was validated"),
+            )),
+            8 => i64::from_le_bytes(
+                tags[tag_offset..tag_offset + 8]
+                    .try_into()
+                    .expect("LLM tag width was validated"),
+            ),
+            _ => unreachable!("LLM tag width is constrained to 4 or 8"),
+        };
+        let value_offset = index * size_of::<i64>();
+        let value = i64::from_le_bytes(
+            values[value_offset..value_offset + size_of::<i64>()]
+                .try_into()
+                .expect("LLM value width was validated"),
+        );
+        decoded.push((tag, value));
+    }
+
+    Ok(LlmTagValueSample {
+        tracker_id: read_u8_field(event, data, "TrackerId", base_offset)?,
+        cycle: read_u64_field(event, data, "Cycle", base_offset)?,
+        values: decoded,
+        dropped_values: u64::try_from(count - retained_count).unwrap_or(u64::MAX),
+    })
+}
+
+fn read_llm_tag_id_field(
+    event: &EventTypeInfo,
+    data: &[u8],
+    name: &str,
+    base_offset: u64,
+) -> Result<i64, TraceError> {
+    let field = find_field(event, name)?;
+    match field.size {
+        4 => Ok(i64::from(read_u32_field(event, data, name, base_offset)?)),
+        8 => read_i64_field(event, data, name, base_offset),
+        size => Err(TraceError::new(
+            TraceErrorKind::MalformedData,
+            base_offset + u64::from(field.offset),
+            format!("{}.{}", event.event, name),
+            format!("expected 4 or 8 byte LLM tag id, got {size}"),
+        )),
+    }
+}
+
+fn read_required_aux_bytes<'a>(
+    event: &EventTypeInfo,
+    aux: &'a BTreeMap<u8, Vec<u8>>,
+    name: &str,
+) -> Result<&'a [u8], TraceError> {
+    let index = event
+        .fields
+        .iter()
+        .position(|field| field.name == name)
+        .ok_or_else(|| {
+            TraceError::new(
+                TraceErrorKind::MalformedData,
+                0,
+                format!("{}.{}", event.event, name),
+                "declared event is missing required aux array field",
+            )
+        })?;
+    aux.get(&(index as u8)).map(Vec::as_slice).ok_or_else(|| {
+        TraceError::new(
+            TraceErrorKind::MalformedData,
+            0,
+            format!("{}.{}", event.event, name),
+            "event payload is missing required aux array",
+        )
     })
 }
 
@@ -9281,6 +9539,100 @@ mod tests {
         assert_eq!(slate.widgets[0].widget_id, 0xfeed);
         assert_eq!(slate.widgets[0].first_cycle, Some(1000));
         assert_eq!(slate.widgets[0].last_cycle, Some(1100));
+    }
+
+    #[test]
+    fn decodes_llm_catalog_and_tag_value_arrays() {
+        let tag_event = test_event_type(
+            70,
+            "LLM",
+            "TagsSpec",
+            &[
+                regular_field(0, 8, UINT64, "TagId"),
+                regular_field(8, 8, UINT64, "ParentId"),
+                regular_field(16, 1, UINT8, "TagSetId"),
+                regular_field(17, 0, ANSI_STRING, "Name"),
+            ],
+        );
+        let tracker_event = test_event_type(
+            71,
+            "LLM",
+            "TrackerSpec",
+            &[
+                regular_field(0, 1, UINT8, "TrackerId"),
+                regular_field(1, 0, ANSI_STRING, "Name"),
+            ],
+        );
+        let tag_set_event = test_event_type(
+            72,
+            "LLM",
+            "TagSetSpec",
+            &[
+                regular_field(0, 1, UINT8, "TagSetId"),
+                regular_field(1, 0, ANSI_STRING, "Name"),
+            ],
+        );
+        let values_event = test_event_type(
+            73,
+            "LLM",
+            "TagValue",
+            &[
+                regular_field(0, 1, UINT8, "TrackerId"),
+                regular_field(1, 8, UINT64, "Cycle"),
+                regular_field(9, 0, ARRAY, "Tags"),
+                regular_field(9, 0, ARRAY, "Values"),
+            ],
+        );
+
+        let mut tag_data = Vec::new();
+        tag_data.extend_from_slice(&101_i64.to_le_bytes());
+        tag_data.extend_from_slice(&100_i64.to_le_bytes());
+        tag_data.push(2);
+        tag_data.extend_from_slice(&aux(3, b"Textures"));
+        tag_data.push(3);
+        let tag = decode_llm_tag(&tag_event, &tag_data, 0).unwrap();
+        assert_eq!(tag.tag, 101);
+        assert_eq!(tag.parent, 100);
+        assert_eq!(tag.tag_set, 2);
+        assert_eq!(tag.name, "Textures");
+
+        let mut tracker_data = vec![1];
+        tracker_data.extend_from_slice(&aux(1, b"Platform"));
+        tracker_data.push(3);
+        assert_eq!(
+            decode_llm_tracker(&tracker_event, &tracker_data, 0)
+                .unwrap()
+                .name,
+            "Platform"
+        );
+
+        let mut tag_set_data = vec![2];
+        tag_set_data.extend_from_slice(&aux(1, b"Assets"));
+        tag_set_data.push(3);
+        assert_eq!(
+            decode_llm_tag_set(&tag_set_event, &tag_set_data, 0)
+                .unwrap()
+                .name,
+            "Assets"
+        );
+
+        let mut tags_data = Vec::new();
+        tags_data.extend_from_slice(&101_u32.to_le_bytes());
+        tags_data.extend_from_slice(&202_u32.to_le_bytes());
+        let mut values_data = Vec::new();
+        values_data.extend_from_slice(&64_i64.to_le_bytes());
+        values_data.extend_from_slice(&(-16_i64).to_le_bytes());
+        let mut sample_data = vec![1];
+        sample_data.extend_from_slice(&700_u64.to_le_bytes());
+        sample_data.extend_from_slice(&aux(2, &tags_data));
+        sample_data.extend_from_slice(&aux(3, &values_data));
+        sample_data.push(3);
+
+        let sample = decode_llm_tag_values(&values_event, &sample_data, 0).unwrap();
+        assert_eq!(sample.tracker_id, 1);
+        assert_eq!(sample.cycle, 700);
+        assert_eq!(sample.values, vec![(101, 64), (202, -16)]);
+        assert_eq!(sample.dropped_values, 0);
     }
 
     #[test]

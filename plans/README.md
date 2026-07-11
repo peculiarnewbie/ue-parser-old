@@ -16,6 +16,8 @@ even though that family is absent from the CPU-frame fixture.
 | P1 | Uncapped / configurable frame correlation | parser | [002](002-timelines-and-frame-caps.md) |
 | P1 | Counter / Stats / CSV sample streams | parser + fixture | [004](004-counter-stats-csv-samples.md) |
 | P1 | Wait / TaskTrace + thread-group membership | parser + fixture | [005](005-tasktrace-waits-thread-groups.md) |
+| P0 | Raw callstack catalog + consumer joins | parser + fixture | [006](006-callstack-catalog-and-joins.md) |
+| P0 | Module-aware symbolization | parser + optional tooling | [007](007-module-aware-symbolization.md) |
 
 ## Execution order & status
 
@@ -23,11 +25,18 @@ even though that family is absent from the CPU-frame fixture.
 |------|-------|----------|--------|------------|--------|
 | 001 | Fix inflated CPU scope totals | P0 | M | — | DONE |
 | 002 | Bounded timelines + configurable frame caps | P0/P1 | L | 001 | DONE |
-| 003 | Memory/LLM allocation provider | P0 | L | — (parallel with 001/002 after capture exists) | IN PROGRESS |
+| 003 | Memory/LLM allocation provider | P0 | L | — (parallel with 001/002 after capture exists) | DONE |
 | 004 | Counter / Stats.EventBatch2 / CSV samples | P1 | M | targeted fixture with samples | TODO |
 | 005 | TaskTrace waits + thread-group membership | P1 | L | 002 helpful for correlating waits to frames | TODO |
+| 006 | Bounded callstack catalog + ID joins | P0 | L | coordinate with 003 | TODO |
+| 007 | Module-aware optional symbolization | P0 | L/XL | 006 | TODO |
 
 Status values: `TODO` | `IN PROGRESS` | `DONE` | `BLOCKED` | `REJECTED`
+
+Plan 003 is live-fixture-verified for Memory allocation traffic and
+synthetic-wire-verified for LLM catalog/value decoding. A capture with
+`MemTagChannel` enabled remains a fixture-expansion follow-up, not an open
+provider implementation task.
 
 ## Dependency notes
 
@@ -42,6 +51,12 @@ Status values: `TODO` | `IN PROGRESS` | `DONE` | `BLOCKED` | `REJECTED`
   `Counters.SetValueInt`.
 - **005** needs a TaskTrace-enabled capture; `WaitForTasks` CPU scopes alone
   are not enough for wait-edge attribution.
+- **006 before 007**: raw program counters and stable callstack-id joins are
+  useful without symbols and form the deterministic parser boundary.
+- **006 and 003 overlap** only at bounded memory allocation samples. Reconcile
+  that output shape before either executor edits it concurrently.
+- **007 starts with a spike** because module/build-id parity and a trustworthy
+  offline Windows symbol backend must be proven before committing to an API.
 
 ## Fixture strategy (shared)
 
@@ -51,6 +66,7 @@ Status values: `TODO` | `IN PROGRESS` | `DONE` | `BLOCKED` | `REJECTED`
 | `UTRACE_TARGETED_FIXTURE` / `_DIR` | LoadTime + Counters samples + MemoryScope + MetadataStack restore |
 | `UTRACE_MEMORY_FIXTURE` (**new**, plan 003) | MemAllocChannel + MemTagChannel capture with Alloc/Free + LLM TagValue |
 | `UTRACE_IOSTORE_FIXTURE` | out of P0/P1 scope (keep ignored test as-is) |
+| `UTRACE_CALLSTACK_FIXTURE` | CallstackSpec + module diagnostics + at least one callstack-bearing consumer |
 
 Capture recipes live inside plans 003 and 004. The CPU-frame fixture will
 **never** exercise Memory/LLM; that is expected, not a parser failure.
@@ -62,6 +78,8 @@ Do **not** dump new providers into `src/utrace.rs`. Prefer new modules:
 - `src/utrace_memory.rs` — Memory + LLM (plan 003)
 - `src/utrace_stats_batch.rs` or fold into a small `utrace_counters.rs` (plan 004)
 - `src/utrace_tasks.rs` — TaskTrace (plan 005)
+- `src/utrace_callstacks.rs` — raw callstack catalog and bounded joins (plan 006)
+- `src/utrace_symbols.rs` — optional resolver boundary/backend (plan 007)
 - Timeline collectors may stay near existing `CpuTimelineCollector` initially,
   but extract if `utrace.rs` growth exceeds ~reviewable hunks.
 
@@ -84,7 +102,9 @@ UTRACE_REQUIRE_FIXTURE=1 cargo test --test utrace_fixture --features utrace -- -
 - **Full unbounded in-memory timelines for entire traces**: rejected as default
   output. Plan 002 uses configurable bounds + truncation flags (AGENTS.md
   allocation discipline). Streaming/sidecar formats are a follow-up.
-- **Callstacks / bookmarks / regions / Slate**: P3 — deferred.
+- **Bookmarks / regions / Slate deep analysis**: still deferred. Raw callstack
+  decoding and symbolization are promoted to P0 in plans 006/007 because they
+  make allocation and annotation evidence actionable.
 - **IoStore / LoadTime request deep graphs**: useful but not in the P0/P1 list
   for this tranche; targeted fixture already covers basic LoadTime lifecycle.
 - **GPU fence pairing as first-class intervals**: deferred; counts stay for now

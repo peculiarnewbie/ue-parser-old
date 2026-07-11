@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::utrace::{
     MemoryAllocationDashboard, MemoryAllocationKind, MemoryAllocationSample, MemoryDashboard,
-    MemoryInitSummary, MemoryLlmDashboard, MemoryRootHeapSummary, MemoryScopeSummary,
+    MemoryInitSummary, MemoryLlmDashboard, MemoryLlmTagSetSummary, MemoryLlmTagSummary,
+    MemoryLlmTrackerSummary, MemoryLlmValueSummary, MemoryRootHeapSummary, MemoryScopeSummary,
     MemoryTagSummary,
 };
 
@@ -12,6 +13,10 @@ const MAX_TAGS: usize = 4_096;
 const MAX_SCOPE_TAGS: usize = 4_096;
 const MAX_OUTSTANDING_ALLOCS: usize = 262_144;
 const MAX_ALLOCATION_SAMPLES: usize = 40;
+const MAX_LLM_TAGS: usize = 4_096;
+const MAX_LLM_TRACKERS: usize = 256;
+const MAX_LLM_TAG_SETS: usize = 256;
+const MAX_LLM_LATEST_VALUES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MemoryInit {
@@ -43,6 +48,32 @@ pub(crate) struct MemoryFree {
     pub(crate) address: u64,
     pub(crate) root_heap: u8,
     pub(crate) is_realloc: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LlmTag {
+    pub(crate) tag: i64,
+    pub(crate) parent: i64,
+    pub(crate) tag_set: u8,
+    pub(crate) name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LlmTracker {
+    pub(crate) tracker_id: u8,
+    pub(crate) name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LlmTagSet {
+    pub(crate) tag_set: u8,
+    pub(crate) name: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LlmLatestValue {
+    cycle: u64,
+    value: i64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -80,6 +111,17 @@ pub(crate) struct MemoryProvider {
     outstanding_dropped: u64,
     root_heaps: BTreeMap<u8, RootHeapTotals>,
     samples: Vec<MemoryAllocationSample>,
+    llm_tags: BTreeMap<i64, LlmTag>,
+    llm_tag_count: u64,
+    llm_tag_overflow: u64,
+    llm_trackers: BTreeMap<u8, LlmTracker>,
+    llm_tracker_count: u64,
+    llm_tag_sets: BTreeMap<u8, LlmTagSet>,
+    llm_tag_set_count: u64,
+    llm_sample_events: u64,
+    llm_latest_values: BTreeMap<(u8, i64), LlmLatestValue>,
+    llm_latest_values_overflow: bool,
+    llm_latest_values_dropped: u64,
 }
 
 impl MemoryProvider {
@@ -166,6 +208,61 @@ impl MemoryProvider {
         root.bytes_freed = root.bytes_freed.saturating_add(allocation.size);
     }
 
+    pub(crate) fn record_llm_tag(&mut self, tag: LlmTag) {
+        self.llm_tag_count = self.llm_tag_count.saturating_add(1);
+        if self.llm_tags.contains_key(&tag.tag) || self.llm_tags.len() < MAX_LLM_TAGS {
+            self.llm_tags.insert(tag.tag, tag);
+        } else {
+            self.llm_tag_overflow = self.llm_tag_overflow.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn record_llm_tracker(&mut self, tracker: LlmTracker) {
+        self.llm_tracker_count = self.llm_tracker_count.saturating_add(1);
+        if self.llm_trackers.contains_key(&tracker.tracker_id)
+            || self.llm_trackers.len() < MAX_LLM_TRACKERS
+        {
+            self.llm_trackers.insert(tracker.tracker_id, tracker);
+        }
+    }
+
+    pub(crate) fn record_llm_tag_set(&mut self, tag_set: LlmTagSet) {
+        self.llm_tag_set_count = self.llm_tag_set_count.saturating_add(1);
+        if self.llm_tag_sets.contains_key(&tag_set.tag_set)
+            || self.llm_tag_sets.len() < MAX_LLM_TAG_SETS
+        {
+            self.llm_tag_sets.insert(tag_set.tag_set, tag_set);
+        }
+    }
+
+    pub(crate) fn record_llm_tag_values(
+        &mut self,
+        tracker_id: u8,
+        cycle: u64,
+        values: &[(i64, i64)],
+        dropped_values: u64,
+    ) {
+        self.llm_sample_events = self.llm_sample_events.saturating_add(1);
+        self.llm_latest_values_dropped = self
+            .llm_latest_values_dropped
+            .saturating_add(dropped_values);
+
+        for &(tag, value) in values {
+            let key = (tracker_id, tag);
+            if let Some(latest) = self.llm_latest_values.get_mut(&key) {
+                if cycle >= latest.cycle {
+                    *latest = LlmLatestValue { cycle, value };
+                }
+            } else if self.llm_latest_values.len() < MAX_LLM_LATEST_VALUES {
+                self.llm_latest_values
+                    .insert(key, LlmLatestValue { cycle, value });
+            } else {
+                self.llm_latest_values_overflow = true;
+                self.llm_latest_values_dropped = self.llm_latest_values_dropped.saturating_add(1);
+            }
+        }
+    }
+
     pub(crate) fn dashboard(self) -> MemoryDashboard {
         let mut tags = self
             .tags
@@ -218,6 +315,58 @@ impl MemoryProvider {
                 .then_with(|| left.root_heap.cmp(&right.root_heap))
         });
 
+        let mut llm_tags = self
+            .llm_tags
+            .values()
+            .map(|tag| MemoryLlmTagSummary {
+                tag: tag.tag,
+                parent: tag.parent,
+                tag_set: tag.tag_set,
+                name: tag.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        llm_tags.sort_by_key(|tag| tag.tag);
+
+        let mut llm_trackers = self
+            .llm_trackers
+            .values()
+            .map(|tracker| MemoryLlmTrackerSummary {
+                tracker_id: tracker.tracker_id,
+                name: tracker.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        llm_trackers.sort_by_key(|tracker| tracker.tracker_id);
+
+        let mut llm_tag_sets = self
+            .llm_tag_sets
+            .values()
+            .map(|tag_set| MemoryLlmTagSetSummary {
+                tag_set: tag_set.tag_set,
+                name: tag_set.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        llm_tag_sets.sort_by_key(|tag_set| tag_set.tag_set);
+
+        let mut llm_latest_values = self
+            .llm_latest_values
+            .into_iter()
+            .map(|((tracker_id, tag), latest)| MemoryLlmValueSummary {
+                tracker_id,
+                cycle: latest.cycle,
+                tag,
+                value: latest.value,
+            })
+            .collect::<Vec<_>>();
+        llm_latest_values.sort_by(|left, right| {
+            right
+                .value
+                .unsigned_abs()
+                .cmp(&left.value.unsigned_abs())
+                .then_with(|| right.cycle.cmp(&left.cycle))
+                .then_with(|| left.tracker_id.cmp(&right.tracker_id))
+                .then_with(|| left.tag.cmp(&right.tag))
+        });
+
         MemoryDashboard {
             init: self.init.map(|init| MemoryInitSummary {
                 version: init.version,
@@ -248,7 +397,19 @@ impl MemoryProvider {
                 by_root_heap,
                 samples: self.samples,
             },
-            llm: MemoryLlmDashboard::default(),
+            llm: MemoryLlmDashboard {
+                tag_count: self.llm_tag_count,
+                tracker_count: self.llm_tracker_count,
+                tag_set_count: self.llm_tag_set_count,
+                sample_events: self.llm_sample_events,
+                tag_overflow: self.llm_tag_overflow,
+                tags: llm_tags,
+                trackers: llm_trackers,
+                tag_sets: llm_tag_sets,
+                latest_values: llm_latest_values,
+                latest_values_overflow: self.llm_latest_values_overflow,
+                latest_values_dropped: self.llm_latest_values_dropped,
+            },
         }
     }
 }
@@ -329,5 +490,41 @@ mod tests {
             u64::try_from(MAX_OUTSTANDING_ALLOCS).unwrap()
         );
         assert_eq!(dashboard.allocs.outstanding_dropped, 1);
+    }
+
+    #[test]
+    fn llm_catalog_and_latest_values_are_bounded_and_cycle_aware() {
+        let mut provider = MemoryProvider::default();
+        provider.record_llm_tag(LlmTag {
+            tag: 101,
+            parent: 100,
+            tag_set: 2,
+            name: "Textures".to_owned(),
+        });
+        provider.record_llm_tracker(LlmTracker {
+            tracker_id: 1,
+            name: "Platform".to_owned(),
+        });
+        provider.record_llm_tag_set(LlmTagSet {
+            tag_set: 2,
+            name: "Assets".to_owned(),
+        });
+        provider.record_llm_tag_values(1, 20, &[(101, 64), (102, -16)], 0);
+        provider.record_llm_tag_values(1, 10, &[(101, 32)], 0);
+        provider.record_llm_tag_values(1, 30, &[(101, 96)], 3);
+
+        let dashboard = provider.dashboard();
+        assert_eq!(dashboard.llm.tag_count, 1);
+        assert_eq!(dashboard.llm.tracker_count, 1);
+        assert_eq!(dashboard.llm.tag_set_count, 1);
+        assert_eq!(dashboard.llm.sample_events, 3);
+        assert_eq!(dashboard.llm.tags[0].name, "Textures");
+        assert_eq!(dashboard.llm.tags[0].parent, 100);
+        assert_eq!(dashboard.llm.trackers[0].name, "Platform");
+        assert_eq!(dashboard.llm.tag_sets[0].name, "Assets");
+        assert_eq!(dashboard.llm.latest_values[0].tag, 101);
+        assert_eq!(dashboard.llm.latest_values[0].cycle, 30);
+        assert_eq!(dashboard.llm.latest_values[0].value, 96);
+        assert_eq!(dashboard.llm.latest_values_dropped, 3);
     }
 }

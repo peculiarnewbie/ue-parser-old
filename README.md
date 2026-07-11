@@ -10,8 +10,11 @@ versioned tagged properties.
 ## Current status
 
 Per-class decode coverage and the prioritized backlog are tracked in
-[`docs/asset-coverage.md`](docs/asset-coverage.md). The feature changelog below
-records how the parser got here.
+[`docs/asset-coverage.md`](docs/asset-coverage.md). Where to thicken tests and
+how to prioritize TDD for this translation-style parser:
+[`docs/test-opportunity-catalog.md`](docs/test-opportunity-catalog.md),
+[`docs/tdd-prioritization.md`](docs/tdd-prioritization.md). The feature changelog
+below records how the parser got here.
 
 Phases 1 through 6 are implemented:
 
@@ -66,7 +69,16 @@ Phases 1 through 6 are implemented:
 - File and stdin input
 - Stable stdout/stderr and exit-code behavior
 
-## CLI
+## Web UI
+
+A SolidJS + Vite frontend lives in [`web/`](web/). It provides drop zones for
+`.uasset` and `.utrace` files and shells out to this CLI for JSON inspect /
+dashboard output.
+
+```text
+cargo build --features utrace
+cd web && npm install && npm run dev
+```
 
 ```text
 uasset inspect Asset.uasset
@@ -222,5 +234,8 @@ validated separately with `UTRACE_IOSTORE_FIXTURE`.
 The ignored `memory_utrace_fixture_exposes_alloc_and_tag_summaries` test uses
 `UTRACE_MEMORY_FIXTURE`. It requires `Memory.Init`, `Memory.TagSpec`, and
 allocation/free traffic; the checked dashboard aggregates use bounded samples
-and a capped outstanding-address map. The current studio provider capture has
-Memory allocation traffic but no `LLM.TagValue` events.
+and a capped outstanding-address map. The same provider decodes LLM tag,
+tracker, and tag-set catalogs plus bounded latest tag values. The current studio
+provider capture has Memory allocation traffic but declares no LLM events, so
+the LLM wire decoder is covered by synthetic tests until a MemTag capture is
+available.

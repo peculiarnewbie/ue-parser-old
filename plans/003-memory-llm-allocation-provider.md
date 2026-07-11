@@ -15,16 +15,18 @@
 - **Effort**: L
 - **Risk**: HIGH (format versioning, huge event volume, callstack ids)
 - **Depends on**: none (parallel with 001/002). Memory capture available;
-  LLM `TagValue` capture still needed.
+  an LLM `TagValue` live capture remains useful for fixture validation.
 - **Category**: direction
 - **Planned at**: commit `3c97e3c`, 2026-07-11
 
-**Progress (2026-07-11):** `targeted-providers.utrace` supplies a UE v2 Memory
+**Progress (2026-07-12):** `targeted-providers.utrace` supplies a UE v2 Memory
 capture with Init, TagSpec, AllocSystem/FreeSystem, and realloc events. The
-bounded Memory allocation milestone is implemented and fixture-verified. This
-capture declares no LLM events, and allocation-to-tag attribution requires
-preserving scoped-event enter/leave style in serial dispatch; both remain
-explicit follow-up work in this plan.
+bounded Memory allocation milestone is fixture-verified. The provider now also
+decodes bounded LLM TagsSpec/TrackerSpec/TagSetSpec catalogs and TagValue arrays
+into latest values, with synthetic wire-format coverage. This capture declares
+no LLM events, so live MemTag fixture validation remains a follow-up.
+Allocation-to-tag attribution requires preserving scoped-event enter/leave style
+in serial dispatch and is out of scope for the completed provider.
 
 ## Why this matters
 
@@ -229,7 +231,7 @@ partial provider. Run fmt/clippy/test baseline.
 - [x] Dashboard exposes alloc summaries + tag names
 - [x] `UTRACE_MEMORY_FIXTURE` ignored test exists and passes on a real capture
 - [x] CPU-frame fixture still passes (Memory sections may remain empty)
-- [ ] Clippy/tests clean; README + matrix updated; plan status DONE (pending LLM capture/decoder)
+- [x] Clippy/tests clean; README + matrix updated; plan status DONE (live LLM fixture validation remains a follow-up)
 
 ## STOP conditions
 

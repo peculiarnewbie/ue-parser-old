@@ -66,7 +66,7 @@ The area-level status table below is the human narrative layer on top of that.
 | Stats | partial | `Stats.Spec` | `stats.specs`, `stats.groups`, `stats.stats` | Dashboard decodes UE Stats declarations (id, name, description, group, and floating-point/memory/clear-every-frame flags) and explicitly reports zero sample events for the current fixture. Stat sample values are not decoded yet. |
 | CSV profiler | partial | `CsvProfiler.RegisterCategory`, `CsvProfiler.DefineDeclaredStat`, `CsvProfiler.DefineInlineStat` | `csv.categories`, `csv.stat_defs`, `csv.top_categories` | Dashboard decodes CSV profiler category and stat registration catalogs and explicitly reports zero sample events for the current fixture. CSV sample timelines are not decoded yet. |
 | Trace channels | partial | `Trace.ChannelAnnounce`, `Trace.ChannelToggle` | `channels.channels` | Dashboard decodes trace channel declarations, read-only flags, latest enabled state, and toggle counts. Distinct from the `$Trace` logger used for the prologue and threads. |
-| Memory | partial | `Memory.Init`, `TagSpec`, `MemoryScope`, `Alloc*`, `Free*`, `ReallocAlloc*`, `ReallocFree*` | `memory.init`, `memory.tags`, `memory.scopes`, `memory.allocs` | Dashboard validates supported Memory trace versions (1–2), resolves scope tag names, unpacks sizes using `SizeShift`, and summarizes allocation/free/reallocation bytes by root heap. Retained allocation samples (40) and outstanding address tracking (262,144 entries) are explicitly bounded; once the outstanding map overflows, later frees may be unresolved. Allocation-to-current-tag attribution needs scoped Memory event style support and remains deferred. The current provider capture has no LLM events, so `memory.llm` stays explicitly empty. |
+| Memory + LLM | partial | `Memory.Init`, `TagSpec`, `MemoryScope`, `Alloc*`, `Free*`, `ReallocAlloc*`, `ReallocFree*`; `LLM.TagsSpec`, `TrackerSpec`, `TagSetSpec`, `TagValue` | `memory.init`, `memory.tags`, `memory.scopes`, `memory.allocs`, `memory.llm` | Dashboard validates supported Memory trace versions (1–2), resolves scope tag names, unpacks sizes using `SizeShift`, and summarizes allocation/free/reallocation bytes by root heap. Retained allocation samples (40), outstanding address tracking (262,144 entries), LLM catalogs (4,096 tags), and latest LLM values (4,096 tracker/tag pairs) are explicitly bounded; overflow is surfaced in the dashboard. Allocation-to-current-tag attribution needs scoped Memory event style support and remains deferred. The current provider capture declares no LLM events, so the LLM wire path is synthetic-tested pending a MemTag capture. |
 | Loading/assets | partial | `LoadTime.ClassInfo`, `LoadTime.StartAsyncLoading`, `LoadTime.SuspendAsyncLoading`, `LoadTime.ResumeAsyncLoading`, `LoadTime.PackageSummary`, `LoadTime.BeginRequest`, `LoadTime.EndRequest`, `LoadTime.NewAsyncPackage`, `LoadTime.DestroyAsyncPackage` | `loading.classes`, `loading.packages`, `loading.requests`, `loading.async_loading` | Class catalog, package summaries, request begin/end pairing with bounded samples, and async loading start/suspend/resume counts are decoded. Full Unreal Insights load-time analyzer semantics (object graphs, package state machines) are not emitted yet. This fixture currently exercises only `ClassInfo`. |
 | IO/file | partial | `IoStore.*` lifecycle events | `io_store.backends`, `io_store.request_samples`, request/byte counters | IoStore backend catalog and request create/start/complete/fail lifecycle are decoded with bounded samples. `File.*` activity and full chunk-resolution timelines are not decoded yet. The current CPU-frame fixture declares no IoStore traffic. |
 | Logs/diagnostics | partial | `Logging.LogCategory`, `Logging.LogMessageSpec`, `Logging.LogMessage`, `Diagnostics.Session2` | `logging.categories`, `logging.message_specs`, `logging.verbosity`, `logging.top_categories`, `logging.top_messages`, `session` | Dashboard decodes the log category catalog (name + default verbosity), message specs (log points) resolved to file/line/format/category, per-verbosity spec and message counts, and message counts per log point. It renders simple `%s` sample log arguments and formats the `Diagnostics.Session2` instance id as a GUID. Full printf argument expansion, per-message timelines, and `Diagnostics.Session` (v1) are not decoded. |
@@ -142,3 +142,36 @@ cooked capture and are checked separately with `UTRACE_IOSTORE_FIXTURE`.
 Do not add the full coverage matrix back into the CLI JSON unless there is a
 runtime consumer that needs it. Prefer keeping parser capability notes here and
 keeping `utrace dashboard` focused on decoded performance data.
+
+## Practical gaps before this can replace Unreal Insights
+
+The parser is already useful for automated summaries and first-pass hitch
+triage. For day-to-day performance investigation, these are the main remaining
+gaps, in priority order:
+
+1. **Callstacks and symbolization** — decode `Callstack.*`, resolve modules and
+   addresses, and attach readable stacks to allocations, bookmarks, and other
+   callstack-bearing events.
+2. **Capture-wide timeline queries** — support indexed arbitrary time ranges,
+   filtering, searching, zooming, and repeated frame navigation without
+   reparsing the full capture. Keep storage bounded or use a sidecar rather than
+   retaining an unbounded timeline in memory.
+3. **Task and wait causality** — decode TaskTrace lifecycles and dependencies,
+   attach thread-group membership, and explain which task or scheduling delay
+   caused scopes such as `WaitForTasks`.
+4. **Unified performance curves** — finish Stats and CSV sample decoding and
+   expose Counters, Stats, and CSV as frame-aligned time series with units.
+5. **Asset-loading critical paths** — join LoadTime, IoStore/File activity,
+   CPU work, and package dependencies so a loading hitch can be attributed to
+   the responsible asset and stage.
+6. **Memory attribution** — join allocations to active tags and resolved
+   callstacks, add frame-aligned allocation/live-memory curves, and clearly
+   surface when bounded outstanding tracking makes totals incomplete.
+7. **Regression comparison** — compare baseline and candidate traces using
+   frame percentiles, scope/counter/memory/loading deltas, bookmark alignment,
+   and machine-readable CI thresholds.
+
+The frontend is secondary to these parser and query-model gaps. Once the data
+exists, the useful interaction is a linked path from frame to scope to task,
+allocation, file activity, or asset—not a collection of disconnected summary
+panels.
