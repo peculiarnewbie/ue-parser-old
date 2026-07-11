@@ -557,6 +557,121 @@ mod tests {
     }
 
     #[test]
+    fn reads_optional_tag_fields_and_property_extensions() {
+        let mut bytes = Vec::new();
+        push_i32(&mut bytes, 3); // property name
+        push_i32(&mut bytes, 0);
+        write_type_name(
+            &mut bytes,
+            &TypeParam {
+                type_index: 1,
+                parameters: Vec::new(),
+            },
+        );
+        push_i32(&mut bytes, 4); // payload size
+        bytes.push(
+            TAG_FLAG_HAS_ARRAY_INDEX
+                | TAG_FLAG_HAS_PROPERTY_GUID
+                | TAG_FLAG_HAS_PROPERTY_EXTENSIONS,
+        );
+        push_i32(&mut bytes, 7); // array index
+        for value in [1_u32, 2, 3, 4] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.push(PROPERTY_EXTENSION_OVERRIDABLE_INFORMATION);
+        bytes.push(9); // override operation
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&42_i32.to_le_bytes());
+        write_property_terminator(&mut bytes, 0);
+
+        let mut reader = Reader::new(&bytes);
+        let stream = read_tagged_property_stream(&mut reader, &ue5_versions(), &names(), "Test")
+            .expect("parse optional fields");
+        let record = &stream.records[0];
+
+        assert_eq!(record.array_index, 7);
+        assert_eq!(
+            record.property_guid,
+            Some(crate::archive::Guid {
+                a: 1,
+                b: 2,
+                c: 3,
+                d: 4,
+            })
+        );
+        assert_eq!(
+            record.extensions,
+            Some(PropertyTagExtensions {
+                raw_flags: PROPERTY_EXTENSION_OVERRIDABLE_INFORMATION,
+                override_operation: Some(9),
+                experimental_overridable_logic: Some(true),
+            })
+        );
+        assert_eq!(record.payload.len(), 4);
+        assert_eq!(reader.tell(), bytes.len() as u64);
+    }
+
+    #[test]
+    fn reads_root_class_serialization_control_extensions() {
+        let mut bytes = vec![CLASS_EXTENSION_OVERRIDABLE_SERIALIZATION_INFORMATION, 5];
+        write_property_terminator(&mut bytes, 0);
+        let mut reader = Reader::new(&bytes);
+
+        let stream =
+            read_uobject_tagged_property_stream(&mut reader, &ue5_versions(), &names(), "Object")
+                .expect("parse root extensions");
+
+        assert_eq!(
+            stream.class_extensions,
+            Some(ClassSerializationControlExtensions {
+                raw_flags: CLASS_EXTENSION_OVERRIDABLE_SERIALIZATION_INFORMATION,
+                overridable_operation: Some(5),
+            })
+        );
+        assert!(stream.records.is_empty());
+        assert_eq!(reader.tell(), bytes.len() as u64);
+    }
+
+    #[test]
+    fn rejects_reserved_property_and_class_extension_groups() {
+        let mut class_bytes = vec![CLASS_EXTENSION_RESERVE_FOR_FUTURE_USE];
+        write_property_terminator(&mut class_bytes, 0);
+        let class_error = read_uobject_tagged_property_stream(
+            &mut Reader::new(&class_bytes),
+            &ue5_versions(),
+            &names(),
+            "Object",
+        )
+        .unwrap_err();
+        assert_eq!(class_error.kind(), PropertyErrorKind::UnsupportedCapability);
+
+        let mut property_bytes = Vec::new();
+        push_i32(&mut property_bytes, 3);
+        push_i32(&mut property_bytes, 0);
+        write_type_name(
+            &mut property_bytes,
+            &TypeParam {
+                type_index: 1,
+                parameters: Vec::new(),
+            },
+        );
+        push_i32(&mut property_bytes, 0);
+        property_bytes.push(TAG_FLAG_HAS_PROPERTY_EXTENSIONS);
+        property_bytes.push(PROPERTY_EXTENSION_RESERVE_FOR_FUTURE_USE);
+        let property_error = read_tagged_property_stream(
+            &mut Reader::new(&property_bytes),
+            &ue5_versions(),
+            &names(),
+            "Test",
+        )
+        .unwrap_err();
+        assert_eq!(
+            property_error.kind(),
+            PropertyErrorKind::UnsupportedCapability
+        );
+    }
+
+    #[test]
     fn reads_array_property_inner_type_parameters() {
         let mut bytes = Vec::new();
         write_type_name(
@@ -575,6 +690,60 @@ mod tests {
         assert_eq!(type_name.name, name_ref(5, 0));
         assert_eq!(type_name.parameters.len(), 1);
         assert_eq!(type_name.parameters[0].name, name_ref(6, 0));
+    }
+
+    #[test]
+    fn reads_multiple_records_through_the_terminator() {
+        let mut bytes = Vec::new();
+        for (name_index, value) in [(3, 10_i32), (4, 20_i32)] {
+            write_property_tag(
+                &mut bytes,
+                name_index,
+                &TypeParam {
+                    type_index: 1,
+                    parameters: Vec::new(),
+                },
+                0,
+                &value.to_le_bytes(),
+            );
+        }
+        write_property_terminator(&mut bytes, 0);
+        let mut reader = Reader::new(&bytes);
+
+        let stream = read_tagged_property_stream(&mut reader, &ue5_versions(), &names(), "Test")
+            .expect("parse records");
+
+        assert_eq!(stream.records.len(), 2);
+        assert_eq!(stream.records[0].name, name_ref(3, 0));
+        assert_eq!(stream.records[1].name, name_ref(4, 0));
+        assert_eq!(stream.terminator.len(), 8);
+        assert_eq!(reader.tell(), bytes.len() as u64);
+    }
+
+    #[test]
+    fn rejects_pre_complete_type_name_versions() {
+        let versions = VersionContext {
+            ue5: UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME - 1,
+            ..ue5_versions()
+        };
+        let error = read_tagged_property_stream(&mut Reader::new(&[]), &versions, &names(), "Test")
+            .unwrap_err();
+
+        assert_eq!(error.kind(), PropertyErrorKind::UnsupportedVersion);
+        assert_eq!(error.offset(), Some(0));
+    }
+
+    #[test]
+    fn rejects_negative_property_type_inner_count() {
+        let mut bytes = Vec::new();
+        push_i32(&mut bytes, 1);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, -1);
+        let error =
+            read_property_type_name_for_test(&mut Reader::new(&bytes), &names()).unwrap_err();
+
+        assert_eq!(error.kind(), PropertyErrorKind::MalformedData);
+        assert!(error.path().ends_with("InnerCount"));
     }
 
     #[test]

@@ -234,10 +234,26 @@ fn decode_soft_object_path(
     path: &str,
     context: &DecodeContext<'_>,
 ) -> Result<String, PropertyError> {
-    if !context.package.soft_object_paths.is_empty() && payload.remaining() == 4 {
+    if !context.package.soft_object_paths.is_empty() {
+        if payload.remaining() != 4 {
+            return Err(PropertyError::new(
+                crate::property::PropertyErrorKind::MalformedData,
+                Some(payload.tell()),
+                path,
+                format!(
+                    "table-backed soft object path payload must be exactly 4 bytes, got {}",
+                    payload.remaining()
+                ),
+            ));
+        }
         let index = payload.read_i32(&format!("{path}.SoftObjectPathIndex"))?;
         if index < 0 {
-            return Ok(String::new());
+            return Err(PropertyError::new(
+                crate::property::PropertyErrorKind::MalformedData,
+                Some(payload.tell() - 4),
+                path,
+                format!("soft object path index must be non-negative, got {index}"),
+            ));
         }
         let index = usize::try_from(index).map_err(|error| {
             PropertyError::new(
@@ -841,6 +857,133 @@ mod tests {
     }
 
     #[test]
+    fn decodes_scalar_property_matrix() {
+        let cases: Vec<(&str, Vec<u8>, PropertyValue)> = vec![
+            (
+                "Int8Property",
+                (-7_i8).to_le_bytes().to_vec(),
+                PropertyValue::Int(-7),
+            ),
+            (
+                "Int16Property",
+                (-1234_i16).to_le_bytes().to_vec(),
+                PropertyValue::Int(-1234),
+            ),
+            (
+                "Int64Property",
+                (-9_876_543_210_i64).to_le_bytes().to_vec(),
+                PropertyValue::Int(-9_876_543_210),
+            ),
+            (
+                "UInt8Property",
+                250_u8.to_le_bytes().to_vec(),
+                PropertyValue::UInt(250),
+            ),
+            (
+                "UInt16Property",
+                60_000_u16.to_le_bytes().to_vec(),
+                PropertyValue::UInt(60_000),
+            ),
+            (
+                "UInt32Property",
+                3_000_000_000_u32.to_le_bytes().to_vec(),
+                PropertyValue::UInt(3_000_000_000),
+            ),
+            (
+                "UInt64Property",
+                9_000_000_000_u64.to_le_bytes().to_vec(),
+                PropertyValue::UInt(9_000_000_000),
+            ),
+            (
+                "FloatProperty",
+                1.25_f32.to_le_bytes().to_vec(),
+                PropertyValue::Float(1.25),
+            ),
+            (
+                "DoubleProperty",
+                (-2.5_f64).to_le_bytes().to_vec(),
+                PropertyValue::Double(-2.5),
+            ),
+        ];
+
+        for (type_name, payload, expected) in cases {
+            assert_eq!(
+                decode_record(
+                    vec![type_name.into()],
+                    0,
+                    Vec::new(),
+                    PropertyTagFlags(0),
+                    &payload,
+                ),
+                expected,
+                "{type_name}",
+            );
+        }
+
+        assert_eq!(
+            decode_record(
+                vec!["BoolProperty".into()],
+                0,
+                Vec::new(),
+                PropertyTagFlags(0x10),
+                &[],
+            ),
+            PropertyValue::Bool(true)
+        );
+        assert_eq!(
+            decode_record(
+                vec!["BoolProperty".into()],
+                0,
+                Vec::new(),
+                PropertyTagFlags(0),
+                &[],
+            ),
+            PropertyValue::Bool(false)
+        );
+
+        let mut name_payload = Vec::new();
+        push_i32(&mut name_payload, 1);
+        push_i32(&mut name_payload, 2);
+        assert_eq!(
+            decode_record(
+                vec!["NameProperty".into(), "Value".into()],
+                0,
+                Vec::new(),
+                PropertyTagFlags(0),
+                &name_payload,
+            ),
+            PropertyValue::Name(crate::test_support::name_ref(1, 2))
+        );
+
+        let mut string_payload = Vec::new();
+        push_fstring(&mut string_payload, "hello");
+        assert_eq!(
+            decode_record(
+                vec!["StrProperty".into()],
+                0,
+                Vec::new(),
+                PropertyTagFlags(0),
+                &string_payload,
+            ),
+            PropertyValue::String("hello".into())
+        );
+
+        for type_name in ["ObjectProperty", "ClassProperty"] {
+            assert_eq!(
+                decode_record(
+                    vec![type_name.into()],
+                    0,
+                    Vec::new(),
+                    PropertyTagFlags(0),
+                    &(-3_i32).to_le_bytes(),
+                ),
+                PropertyValue::ObjectRef(PackageIndex::from_raw(-3)),
+                "{type_name}",
+            );
+        }
+    }
+
+    #[test]
     fn decodes_weak_object_payload_as_package_index() {
         let names = vec!["WeakObjectProperty".into()];
         let payload = (-2_i32).to_le_bytes();
@@ -1197,6 +1340,55 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_table_backed_soft_object_payloads() {
+        fn decode(payload: &[u8]) -> Result<PropertyValue, PropertyError> {
+            let names = vec!["SoftObjectProperty".into()];
+            let mut package = test_package(names);
+            package.soft_object_paths = vec![String::new(), "/Game/Valid.Valid".into()];
+            let source = payload.to_vec();
+            let mut record = PropertyRecord {
+                name: crate::test_support::name_ref(0, 0),
+                type_name: PropertyTypeName {
+                    name: crate::test_support::name_ref(0, 0),
+                    parameters: Vec::new(),
+                },
+                array_index: 0,
+                flags: PropertyTagFlags(0),
+                property_guid: None,
+                extensions: None,
+                payload: Span::new(0, source.len() as u64).expect("payload span"),
+                value: PropertyValue::Raw {
+                    reason: RawReason::UnsupportedType,
+                },
+            };
+            let schemas = EmptySchemas;
+            let context = DecodeContext {
+                package: &package,
+                versions: &package.summary.versions,
+                schemas: &schemas,
+            };
+            decode_property_record(&source, &mut record, &context, 0)?;
+            Ok(record.value)
+        }
+
+        for payload in [
+            Vec::new(),
+            vec![0; 3],
+            vec![0; 5],
+            (-1_i32).to_le_bytes().to_vec(),
+            2_i32.to_le_bytes().to_vec(),
+        ] {
+            let error = decode(&payload).unwrap_err();
+            assert_eq!(error.kind(), PropertyErrorKind::MalformedData);
+        }
+
+        assert_eq!(
+            decode(&0_i32.to_le_bytes()).unwrap(),
+            PropertyValue::SoftObjectPath(String::new())
+        );
+    }
+
+    #[test]
     fn decodes_indexed_soft_object_path_array_elements() {
         let names = vec!["ArrayProperty".into(), "SoftObjectProperty".into()];
         let mut package = test_package(names);
@@ -1279,6 +1471,43 @@ mod tests {
     }
 
     #[test]
+    fn consumes_set_elements_to_remove_and_rejects_negative_counts() {
+        let names = vec!["SetProperty".into(), "IntProperty".into()];
+        let element_type = vec![PropertyTypeName {
+            name: crate::test_support::name_ref(1, 0),
+            parameters: Vec::new(),
+        }];
+        let mut payload = Vec::new();
+        push_i32(&mut payload, 2);
+        push_i32(&mut payload, 10);
+        push_i32(&mut payload, 11);
+        push_i32(&mut payload, 1);
+        push_i32(&mut payload, 42);
+
+        assert_eq!(
+            decode_record(
+                names.clone(),
+                0,
+                element_type.clone(),
+                PropertyTagFlags(0),
+                &payload,
+            ),
+            PropertyValue::Set(vec![PropertyValue::Int(42)])
+        );
+
+        let error = decode_record_result(
+            names,
+            0,
+            element_type,
+            PropertyTagFlags(0),
+            &(-1_i32).to_le_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), PropertyErrorKind::MalformedData);
+        assert!(error.detail().contains("ElementsToRemove"));
+    }
+
+    #[test]
     fn decodes_int_to_string_map_payload() {
         let names = vec![
             "MapProperty".into(),
@@ -1354,6 +1583,70 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, PropertyValue::Int(42));
         assert_eq!(entries[0].value, PropertyValue::Int(7));
+    }
+
+    #[test]
+    fn consumes_map_keys_to_remove_before_entries() {
+        let names = vec![
+            "MapProperty".into(),
+            "IntProperty".into(),
+            "IntProperty".into(),
+        ];
+        let types = vec![
+            PropertyTypeName {
+                name: crate::test_support::name_ref(1, 0),
+                parameters: Vec::new(),
+            },
+            PropertyTypeName {
+                name: crate::test_support::name_ref(2, 0),
+                parameters: Vec::new(),
+            },
+        ];
+        let mut payload = Vec::new();
+        push_i32(&mut payload, 2);
+        push_i32(&mut payload, 10);
+        push_i32(&mut payload, 11);
+        push_i32(&mut payload, 1);
+        push_i32(&mut payload, 42);
+        push_i32(&mut payload, 7);
+
+        assert_eq!(
+            decode_record(names, 0, types, PropertyTagFlags(0), &payload),
+            PropertyValue::Map(vec![MapEntry {
+                key: PropertyValue::Int(42),
+                value: PropertyValue::Int(7),
+            }])
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_negative_map_remove_count() {
+        let names = vec![
+            "MapProperty".into(),
+            "IntProperty".into(),
+            "IntProperty".into(),
+        ];
+        let types = vec![
+            PropertyTypeName {
+                name: crate::test_support::name_ref(1, 0),
+                parameters: Vec::new(),
+            },
+            PropertyTypeName {
+                name: crate::test_support::name_ref(2, 0),
+                parameters: Vec::new(),
+            },
+        ];
+
+        let error = decode_record_result(
+            names,
+            0,
+            types,
+            PropertyTagFlags(0),
+            &(-2_i32).to_le_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), PropertyErrorKind::MalformedData);
+        assert!(error.detail().contains("KeysToRemove"));
     }
 
     #[test]

@@ -10769,6 +10769,60 @@ mod tests {
         assert_eq!(universe.not_in_universe, vec!["$Trace.NewTrace".to_owned()]);
     }
 
+    #[test]
+    fn decodes_cpu_event_spec_payload() {
+        let event = test_event_type(
+            1,
+            "CpuProfiler",
+            "EventSpec",
+            &[
+                regular_field(0, 4, UINT32, "Id"),
+                regular_field(4, 0, ANSI_STRING, "Name"),
+                regular_field(4, 0, ANSI_STRING, "File"),
+                regular_field(4, 4, UINT32, "Line"),
+            ],
+        );
+        let mut data = Vec::new();
+        data.extend_from_slice(&17_u32.to_le_bytes());
+        data.extend_from_slice(&42_u32.to_le_bytes());
+        data.extend_from_slice(&aux(1, b"Tick"));
+        data.extend_from_slice(&aux(2, b"Actor.cpp"));
+
+        let spec = decode_cpu_event_spec(&event, &data, 0).expect("decode EventSpec");
+
+        assert_eq!(spec.id, 17);
+        assert_eq!(spec.name, "Tick");
+        assert_eq!(spec.file.as_deref(), Some("Actor.cpp"));
+        assert_eq!(spec.line, Some(42));
+    }
+
+    #[test]
+    fn decodes_begin_and_end_frame_payloads() {
+        let event = test_event_type(
+            1,
+            "Misc",
+            "BeginFrame",
+            &[
+                regular_field(0, 8, UINT64, "Cycle"),
+                regular_field(8, 1, UINT8, "FrameType"),
+            ],
+        );
+        let mut data = Vec::new();
+        data.extend_from_slice(&123_456_u64.to_le_bytes());
+        data.push(2);
+
+        let begin = decode_frame_marker(&event, &data, 0, 7, FrameMarkerKind::Begin)
+            .expect("decode begin frame");
+        let end = decode_frame_marker(&event, &data, 0, 7, FrameMarkerKind::End)
+            .expect("decode end frame");
+
+        assert_eq!(begin.kind, FrameMarkerKind::Begin);
+        assert_eq!(end.kind, FrameMarkerKind::End);
+        assert_eq!(begin.cycle, 123_456);
+        assert_eq!(begin.frame_type, 2);
+        assert_eq!(begin.thread_id, 7);
+    }
+
     #[derive(Clone)]
     struct TestField {
         offset: u16,

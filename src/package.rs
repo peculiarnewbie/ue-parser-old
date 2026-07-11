@@ -254,6 +254,11 @@ pub struct ObjectPath(String);
 
 impl ObjectPath {
     #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -1727,18 +1732,29 @@ mod tests {
     }
 
     fn current_summary_fixture(package_flags: u32) -> Vec<u8> {
+        summary_fixture(VersionContext::LATEST_SUPPORTED_UE5, package_flags)
+    }
+
+    fn summary_fixture(ue5: i32, package_flags: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
         push_u32(&mut bytes, PACKAGE_FILE_TAG);
         push_i32(&mut bytes, -9);
         push_i32(&mut bytes, 864);
         push_i32(&mut bytes, VersionContext::LATEST_SUPPORTED_UE4);
-        push_i32(&mut bytes, VersionContext::LATEST_SUPPORTED_UE5);
+        push_i32(&mut bytes, ue5);
         push_i32(&mut bytes, 0);
-        bytes.extend_from_slice(&[0xAB; IoHash::BYTE_LEN]);
-        let total_header_size_offset = bytes.len();
-        push_i32(&mut bytes, 0);
+        let mut total_header_size_offset = None;
+        if ue5 >= UE5_PACKAGE_SAVED_HASH {
+            bytes.extend_from_slice(&[0xAB; IoHash::BYTE_LEN]);
+            total_header_size_offset = Some(bytes.len());
+            push_i32(&mut bytes, 0);
+        }
 
         push_i32(&mut bytes, 0); // CustomVersions
+        if ue5 < UE5_PACKAGE_SAVED_HASH {
+            total_header_size_offset = Some(bytes.len());
+            push_i32(&mut bytes, 0);
+        }
         push_i32(&mut bytes, 0); // PackageName
         push_u32(&mut bytes, package_flags);
 
@@ -1771,8 +1787,13 @@ mod tests {
         }
         push_i32(&mut bytes, 0); // SearchableNamesOffset
         push_i32(&mut bytes, 0); // ThumbnailTableOffset
-        for _ in 0..2 {
-            push_i32(&mut bytes, 0); // ImportTypeHierarchies
+        if ue5 >= UE5_IMPORT_TYPE_HIERARCHIES {
+            for _ in 0..2 {
+                push_i32(&mut bytes, 0); // ImportTypeHierarchies
+            }
+        }
+        if ue5 < UE5_PACKAGE_SAVED_HASH {
+            bytes.extend_from_slice(&[0xCD; 16]); // LegacyGuid
         }
         bytes.extend_from_slice(&[0; 16]); // PersistentGuid
         push_i32(&mut bytes, 0); // Generations
@@ -1793,6 +1814,7 @@ mod tests {
         push_i32(&mut bytes, -1); // DataResourceOffset
 
         let header_size = i32::try_from(bytes.len()).unwrap();
+        let total_header_size_offset = total_header_size_offset.expect("header size offset");
         bytes[total_header_size_offset..total_header_size_offset + 4]
             .copy_from_slice(&header_size.to_le_bytes());
         bytes
@@ -1817,6 +1839,23 @@ mod tests {
         assert!(summary.import_type_hierarchies.is_some());
         assert_eq!(summary.payload_toc_offset, None);
         assert_eq!(summary.data_resource_offset, None);
+    }
+
+    #[test]
+    fn parses_both_sides_of_package_saved_hash_boundary() {
+        let legacy_bytes = summary_fixture(UE5_PACKAGE_SAVED_HASH - 1, 0);
+        let current_bytes = summary_fixture(UE5_PACKAGE_SAVED_HASH, 0);
+
+        let legacy = PackageSummary::parse(&legacy_bytes).expect("legacy hash layout");
+        let current = PackageSummary::parse(&current_bytes).expect("saved hash layout");
+
+        assert_eq!(legacy.versions.ue5, UE5_PACKAGE_SAVED_HASH - 1);
+        assert_eq!(current.versions.ue5, UE5_PACKAGE_SAVED_HASH);
+        assert_eq!(legacy.total_header_size as usize, legacy_bytes.len());
+        assert_eq!(current.total_header_size as usize, current_bytes.len());
+        assert_ne!(legacy.saved_hash, IoHash::default());
+        assert_eq!(current.saved_hash.as_bytes(), &[0xAB; IoHash::BYTE_LEN]);
+        assert!(legacy.import_type_hierarchies.is_none());
     }
 
     #[test]
@@ -1924,6 +1963,51 @@ mod tests {
 
         assert_eq!(error.kind(), PackageErrorKind::MalformedData);
         assert!(error.detail().contains("cycle"));
+    }
+
+    #[test]
+    fn rejects_export_spans_past_eof_and_integer_overflow() {
+        let past_eof =
+            validate_export_span(FileOffset(90), 11, 100, "Exports[0]").expect_err("span past EOF");
+        assert_eq!(past_eof.kind(), PackageErrorKind::MalformedData);
+        assert_eq!(past_eof.path(), "Exports[0].SerialOffset");
+        assert!(past_eof.detail().contains("outside file length"));
+
+        let overflow = validate_export_span(FileOffset(u64::MAX), 1, u64::MAX, "Exports[1]")
+            .expect_err("span overflow");
+        assert_eq!(overflow.kind(), PackageErrorKind::MalformedData);
+        assert_eq!(overflow.path(), "Exports[1].SerialOffset");
+        assert!(overflow.detail().contains("overflows"));
+
+        validate_export_span(FileOffset(90), 10, 100, "Exports[2]")
+            .expect("span ending at EOF is valid");
+    }
+
+    #[test]
+    fn rejects_nonempty_table_at_or_past_eof() {
+        for offset in [100, 101] {
+            let error = validate_table_location(
+                "Summary.Names",
+                TableLocation {
+                    count: 1,
+                    offset: FileOffset(offset),
+                },
+                100,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), PackageErrorKind::MalformedData);
+            assert_eq!(error.path(), "Summary.Names");
+        }
+
+        validate_table_location(
+            "Summary.Names",
+            TableLocation {
+                count: 0,
+                offset: FileOffset(100),
+            },
+            100,
+        )
+        .expect("empty table offset is not dereferenced");
     }
 
     #[test]

@@ -2962,6 +2962,160 @@ Options:
 mod tests {
     use super::*;
 
+    fn tiny_package() -> Package {
+        let hex = include_str!("../../tests/fixtures/tiny/minimal-current-summary.uasset.hex");
+        let compact = hex
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .flat_map(str::chars)
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>();
+        let bytes = compact
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).expect("ASCII hex"), 16)
+                    .expect("valid hex fixture")
+            })
+            .collect::<Vec<_>>();
+        Package::parse(&bytes).expect("tiny package")
+    }
+
+    fn empty_property_stream() -> uasset_parser::property::PropertyStream {
+        uasset_parser::property::PropertyStream {
+            class_extensions: None,
+            records: Vec::new(),
+            terminator: uasset_parser::Span::new(0, 0).expect("empty span"),
+        }
+    }
+
+    #[test]
+    fn maps_asset_output_and_renders_inspect_text() {
+        let package = tiny_package();
+        let asset = asset_output_from_decoded(
+            &package,
+            DecodedAsset::StringTable(uasset_parser::asset::DecodedStringTable {
+                object_path: uasset_parser::package::ObjectPath::new("/Game/Test.ST_Test"),
+                namespace: "TestNamespace".to_owned(),
+                entries: vec![uasset_parser::asset::StringTableEntry {
+                    key: "Greeting".to_owned(),
+                    source: "Hello".to_owned(),
+                }],
+            }),
+        );
+        let json = serde_json::to_value(&asset).expect("serialize asset output");
+        assert_eq!(json["kind"], "StringTable");
+        assert_eq!(json["object_path"], "/Game/Test.ST_Test");
+        assert_eq!(json["class_path"], "/Script/Engine.StringTable");
+        assert_eq!(json["string_table_namespace"], "TestNamespace");
+        assert_eq!(json["string_table_entries"][0]["key"], "Greeting");
+        assert_eq!(json["string_table_entries"][0]["source"], "Hello");
+        assert_eq!(json["row_count"], 0);
+        assert!(json.get("properties").is_none());
+
+        let mut output = InspectOutput::from_summary("test.uasset".to_owned(), &package.summary);
+        output.assets.push(asset);
+        output.decode_errors.push(DecodeErrorOutput {
+            object_path: "/Game/Test.Broken".to_owned(),
+            class_path: None,
+            kind: "malformed_data",
+            message: "bad tail".to_owned(),
+        });
+        let text = render_text_output(&output);
+        assert!(text.contains("path: test.uasset"));
+        assert!(text.contains("asset: StringTable /Game/Test.ST_Test rows=0"));
+        assert!(text.contains("namespace: TestNamespace"));
+        assert!(text.contains("  Greeting = Hello"));
+        assert!(text.contains("decode_error: /Game/Test.Broken [malformed_data] bad tail"));
+    }
+
+    #[test]
+    fn maps_every_decoded_asset_variant_to_a_stable_kind() {
+        use uasset_parser::asset::{
+            CurveTableMode, DataTableKind, DecodedCurveTable, DecodedDataAsset, DecodedDataTable,
+            DecodedEnum, DecodedSkeleton, DecodedStruct, DecodedUObject,
+        };
+        use uasset_parser::package::ObjectPath;
+
+        let package = tiny_package();
+        let path = || ObjectPath::new("/Game/Test.Asset");
+        let variants = vec![
+            (
+                DecodedAsset::DataTable(DecodedDataTable {
+                    kind: DataTableKind::Plain,
+                    object_path: path(),
+                    row_struct: None,
+                    parent_tables: Vec::new(),
+                    properties: empty_property_stream(),
+                    rows: Vec::new(),
+                }),
+                "DataTable",
+            ),
+            (
+                DecodedAsset::CurveTable(DecodedCurveTable {
+                    object_path: path(),
+                    mode: CurveTableMode::Empty,
+                    properties: empty_property_stream(),
+                    rows: Vec::new(),
+                }),
+                "CurveTable",
+            ),
+            (
+                DecodedAsset::DataAsset(DecodedDataAsset {
+                    object_path: path(),
+                    class_path: ObjectPath::new(DATA_ASSET_CLASS),
+                    object_guid: None,
+                    properties: empty_property_stream(),
+                }),
+                "DataAsset",
+            ),
+            (
+                DecodedAsset::UObject(DecodedUObject {
+                    object_path: path(),
+                    class_path: ObjectPath::new("/Script/CoreUObject.Object"),
+                    object_guid: None,
+                    properties: empty_property_stream(),
+                    tail: uasset_parser::Span::new(0, 0).expect("empty tail"),
+                }),
+                "UObject",
+            ),
+            (
+                DecodedAsset::Enum(DecodedEnum {
+                    object_path: path(),
+                    cpp_form: EnumCppForm::Regular,
+                    properties: empty_property_stream(),
+                    entries: Vec::new(),
+                }),
+                "Enum",
+            ),
+            (
+                DecodedAsset::Struct(DecodedStruct {
+                    object_path: path(),
+                    struct_flags: 0,
+                    properties: empty_property_stream(),
+                    fields: Vec::new(),
+                    default_values: empty_property_stream(),
+                }),
+                "Struct",
+            ),
+            (
+                DecodedAsset::Skeleton(DecodedSkeleton {
+                    object_path: path(),
+                    object_guid: None,
+                    properties: empty_property_stream(),
+                    bones: Vec::new(),
+                }),
+                "Skeleton",
+            ),
+        ];
+
+        for (decoded, expected_kind) in variants {
+            let output = asset_output_from_decoded(&package, decoded);
+            assert_eq!(output.kind, expected_kind);
+            assert_eq!(output.object_path, "/Game/Test.Asset");
+        }
+    }
+
     #[test]
     fn parses_inspect_contract() {
         assert_eq!(

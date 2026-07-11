@@ -855,14 +855,22 @@ mod tests {
     #[test]
     fn reads_little_endian_primitives() {
         let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(-7_i8).to_le_bytes());
+        bytes.extend_from_slice(&(-0x1234_i16).to_le_bytes());
         bytes.extend_from_slice(&0x1234_u16.to_le_bytes());
         bytes.extend_from_slice(&(-123_i32).to_le_bytes());
+        bytes.extend_from_slice(&0x0123_4567_89ab_cdef_u64.to_le_bytes());
+        bytes.extend_from_slice(&(-0x0123_4567_89ab_cdef_i64).to_le_bytes());
         bytes.extend_from_slice(&1.5_f32.to_le_bytes());
         bytes.extend_from_slice(&(-2.25_f64).to_le_bytes());
 
         let mut reader = Reader::new(&bytes);
+        assert_eq!(reader.read_i8("I8").unwrap(), -7);
+        assert_eq!(reader.read_i16("I16").unwrap(), -0x1234);
         assert_eq!(reader.read_u16("U16").unwrap(), 0x1234);
         assert_eq!(reader.read_i32("I32").unwrap(), -123);
+        assert_eq!(reader.read_u64("U64").unwrap(), 0x0123_4567_89ab_cdef);
+        assert_eq!(reader.read_i64("I64").unwrap(), -0x0123_4567_89ab_cdef);
         assert_eq!(reader.read_f32("F32").unwrap(), 1.5);
         assert_eq!(reader.read_f64("F64").unwrap(), -2.25);
         assert_eq!(reader.remaining(), 0);
@@ -913,6 +921,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_cursor_and_child_span_boundary_violations() {
+        let source = [0; 8];
+        let root = Reader::new(&source);
+        let mut child = root.bounded(Span::new(2, 4).unwrap(), "Child").unwrap();
+
+        let below = child.seek(1, "Below").unwrap_err();
+        assert_eq!(below.kind(), ArchiveErrorKind::InvalidSeek);
+        assert_eq!(child.tell(), 2);
+
+        let overflow = child.skip(u64::MAX, "Overflow").unwrap_err();
+        assert_eq!(overflow.kind(), ArchiveErrorKind::IntegerOverflow);
+        assert_eq!(child.tell(), 2);
+
+        let outside = child
+            .bounded(Span::new(1, 2).unwrap(), "Outside")
+            .unwrap_err();
+        assert_eq!(outside.kind(), ArchiveErrorKind::OutOfBounds);
+    }
+
+    #[test]
     fn reads_guid_hash_and_name_reference() {
         let mut bytes = Vec::new();
         for value in [1_u32, 2, 3, 4] {
@@ -950,6 +978,13 @@ mod tests {
         let error = Reader::new(&bytes).read_name_ref("Name").unwrap_err();
         assert_eq!(error.kind(), ArchiveErrorKind::InvalidNameReference);
         assert_eq!(error.path(), "Name.NameIndex");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0_i32.to_le_bytes());
+        bytes.extend_from_slice(&(-1_i32).to_le_bytes());
+        let error = Reader::new(&bytes).read_name_ref("Name").unwrap_err();
+        assert_eq!(error.kind(), ArchiveErrorKind::InvalidNameReference);
+        assert_eq!(error.path(), "Name.Number");
     }
 
     #[test]
@@ -978,6 +1013,28 @@ mod tests {
         let error = Reader::new(&bytes).read_fstring("Text").unwrap_err();
         assert_eq!(error.kind(), ArchiveErrorKind::MissingNullTerminator);
         assert_eq!(error.offset(), 7);
+    }
+
+    #[test]
+    fn rejects_minimum_signed_string_lengths() {
+        let bytes = i32::MIN.to_le_bytes();
+
+        let fstring_error = Reader::new(&bytes).read_fstring("Text").unwrap_err();
+        assert_eq!(fstring_error.kind(), ArchiveErrorKind::InvalidCount);
+        assert_eq!(fstring_error.path(), "Text.Length");
+
+        let subpath_error = Reader::new(&bytes)
+            .read_soft_object_subpath("SubPath")
+            .unwrap_err();
+        assert_eq!(subpath_error.kind(), ArchiveErrorKind::InvalidCount);
+        assert_eq!(subpath_error.path(), "SubPath.Length");
+    }
+
+    #[test]
+    fn rejects_span_end_overflow() {
+        let error = Span::new(u64::MAX, 1).unwrap_err();
+        assert_eq!(error.kind(), ArchiveErrorKind::IntegerOverflow);
+        assert_eq!(error.path(), "span");
     }
 
     #[test]

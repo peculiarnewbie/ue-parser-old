@@ -56,3 +56,47 @@ impl VersionContext {
         self.ue4 == 0 && self.ue5 == 0 && self.licensee == 0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_flags_preserve_bits_and_detect_individual_capabilities() {
+        let flags =
+            PackageFlags::from_bits(PackageFlags::COOKED | PackageFlags::FILTER_EDITOR_ONLY);
+
+        assert_eq!(
+            flags.bits(),
+            PackageFlags::COOKED | PackageFlags::FILTER_EDITOR_ONLY
+        );
+        assert!(flags.contains(PackageFlags::COOKED));
+        assert!(flags.contains(PackageFlags::FILTER_EDITOR_ONLY));
+        assert!(!flags.contains(PackageFlags::UNVERSIONED_PROPERTIES));
+    }
+
+    #[test]
+    fn version_predicates_include_the_boundary() {
+        let versions = VersionContext {
+            ue4: 522,
+            ue5: 1018,
+            licensee: 0,
+            ..VersionContext::default()
+        };
+
+        assert!(versions.is_at_least_ue4(522));
+        assert!(!versions.is_at_least_ue4(523));
+        assert!(versions.is_at_least_ue5(1018));
+        assert!(!versions.is_at_least_ue5(1019));
+        assert!(!versions.is_unversioned());
+
+        assert!(VersionContext::default().is_unversioned());
+        assert!(
+            !VersionContext {
+                licensee: 1,
+                ..VersionContext::default()
+            }
+            .is_unversioned()
+        );
+    }
+}
