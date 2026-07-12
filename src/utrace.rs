@@ -12106,6 +12106,8 @@ mod tests {
                 line: None,
                 count: 1,
                 format_args_bytes: 0,
+                sample_args: Vec::new(),
+                sample_message: None,
                 first_cycle: Some(50),
                 last_cycle: Some(50),
                 callstack_count: 1,
