@@ -14,6 +14,7 @@ const MAX_SYMBOL_CACHE: usize = 16_384;
 
 /// Result of resolving one relative address against a verified module identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SymbolResolveResult {
     Symbol {
         name: String,

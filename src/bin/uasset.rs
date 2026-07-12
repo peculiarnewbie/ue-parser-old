@@ -1410,12 +1410,16 @@ fn render_utrace_dashboard_text_output(output: &UtraceDashboardOutput) -> String
     }
     writeln!(
         rendered,
-        "stats: specs={} floating_point={} memory={} clear_every_frame={} groups={}",
+        "stats: specs={} floating_point={} memory={} clear_every_frame={} groups={} samples={} unresolved={} state_overflow={} malformed_batches={}",
         output.dashboard.stats.specs,
         output.dashboard.stats.floating_point_specs,
         output.dashboard.stats.memory_specs,
         output.dashboard.stats.clear_every_frame_specs,
-        output.dashboard.stats.groups.len()
+        output.dashboard.stats.groups.len(),
+        output.dashboard.stats.sample_events,
+        output.dashboard.stats.unresolved_samples,
+        output.dashboard.stats.sample_state_overflow,
+        output.dashboard.stats.malformed_batches
     )
     .unwrap();
     for group in output.dashboard.stats.groups.iter().take(10) {
@@ -3272,6 +3276,27 @@ mod tests {
                 gpu_timeline_limit: 5,
                 symbol_paths: Vec::new(),
             }))
+        );
+    }
+
+    #[test]
+    fn parses_repeatable_utrace_symbol_paths() {
+        let command = Command::parse(vec![
+            "utrace".into(),
+            "dashboard".into(),
+            "trace.utrace".into(),
+            "--symbol-path".into(),
+            "symbols/one".into(),
+            "--symbol-path=symbols/two".into(),
+        ])
+        .unwrap();
+
+        let Command::Utrace(UtraceCommand::Dashboard(options)) = command else {
+            panic!("expected dashboard command");
+        };
+        assert_eq!(
+            options.symbol_paths,
+            vec![PathBuf::from("symbols/one"), PathBuf::from("symbols/two")]
         );
     }
 

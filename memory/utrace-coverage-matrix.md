@@ -63,7 +63,7 @@ The area-level status table below is the human narrative layer on top of that.
 | Counters | partial | `Counters.Spec`, `Counters.SetValueInt`, `Counters.SetValueFloat` | `counters.specs`, `counters.counters`, inventory samples | Dashboard decodes counter specs and summarizes integer/float samples with min/max/latest values plus bounded per-counter sample points. Full unbounded counter time series output is not emitted yet. |
 | Bookmarks/regions | partial | `Misc.BookmarkSpec`, `Misc.Bookmark`, `Misc.RegionBegin`, `Misc.RegionBeginWithId`, `Misc.RegionEnd`, `Misc.RegionEndWithId` | `annotations.bookmarks`, `annotations.regions`, inventory samples | Dashboard decodes bookmark specs/events and pairs named/id regions into aggregate summaries. Bookmark `FormatArgs` samples are rendered against the spec format string (typed Insights stream, with heuristic `%s` fallback). Full annotation timelines are not emitted yet. |
 | CPU named scopes | partial | `Cpu.Frame` and other `Cpu.<Name>` events | `cpu.named_events` | The `Cpu` logger declares one event type per named CPU marker (e.g. `Cpu.Frame`), each carrying a generic payload sample such as `Name` and optional scalar fields like `SizeInBytes`. This is separate from the `CpuProfiler` spec/batch pipeline; full timeline reconstruction is not emitted yet. |
-| Stats | partial | `Stats.Spec`, `Stats.EventBatch2` | `stats.specs`, `stats.groups`, `stats.stats`, `stats.samples` | Spec catalog plus EventBatch2 opcode samples (min/max/latest, ≤40 points, top 64 hot stats). CPU-frame/targeted studio fixtures currently have catalogs only (`sample_events=0`). |
+| Stats | partial | `Stats.Spec`, `Stats.EventBatch2` | `stats.specs`, `stats.groups`, `stats.stats`, `stats.samples` | Spec catalog plus EventBatch2 opcode samples (min/max/latest, ≤40 points, top 64 hot stats). Per-stat aggregation is capped at 4,096 distinct ids and reports `sample_state_overflow`; samples without a decoded spec report through `unresolved_samples`. CPU-frame/targeted studio fixtures currently have catalogs only (`sample_events=0`). |
 | CSV profiler | partial | `CsvProfiler.RegisterCategory`, `DefineDeclaredStat`, `DefineInlineStat`, `BeginStat`, `EndStat`, `CustomStatInt`, `CustomStatFloat` | `csv.*`, `csv.duration_samples`, `csv.value_samples` | Catalog plus non-exclusive Begin/End durations and CustomStat samples (bounded). Exclusive CSV nesting and full CSV tables deferred. Studio fixtures currently lack sample events. |
 | Tasks | partial | `TaskTrace.Init` / lifecycle / `WaitingStarted` / `WaitingFinished` | `tasks` | Lifecycle counts, bounded named tasks, and wait interval pairing by thread. No full subsequent graph; WaitForTasks CPU-scope overlap correlation deferred. Requires `UTRACE_TASKS_FIXTURE` for live waits. |
 | Trace channels | partial | `Trace.ChannelAnnounce`, `Trace.ChannelToggle` | `channels.channels` | Dashboard decodes trace channel declarations, read-only flags, latest enabled state, and toggle counts. Distinct from the `$Trace` logger used for the prologue and threads. |
@@ -149,6 +149,15 @@ combined corpus contract requires LoadTime requests, counter values, memory
 scopes, and metadata-stack restoration. Memory allocation aggregation is checked
 separately with `UTRACE_MEMORY_FIXTURE`; IoStore request lifecycles require a
 cooked capture and are checked separately with `UTRACE_IOSTORE_FIXTURE`.
+Provider modules also carry always-on synthetic wire and resource-boundary tests.
+CI environments with access to the studio fixture corpus must additionally run:
+
+```text
+cargo test --all-features --test utrace_fixture -- --ignored
+```
+
+with the applicable `UTRACE_*_FIXTURE` variables set. Fixture absence must remain
+an explicit ignored contract; it must not turn into a silently passing test.
 
 Do not add the full coverage matrix back into the CLI JSON unless there is a
 runtime consumer that needs it. Prefer keeping parser capability notes here and

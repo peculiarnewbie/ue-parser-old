@@ -9,6 +9,7 @@ use crate::utrace::{
 
 const MAX_SAMPLE_POINTS_PER_STAT: usize = 40;
 const MAX_HOT_STATS: usize = 64;
+const MAX_STAT_STATES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -79,6 +80,7 @@ impl StatValueState {
 pub(crate) struct StatsSampleProvider {
     sample_events: u64,
     unresolved_samples: u64,
+    state_overflow: u64,
     malformed_batches: u64,
     states: BTreeMap<u32, StatValueState>,
 }
@@ -88,6 +90,7 @@ impl StatsSampleProvider {
         &mut self,
         event: &EventTypeInfo,
         data: &[u8],
+        known_stats: &BTreeMap<u32, impl Sized>,
         base_offset: u64,
     ) -> Result<(), TraceError> {
         let aux = parse_protocol5_aux(data, event_data_size(event), base_offset)?;
@@ -96,10 +99,18 @@ impl StatsSampleProvider {
             Ok(ops) => {
                 for raw in ops {
                     self.sample_events = self.sample_events.saturating_add(1);
-                    self.states
-                        .entry(raw.stat_id)
-                        .or_default()
-                        .apply(raw.cycle, raw.op, raw.amount);
+                    if !known_stats.contains_key(&raw.stat_id) {
+                        self.unresolved_samples = self.unresolved_samples.saturating_add(1);
+                    }
+                    if let Some(state) = self.states.get_mut(&raw.stat_id) {
+                        state.apply(raw.cycle, raw.op, raw.amount);
+                    } else if self.states.len() < MAX_STAT_STATES {
+                        let mut state = StatValueState::default();
+                        state.apply(raw.cycle, raw.op, raw.amount);
+                        self.states.insert(raw.stat_id, state);
+                    } else {
+                        self.state_overflow = self.state_overflow.saturating_add(1);
+                    }
                 }
                 Ok(())
             }
@@ -113,6 +124,7 @@ impl StatsSampleProvider {
     pub(crate) fn apply_to_dashboard(self, dashboard: &mut StatsDashboard) {
         dashboard.sample_events = self.sample_events;
         dashboard.unresolved_samples = self.unresolved_samples;
+        dashboard.sample_state_overflow = self.state_overflow;
         dashboard.malformed_batches = self.malformed_batches;
         let mut samples = self
             .states
@@ -265,6 +277,7 @@ impl<'a> StatsVarintReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utrace::{EventFlags, FieldFamily, FieldInfo, StatSpecSummary, StatsDashboard};
 
     fn push_varint(bytes: &mut Vec<u8>, mut value: u64) {
         while value >= 0x80 {
@@ -277,6 +290,40 @@ mod tests {
     fn push_zigzag(bytes: &mut Vec<u8>, value: i64) {
         let encoded = ((value << 1) ^ (value >> 63)) as u64;
         push_varint(bytes, encoded);
+    }
+
+    fn batch_event() -> EventTypeInfo {
+        EventTypeInfo {
+            uid: 1,
+            logger: "Stats".to_owned(),
+            event: "EventBatch2".to_owned(),
+            flags: EventFlags {
+                important: false,
+                maybe_has_aux: true,
+                no_sync: false,
+                definition: false,
+            },
+            fields: vec![FieldInfo {
+                name: "Data".to_owned(),
+                offset: 0,
+                size: 0,
+                family: FieldFamily::Regular,
+                type_name: "array".to_owned(),
+                ref_uid: None,
+            }],
+        }
+    }
+
+    fn encoded_batch(stat_id: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        push_varint(&mut payload, (u64::from(stat_id) << 3) | 3);
+        push_varint(&mut payload, 1);
+        push_zigzag(&mut payload, 1);
+        let pack = 1_u32 | (u32::try_from(payload.len()).unwrap() << 13);
+        let mut data = pack.to_le_bytes().to_vec();
+        data.extend_from_slice(&payload);
+        data.push(3);
+        data
     }
 
     #[test]
@@ -314,5 +361,48 @@ mod tests {
         push_varint(&mut batch, (1 << 3) | 7);
         push_varint(&mut batch, 1);
         assert!(decode_event_batch2(&batch, 0).is_err());
+    }
+
+    #[test]
+    fn distinct_stat_state_catalog_is_bounded() {
+        let mut provider = StatsSampleProvider::default();
+        let event = batch_event();
+        let known_stats = BTreeMap::<u32, ()>::new();
+        for stat_id in 0..=4_096 {
+            provider
+                .record_batch(&event, &encoded_batch(stat_id), &known_stats, 0)
+                .unwrap();
+        }
+
+        assert_eq!(provider.states.len(), 4_096);
+        let mut dashboard = StatsDashboard::default();
+        provider.apply_to_dashboard(&mut dashboard);
+        assert_eq!(dashboard.sample_events, 4_097);
+        assert_eq!(dashboard.sample_state_overflow, 1);
+    }
+
+    #[test]
+    fn unresolved_samples_are_compared_with_the_spec_catalog() {
+        let mut provider = StatsSampleProvider::default();
+        let known_stats = BTreeMap::from([(1_u32, ())]);
+        provider
+            .record_batch(&batch_event(), &encoded_batch(2), &known_stats, 0)
+            .unwrap();
+        let mut dashboard = StatsDashboard {
+            stats: vec![StatSpecSummary {
+                id: 1,
+                name: "Known".to_owned(),
+                description: String::new(),
+                group: String::new(),
+                is_floating_point: false,
+                is_memory: false,
+                should_clear_every_frame: false,
+            }],
+            ..StatsDashboard::default()
+        };
+
+        provider.apply_to_dashboard(&mut dashboard);
+
+        assert_eq!(dashboard.unresolved_samples, 1);
     }
 }

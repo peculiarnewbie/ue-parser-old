@@ -429,7 +429,8 @@ impl PlatformFileProvider {
         if let Some(index) = self.path_to_index.get(&path).copied() {
             return index;
         }
-        if self.files.len() >= MAX_FILES {
+        let reserved_slots = usize::from(self.unknown_file_index.is_none());
+        if self.files.len() >= MAX_FILES.saturating_sub(reserved_slots) {
             self.file_overflow = self.file_overflow.saturating_add(1);
             return self.unknown_file_index();
         }
@@ -446,10 +447,10 @@ impl PlatformFileProvider {
         if let Some(index) = self.unknown_file_index {
             return index;
         }
-        if self.files.len() >= MAX_FILES {
-            // Catalog is full; reuse index 0 as a last resort sink.
-            return 0;
-        }
+        debug_assert!(
+            self.files.len() < MAX_FILES,
+            "unknown slot must be reserved"
+        );
         let index = u32::try_from(self.files.len()).expect("file catalog within u32");
         self.unknown_file_index = Some(index);
         self.files.push(FileRec {
@@ -626,5 +627,22 @@ mod tests {
         assert_eq!(dashboard.activity_samples.len(), MAX_ACTIVITY_SAMPLES);
         assert_eq!(dashboard.activity_sample_overflow, 3);
         assert_eq!(dashboard.opens, MAX_ACTIVITY_SAMPLES as u64 + 3);
+    }
+
+    #[test]
+    fn full_file_catalog_uses_a_reserved_unknown_bucket() {
+        let mut provider = PlatformFileProvider::default();
+        for index in 0..MAX_FILES {
+            provider.file_index_for_path(format!("/known/{index}"));
+        }
+
+        let unknown = provider.file_index_for_handle(0xdead);
+        assert_ne!(
+            unknown, 0,
+            "overflow activity must not alias the first file"
+        );
+        assert_eq!(provider.files[unknown as usize].path, "");
+        assert_eq!(provider.files.len(), MAX_FILES);
+        assert_eq!(provider.file_overflow, 1);
     }
 }

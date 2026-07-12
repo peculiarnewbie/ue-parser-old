@@ -86,19 +86,20 @@ impl ModuleProvider {
             unloaded: false,
         };
 
+        let can_retain = self.retained_modules.contains_key(&base)
+            || self.retained_modules.len() < MAX_RETAINED_MODULES;
+        if !can_retain {
+            self.dropped = self.dropped.saturating_add(1);
+            self.truncated = true;
+            return Ok(());
+        }
+
         if self.active.insert(base, module.clone()).is_some() {
             self.duplicate_bases = self.duplicate_bases.saturating_add(1);
         }
 
-        if self.retained_modules.contains_key(&base)
-            || self.retained_modules.len() < MAX_RETAINED_MODULES
-        {
-            self.retained_modules.insert(base, module);
-            self.retained = u64::try_from(self.retained_modules.len()).unwrap_or(u64::MAX);
-        } else {
-            self.dropped = self.dropped.saturating_add(1);
-            self.truncated = true;
-        }
+        self.retained_modules.insert(base, module);
+        self.retained = u64::try_from(self.retained_modules.len()).unwrap_or(u64::MAX);
         Ok(())
     }
 
@@ -122,40 +123,15 @@ impl ModuleProvider {
     }
 
     pub(crate) fn map_address(&self, address: u64) -> ModuleFrameMapping {
-        let mut matches = self
-            .active
-            .values()
-            .filter(|module| {
-                !module.unloaded
-                    && address >= module.base
-                    && address < module.base.saturating_add(u64::from(module.size))
-            })
-            .collect::<Vec<_>>();
-
-        if matches.is_empty() {
-            // Also search retained unloaded modules for historical PCs (best-effort).
-            matches = self
-                .retained_modules
-                .values()
-                .filter(|module| {
-                    address >= module.base
-                        && address < module.base.saturating_add(u64::from(module.size))
-                })
-                .collect();
-        }
-
-        match matches.as_slice() {
-            [] => ModuleFrameMapping::Unmapped,
-            [module] => ModuleFrameMapping::Mapped(ModuleFrameMap {
-                module: module.name.clone(),
-                base: module.base,
-                relative_address: address - module.base,
-                identity: ModuleIdentity::from_image_id(&module.image_id),
-            }),
-            _ => ModuleFrameMapping::Ambiguous {
-                candidates: matches.iter().map(|module| module.name.clone()).collect(),
-            },
-        }
+        map_matching_modules(
+            self.active.values().filter(|module| !module.unloaded),
+            address,
+        )
+        .or_else(|| {
+            // Retained unloaded modules provide a best-effort mapping for historical PCs.
+            map_matching_modules(self.retained_modules.values(), address)
+        })
+        .unwrap_or(ModuleFrameMapping::Unmapped)
     }
 
     pub(crate) fn dashboard(self) -> ModuleDashboard {
@@ -189,6 +165,37 @@ impl ModuleProvider {
             modules,
         }
     }
+}
+
+fn map_matching_modules<'a>(
+    modules: impl Iterator<Item = &'a LoadedModule>,
+    address: u64,
+) -> Option<ModuleFrameMapping> {
+    let mut first: Option<&LoadedModule> = None;
+    let mut candidates = Vec::new();
+    for module in modules.filter(|module| {
+        address >= module.base && address < module.base.saturating_add(u64::from(module.size))
+    }) {
+        if let Some(first_match) = first {
+            if candidates.is_empty() {
+                candidates.push(first_match.name.clone());
+            }
+            candidates.push(module.name.clone());
+        } else {
+            first = Some(module);
+        }
+    }
+    if !candidates.is_empty() {
+        return Some(ModuleFrameMapping::Ambiguous { candidates });
+    }
+    first.map(|module| {
+        ModuleFrameMapping::Mapped(ModuleFrameMap {
+            module: module.name.clone(),
+            base: module.base,
+            relative_address: address - module.base,
+            identity: ModuleIdentity::from_image_id(&module.image_id),
+        })
+    })
 }
 
 pub(crate) fn decode_module_init(
@@ -432,6 +439,27 @@ mod tests {
             ModuleFrameMapping::Mapped(mapped) => assert_eq!(mapped.module, "A2.dll"),
             other => panic!("expected remapped module, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn active_module_catalog_is_bounded_with_retained_history() {
+        let mut provider = ModuleProvider::default();
+        provider.record_init(SymbolFormat::Pdb, 0);
+        for index in 0..=MAX_RETAINED_MODULES {
+            provider
+                .record_load(
+                    format!("Module{index}.dll"),
+                    0x1000 + u64::try_from(index).unwrap() * 0x1000,
+                    0x100,
+                    vec![0; 20],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(provider.active.len(), MAX_RETAINED_MODULES);
+        assert_eq!(provider.retained_modules.len(), MAX_RETAINED_MODULES);
+        assert_eq!(provider.dropped, 1);
+        assert!(provider.truncated);
     }
 
     #[test]

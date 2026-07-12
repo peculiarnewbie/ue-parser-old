@@ -739,6 +739,8 @@ pub struct StatsDashboard {
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub unresolved_samples: u64,
     #[serde(skip_serializing_if = "is_zero_u64")]
+    pub sample_state_overflow: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
     pub malformed_batches: u64,
     pub groups: Vec<StatGroupSummary>,
     pub stats: Vec<StatSpecSummary>,
@@ -994,6 +996,7 @@ pub struct PlatformFileSummary {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformFileActivityKind {
     Open,
@@ -1188,6 +1191,7 @@ impl SymbolFormat {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ModuleFrameMapping {
     Unmapped,
     Mapped(ModuleFrameMap),
@@ -3761,7 +3765,7 @@ fn read_dashboard_events(
                 0,
             )?;
         } else if (event.logger.as_str(), event.event.as_str()) == ("Stats", "EventBatch2") {
-            stats_samples.record_batch(event, &raw_event.data, 0)?;
+            stats_samples.record_batch(event, &raw_event.data, &stat_specs, 0)?;
         } else if event.logger.as_str() == "CsvProfiler"
             && matches!(
                 event.event.as_str(),
@@ -3964,13 +3968,14 @@ fn read_dashboard_events(
         &mut callstacks,
     );
     let mut symbol_cache = crate::utrace_symbols::SymbolCache::default();
+    let mut mapped_frame_cache = BTreeMap::<u64, MappedCallstackFrame>::new();
     decoded.callstacks = callstacks.dashboard_mapped(|address| {
-        Some(crate::utrace_symbols::map_frame(
-            &modules,
-            address,
-            None,
-            &mut symbol_cache,
-        ))
+        if let Some(mapped) = mapped_frame_cache.get(&address) {
+            return Some(mapped.clone());
+        }
+        let mapped = crate::utrace_symbols::map_frame(&modules, address, None, &mut symbol_cache);
+        mapped_frame_cache.insert(address, mapped.clone());
+        Some(mapped)
     });
     decoded.modules = modules.dashboard();
     decoded.logging = log_dashboard(
@@ -5237,6 +5242,7 @@ fn stats_dashboard(specs: BTreeMap<u32, StatSpec>) -> StatsDashboard {
         .unwrap(),
         sample_events: 0,
         unresolved_samples: 0,
+        sample_state_overflow: 0,
         malformed_batches: 0,
         groups,
         stats,
