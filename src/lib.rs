@@ -14,6 +14,8 @@ pub mod utrace;
 #[cfg(feature = "utrace")]
 pub(crate) mod utrace_csv;
 #[cfg(feature = "utrace")]
+pub(crate) mod utrace_callstacks;
+#[cfg(feature = "utrace")]
 pub mod utrace_dispatch;
 #[cfg(feature = "utrace")]
 pub(crate) mod utrace_memory;
@@ -21,6 +23,10 @@ pub(crate) mod utrace_memory;
 pub(crate) mod utrace_stats_batch;
 #[cfg(feature = "utrace")]
 pub(crate) mod utrace_tasks;
+#[cfg(feature = "utrace")]
+pub(crate) mod utrace_modules;
+#[cfg(feature = "utrace")]
+pub mod utrace_symbols;
 pub mod version;
 
 #[cfg(test)]

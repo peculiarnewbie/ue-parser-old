@@ -5,5 +5,7 @@ tests/fixtures/*
 !tests/fixtures/electroswag-v15.json
 !tests/fixtures/tiny/
 !tests/fixtures/tiny/*.hex
+!tests/fixtures/symbols/
+!tests/fixtures/symbols/probe.rs
 *.exe
 tmp_*.txt

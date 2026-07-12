@@ -136,6 +136,23 @@ fn tasks_fixture() -> PathBuf {
     )
 }
 
+fn callstack_fixture() -> PathBuf {
+    if let Some(path) = std::env::var_os("UTRACE_CALLSTACK_FIXTURE").map(PathBuf::from) {
+        return require_file_or_skip(path, "UTRACE_CALLSTACK_FIXTURE");
+    }
+    if let Some(path) = std::env::var_os("UTRACE_MEMORY_FIXTURE").map(PathBuf::from) {
+        return require_file_or_skip(path, "UTRACE_MEMORY_FIXTURE");
+    }
+    let studio_capture =
+        PathBuf::from("D:/Perforce/Arif_Fixtures/Traces/targeted-providers.utrace");
+    if studio_capture.is_file() {
+        return studio_capture;
+    }
+    missing_fixture(
+        "set UTRACE_CALLSTACK_FIXTURE (or UTRACE_MEMORY_FIXTURE) to a trace with Memory.CallstackSpec, Diagnostics.Module*, and a callstack-bearing alloc or bookmark".to_owned(),
+    )
+}
+
 fn missing_fixture(message: String) -> ! {
     panic!("{message}");
 }
@@ -1527,6 +1544,157 @@ fn memory_utrace_fixture_exposes_alloc_and_tag_summaries() {
     );
     if has_llm_tag_values {
         assert!(memory["llm"]["sample_events"].as_u64().unwrap() > 0);
+    }
+}
+
+#[test]
+#[ignore = "requires a CallstackSpec + Module* capture; set UTRACE_CALLSTACK_FIXTURE (optional UTRACE_SYMBOL_PATH for PDB enrichment)"]
+fn callstack_utrace_fixture_resolves_catalog_and_consumer_ids() {
+    let fixture = callstack_fixture();
+    let inventory_output = binary()
+        .args([
+            "utrace",
+            "inventory",
+            fixture.to_str().unwrap(),
+            "--format=json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        inventory_output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&inventory_output.stderr)
+    );
+    let inventory: Value = serde_json::from_slice(&inventory_output.stdout).unwrap();
+    let events = inventory["inventory"]["events"].as_array().unwrap();
+    let callstack_events = events
+        .iter()
+        .find(|event| event["logger"] == "Memory" && event["event"] == "CallstackSpec")
+        .expect("fixture must declare Memory.CallstackSpec");
+    assert!(
+        callstack_events["observed_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "fixture must observe CallstackSpec payloads, not only the declaration"
+    );
+    let module_load = events
+        .iter()
+        .find(|event| event["logger"] == "Diagnostics" && event["event"] == "ModuleLoad")
+        .expect("fixture must declare Diagnostics.ModuleLoad");
+    assert!(
+        module_load["observed_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "fixture must observe ModuleLoad payloads for address mapping"
+    );
+
+    let mut dashboard_args = vec![
+        "utrace".to_owned(),
+        "dashboard".to_owned(),
+        fixture.to_str().unwrap().to_owned(),
+        "--format=json".to_owned(),
+    ];
+    let symbol_path = std::env::var_os("UTRACE_SYMBOL_PATH")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir());
+    if let Some(path) = &symbol_path {
+        dashboard_args.push("--symbol-path".to_owned());
+        dashboard_args.push(path.to_string_lossy().into_owned());
+    }
+
+    let dashboard_output = binary().args(&dashboard_args).output().unwrap();
+    assert_eq!(
+        dashboard_output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&dashboard_output.stderr)
+    );
+    let dashboard: Value = serde_json::from_slice(&dashboard_output.stdout).unwrap();
+    let callstacks = &dashboard["dashboard"]["callstacks"];
+    assert!(callstacks["retained"].as_u64().unwrap() > 0);
+    let stacks = callstacks["stacks"].as_array().unwrap();
+    assert!(
+        stacks.iter().any(|stack| {
+            stack["id"].as_u64().is_some_and(|id| id > 0)
+                && stack["frames"]
+                    .as_array()
+                    .is_some_and(|frames| !frames.is_empty())
+        }),
+        "expected at least one nonzero stack with decoded frames"
+    );
+
+    let modules = &dashboard["dashboard"]["modules"];
+    assert_eq!(modules["init_seen"], true);
+    assert_eq!(modules["symbol_format"], "pdb");
+    assert!(modules["retained"].as_u64().unwrap() > 0);
+    assert!(
+        modules["modules"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty()),
+        "expected retained module catalog entries"
+    );
+
+    let mapped_module_frames: Vec<&Value> = stacks
+        .iter()
+        .flat_map(|stack| stack["mapped_frames"].as_array().into_iter().flatten())
+        .filter(|frame| {
+            frame["status"] == "module_offset"
+                || frame["status"] == "symbol"
+                || frame["status"] == "symbols_missing"
+        })
+        .collect();
+    assert!(
+        mapped_module_frames.len() >= 3,
+        "expected at least three module-mapped frames (got {})",
+        mapped_module_frames.len()
+    );
+    assert!(
+        mapped_module_frames.iter().all(|frame| {
+            frame["module"]
+                .as_str()
+                .is_some_and(|name| !name.is_empty())
+                && frame["relative_address"]
+                    .as_str()
+                    .is_some_and(|rva| rva.starts_with("0x"))
+                && frame["address"]
+                    .as_str()
+                    .is_some_and(|address| address.starts_with("0x"))
+        }),
+        "mapped frames must keep raw address plus module+relative_address"
+    );
+
+    let resolved_alloc = dashboard["dashboard"]["memory"]["allocs"]["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|sample| sample["callstack"] == "resolved");
+    let resolved_bookmark = dashboard["dashboard"]["annotations"]["bookmarks"]["bookmarks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|bookmark| {
+            bookmark["callstack_samples"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .any(|sample| sample["callstack"] == "resolved");
+    assert!(
+        resolved_alloc || resolved_bookmark,
+        "expected at least one resolved consumer callstack id on an alloc or bookmark sample"
+    );
+
+    if symbol_path.is_some() {
+        let symbolized = stacks
+            .iter()
+            .flat_map(|stack| stack["mapped_frames"].as_array().into_iter().flatten())
+            .filter(|frame| frame["status"] == "symbol")
+            .count();
+        assert!(
+            symbolized >= 3,
+            "UTRACE_SYMBOL_PATH set but fewer than three symbolized frames (got {symbolized}); confirm PDBs match traced ImageId GUID+age"
+        );
     }
 }
 

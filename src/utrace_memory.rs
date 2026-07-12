@@ -3,10 +3,10 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::utrace::{
-    MemoryAllocationDashboard, MemoryAllocationKind, MemoryAllocationSample, MemoryDashboard,
-    MemoryInitSummary, MemoryLlmDashboard, MemoryLlmTagSetSummary, MemoryLlmTagSummary,
-    MemoryLlmTrackerSummary, MemoryLlmValueSummary, MemoryRootHeapSummary, MemoryScopeSummary,
-    MemoryTagSummary,
+    CallstackResolution, MemoryAllocationDashboard, MemoryAllocationKind, MemoryAllocationSample,
+    MemoryDashboard, MemoryInitSummary, MemoryLlmDashboard, MemoryLlmTagSetSummary,
+    MemoryLlmTagSummary, MemoryLlmTrackerSummary, MemoryLlmValueSummary, MemoryRootHeapSummary,
+    MemoryScopeSummary, MemoryTagSummary,
 };
 
 const MAX_TAGS: usize = 4_096;
@@ -167,6 +167,7 @@ impl MemoryProvider {
                 size: allocation.size,
                 root_heap: allocation.root_heap,
                 callstack_id: allocation.callstack_id,
+                callstack: CallstackResolution::None,
                 kind: allocation.kind,
             });
         }

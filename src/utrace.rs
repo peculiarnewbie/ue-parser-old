@@ -5,9 +5,13 @@ use std::fmt;
 
 use serde::Serialize;
 
+use crate::utrace_callstacks::{CallstackId, CallstackProvider, decode_callstack_spec};
 use crate::utrace_memory::{
     LlmTag, LlmTagSet, LlmTracker, MemoryAllocation, MemoryFree, MemoryInit, MemoryProvider,
     MemoryTag,
+};
+use crate::utrace_modules::{
+    ModuleProvider, decode_module_init, decode_module_load, decode_module_unload,
 };
 use crate::{ArchiveError, ArchiveErrorKind, Reader};
 
@@ -57,6 +61,8 @@ pub struct TraceDashboard {
     pub io_store: IoStoreDashboard,
     pub trace_timing: TraceTimingDashboard,
     pub memory: MemoryDashboard,
+    pub callstacks: CallstackDashboard,
+    pub modules: ModuleDashboard,
     pub metadata_stack: MetadataStackDashboard,
     pub slate: SlateDashboard,
     pub channels: TraceChannelDashboard,
@@ -968,6 +974,153 @@ pub struct MemoryDashboard {
     pub llm: MemoryLlmDashboard,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct CallstackDashboard {
+    pub observed: u64,
+    pub retained: u64,
+    pub dropped: u64,
+    pub truncated: bool,
+    pub duplicate_ids: u64,
+    pub malformed: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub id_zero: u64,
+    pub total_frames_retained: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub unresolved_references: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stacks: Vec<CallstackEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CallstackEntry {
+    pub id: u32,
+    pub frame_count: u64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub frames_truncated: bool,
+    /// Raw program-counter addresses as JSON-safe hex strings.
+    pub frames: Vec<String>,
+    /// Module/relative mapping for the same ordered frames (empty when unmapped).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mapped_frames: Vec<MappedCallstackFrame>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MappedCallstackFrame {
+    pub address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ModuleIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub status: MappedFrameStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum MappedFrameStatus {
+    Unmapped,
+    ModuleOffset,
+    Symbol,
+    Ambiguous,
+    IdentityMismatch,
+    SymbolsMissing,
+    ResolverError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum CallstackResolution {
+    None,
+    Resolved,
+    Missing,
+    CatalogTruncated,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct ModuleDashboard {
+    pub init_seen: bool,
+    pub missing_init: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_format: Option<SymbolFormat>,
+    pub module_base_shift: u8,
+    pub observed_loads: u64,
+    pub observed_unloads: u64,
+    pub retained: u64,
+    pub dropped: u64,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub duplicate_bases: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub unload_without_load: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub malformed: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub modules: Vec<ModuleEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ModuleEntry {
+    pub name: String,
+    pub base: String,
+    pub size: u32,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub image_id_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ModuleIdentity>,
+    pub unloaded: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ModuleIdentity {
+    pub guid: String,
+    pub age: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolFormat {
+    Pdb,
+    Dwarf,
+    Psym,
+    Other,
+}
+
+impl SymbolFormat {
+    pub(crate) fn parse(value: &str) -> Self {
+        match value {
+            "pdb" => Self::Pdb,
+            "dwarf" => Self::Dwarf,
+            "psym" => Self::Psym,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModuleFrameMapping {
+    Unmapped,
+    Mapped(ModuleFrameMap),
+    Ambiguous { candidates: Vec<String> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleFrameMap {
+    pub module: String,
+    pub base: u64,
+    pub relative_address: u64,
+    pub identity: Option<ModuleIdentity>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct MemoryInitSummary {
     pub version: u8,
@@ -1021,6 +1174,7 @@ pub struct MemoryAllocationSample {
     pub size: u64,
     pub root_heap: u8,
     pub callstack_id: u32,
+    pub callstack: CallstackResolution,
     pub kind: MemoryAllocationKind,
 }
 
@@ -1272,6 +1426,15 @@ pub struct BookmarkSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_cycle: Option<u64>,
     pub callstack_count: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub callstack_samples: Vec<BookmarkCallstackSample>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BookmarkCallstackSample {
+    pub cycle: u64,
+    pub callstack_id: u32,
+    pub callstack: CallstackResolution,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -2124,6 +2287,12 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
         note: "Video-root reallocation frees paired only against bounded tracked addresses.",
     },
     EventCoverage {
+        logger: "Memory",
+        event: "CallstackSpec",
+        status: DecodeStatus::Partial,
+        note: "Bounded raw callstack catalog (CallstackId + u64 program counters); no module/symbol resolution.",
+    },
+    EventCoverage {
         logger: "LLM",
         event: "TagsSpec",
         status: DecodeStatus::Partial,
@@ -2314,6 +2483,24 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
         event: "Session2",
         status: DecodeStatus::Partial,
         note: "Session identity fields; instance id emitted as raw hex.",
+    },
+    EventCoverage {
+        logger: "Diagnostics",
+        event: "ModuleInit",
+        status: DecodeStatus::Partial,
+        note: "Symbol format and ModuleBaseShift for address reconstruction (Insights parity).",
+    },
+    EventCoverage {
+        logger: "Diagnostics",
+        event: "ModuleLoad",
+        status: DecodeStatus::Partial,
+        note: "Bounded module catalog with base/size/ImageId; Windows PDB identity is Guid+Age.",
+    },
+    EventCoverage {
+        logger: "Diagnostics",
+        event: "ModuleUnload",
+        status: DecodeStatus::Partial,
+        note: "Module unload by reconstructed base address.",
     },
 ];
 
@@ -2863,6 +3050,8 @@ struct DecodedDashboardEvents {
     io_store: IoStoreDashboard,
     trace_timing: TraceTimingDashboard,
     memory: MemoryDashboard,
+    callstacks: CallstackDashboard,
+    modules: ModuleDashboard,
     metadata_stack: MetadataStackDashboard,
     slate: SlateDashboard,
     channels: TraceChannelDashboard,
@@ -2926,6 +3115,8 @@ pub fn dashboard_with_options(
         io_store: dashboard.io_store,
         trace_timing: dashboard.trace_timing,
         memory: dashboard.memory,
+        callstacks: dashboard.callstacks,
+        modules: dashboard.modules,
         metadata_stack: dashboard.metadata_stack,
         slate: dashboard.slate,
         channels: dashboard.channels,
@@ -3049,6 +3240,8 @@ fn read_dashboard_events(
     let mut trace_thread_timing = BTreeMap::<u16, TraceThreadTimingSummary>::new();
     let mut cpu_end_threads = Vec::<CpuEndThreadSummary>::new();
     let mut memory = MemoryProvider::default();
+    let mut callstacks = CallstackProvider::default();
+    let mut modules = ModuleProvider::default();
     let mut metadata_stack = MetadataStackState::default();
     let mut slate_widgets = BTreeMap::<u64, SlateWidgetState>::new();
     let mut trace_channels = BTreeMap::<u32, TraceChannelState>::new();
@@ -3230,6 +3423,20 @@ fn read_dashboard_events(
                 ("Diagnostics", "Session2") => {
                     session = Some(decode_session(event, raw_event.data, raw_event.offset + 4)?);
                 }
+                ("Diagnostics", "ModuleInit") => {
+                    let (format, shift) =
+                        decode_module_init(event, raw_event.data, raw_event.offset + 4)?;
+                    modules.record_init(format, shift);
+                }
+                ("Diagnostics", "ModuleLoad") => {
+                    let (name, base, size, image_id) =
+                        decode_module_load(event, raw_event.data, raw_event.offset + 4)?;
+                    modules.record_load(name, base, size, image_id)?;
+                }
+                ("Diagnostics", "ModuleUnload") => {
+                    let base = decode_module_unload(event, raw_event.data, raw_event.offset + 4)?;
+                    modules.record_unload(base)?;
+                }
                 ("CpuProfiler", "EndThread") => {
                     cpu_end_threads.push(decode_cpu_end_thread(
                         event,
@@ -3247,6 +3454,13 @@ fn read_dashboard_events(
                 }
                 ("Memory", "TagSpec") => {
                     memory.record_tag(decode_memory_tag(
+                        event,
+                        raw_event.data,
+                        raw_event.offset + 4,
+                    )?);
+                }
+                ("Memory", "CallstackSpec") => {
+                    callstacks.record(decode_callstack_spec(
                         event,
                         raw_event.data,
                         raw_event.offset + 4,
@@ -3433,6 +3647,9 @@ fn read_dashboard_events(
                 "MemoryScope" => {
                     memory.record_scope(decode_memory_scope(event, &raw_event.data, 0)?);
                 }
+                "CallstackSpec" => {
+                    callstacks.record(decode_callstack_spec(event, &raw_event.data, 0)?);
+                }
                 "Alloc" | "AllocSystem" | "AllocVideo" | "ReallocAlloc" | "ReallocAllocSystem"
                 | "ReallocAllocVideo" => {
                     let init = memory.init().ok_or_else(|| {
@@ -3581,6 +3798,21 @@ fn read_dashboard_events(
         unresolved_bookmark_events,
         region_state,
     );
+    apply_callstack_resolutions(
+        &mut decoded.memory,
+        &mut decoded.annotations.bookmarks,
+        &mut callstacks,
+    );
+    let mut symbol_cache = crate::utrace_symbols::SymbolCache::default();
+    decoded.callstacks = callstacks.dashboard_mapped(|address| {
+        Some(crate::utrace_symbols::map_frame(
+            &modules,
+            address,
+            None,
+            &mut symbol_cache,
+        ))
+    });
+    decoded.modules = modules.dashboard();
     decoded.logging = log_dashboard(
         log_categories,
         log_message_specs,
@@ -6077,7 +6309,10 @@ struct BookmarkState {
     first_cycle: Option<u64>,
     last_cycle: Option<u64>,
     callstack_count: u64,
+    callstack_samples: Vec<BookmarkCallstackSample>,
 }
+
+const MAX_BOOKMARK_CALLSTACK_SAMPLES: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct OpenRegion {
@@ -6148,6 +6383,13 @@ fn decode_misc_annotation_event(
             state.last_cycle = Some(cycle);
             if callstack_id != 0 {
                 state.callstack_count += 1;
+                if state.callstack_samples.len() < MAX_BOOKMARK_CALLSTACK_SAMPLES {
+                    state.callstack_samples.push(BookmarkCallstackSample {
+                        cycle,
+                        callstack_id,
+                        callstack: CallstackResolution::Missing,
+                    });
+                }
             }
         }
         "RegionBegin" => {
@@ -6227,6 +6469,35 @@ fn record_region(region_state: &mut RegionState, open: OpenRegion, end_cycle: u6
     region_state.completed += 1;
 }
 
+fn apply_callstack_resolutions(
+    memory: &mut MemoryDashboard,
+    bookmarks: &mut BookmarkDashboard,
+    callstacks: &mut CallstackProvider,
+) {
+    for sample in &mut memory.allocs.samples {
+        let resolution = callstacks.resolve(CallstackId(sample.callstack_id));
+        sample.callstack = resolution;
+        if matches!(
+            resolution,
+            CallstackResolution::Missing | CallstackResolution::CatalogTruncated
+        ) {
+            callstacks.note_unresolved_reference();
+        }
+    }
+    for bookmark in &mut bookmarks.bookmarks {
+        for sample in &mut bookmark.callstack_samples {
+            let resolution = callstacks.resolve(CallstackId(sample.callstack_id));
+            sample.callstack = resolution;
+            if matches!(
+                resolution,
+                CallstackResolution::Missing | CallstackResolution::CatalogTruncated
+            ) {
+                callstacks.note_unresolved_reference();
+            }
+        }
+    }
+}
+
 fn annotation_dashboard(
     bookmark_specs: BTreeMap<u64, BookmarkSpec>,
     bookmark_states: BTreeMap<u64, BookmarkState>,
@@ -6258,6 +6529,7 @@ fn bookmark_dashboard(
                 first_cycle: state.first_cycle,
                 last_cycle: state.last_cycle,
                 callstack_count: state.callstack_count,
+                callstack_samples: state.callstack_samples,
             }
         })
         .collect::<Vec<_>>();
@@ -8765,7 +9037,7 @@ fn optional_aux_string(
         .map(|bytes| decode_ansi_bytes(bytes)))
 }
 
-fn optional_aux_text(
+pub(crate) fn optional_aux_text(
     event: &EventTypeInfo,
     aux: &BTreeMap<u8, Vec<u8>>,
     name: &str,
@@ -11089,6 +11361,15 @@ mod tests {
         );
         assert_eq!(dashboard.bookmarks.bookmarks[0].line, Some(77));
         assert_eq!(dashboard.bookmarks.bookmarks[0].callstack_count, 1);
+        assert_eq!(dashboard.bookmarks.bookmarks[0].callstack_samples.len(), 1);
+        assert_eq!(
+            dashboard.bookmarks.bookmarks[0].callstack_samples[0].callstack_id,
+            42
+        );
+        assert_eq!(
+            dashboard.bookmarks.bookmarks[0].callstack_samples[0].cycle,
+            100
+        );
         assert_eq!(dashboard.regions.begin_events, 2);
         assert_eq!(dashboard.regions.end_events, 2);
         assert_eq!(dashboard.regions.completed, 2);
@@ -11333,6 +11614,146 @@ mod tests {
             sample.fields["Name"],
             SampleValue::String("MyActor".to_owned())
         );
+    }
+
+    #[test]
+    fn dashboard_decodes_callstack_catalog_as_partial() {
+        let callstack_uid = 90_u16;
+        let declaration = new_event(
+            callstack_uid,
+            0x07,
+            "Memory",
+            "CallstackSpec",
+            &[
+                regular_field(0, 4, UINT32, "CallstackId"),
+                regular_field(4, 0, ARRAY, "Frames"),
+            ],
+        );
+
+        let mut frames = Vec::new();
+        frames.extend_from_slice(&0x1000_u64.to_le_bytes());
+        frames.extend_from_slice(&0x2000_u64.to_le_bytes());
+        frames.extend_from_slice(&0x3000_u64.to_le_bytes());
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7_u32.to_le_bytes());
+        payload.extend_from_slice(&aux(1, &frames));
+        payload.push(3);
+
+        let bytes = trace_with_events(&[
+            important_event(0, &declaration),
+            important_event(callstack_uid, &payload),
+        ]);
+        let dashboard = dashboard(&bytes).unwrap();
+        let inventory = inventory(&bytes).unwrap();
+
+        assert_eq!(dashboard.callstacks.observed, 1);
+        assert_eq!(dashboard.callstacks.retained, 1);
+        assert_eq!(dashboard.callstacks.stacks.len(), 1);
+        assert_eq!(dashboard.callstacks.stacks[0].id, 7);
+        assert_eq!(
+            dashboard.callstacks.stacks[0].frames,
+            vec![
+                "0x1000".to_owned(),
+                "0x2000".to_owned(),
+                "0x3000".to_owned()
+            ]
+        );
+        assert!(
+            !dashboard
+                .unmodeled
+                .events
+                .iter()
+                .any(|event| event.logger == "Memory" && event.event == "CallstackSpec")
+        );
+        let entry = inventory
+            .events
+            .iter()
+            .find(|event| event.logger == "Memory" && event.event == "CallstackSpec")
+            .expect("CallstackSpec should be declared");
+        assert_eq!(entry.decode_status, DecodeStatus::Partial);
+        assert_eq!(entry.observed_count, 1);
+    }
+
+    #[test]
+    fn callstack_joins_keep_frames_only_in_catalog() {
+        let mut callstacks = CallstackProvider::default();
+        callstacks.record(crate::utrace_callstacks::DecodedCallstackSpec {
+            id: CallstackId(9),
+            frames: vec![0xaa, 0xbb],
+            declared_frame_count: 2,
+            frames_truncated: false,
+        });
+
+        let mut memory = MemoryProvider::default();
+        memory.record_allocation(MemoryAllocation {
+            address: 0x10,
+            size: 32,
+            root_heap: 0,
+            callstack_id: 9,
+            kind: MemoryAllocationKind::Alloc,
+        });
+        memory.record_allocation(MemoryAllocation {
+            address: 0x20,
+            size: 8,
+            root_heap: 0,
+            callstack_id: 0,
+            kind: MemoryAllocationKind::Alloc,
+        });
+
+        let mut memory_dashboard = memory.dashboard();
+        let mut bookmark_dashboard = BookmarkDashboard {
+            specs: 1,
+            events: 1,
+            format_args_bytes: 0,
+            unresolved_events: 0,
+            bookmarks: vec![BookmarkSummary {
+                bookmark_point: 1,
+                format_string: "mark".to_owned(),
+                file: None,
+                line: None,
+                count: 1,
+                format_args_bytes: 0,
+                first_cycle: Some(50),
+                last_cycle: Some(50),
+                callstack_count: 1,
+                callstack_samples: vec![BookmarkCallstackSample {
+                    cycle: 50,
+                    callstack_id: 9,
+                    callstack: CallstackResolution::Missing,
+                }],
+            }],
+        };
+
+        apply_callstack_resolutions(
+            &mut memory_dashboard,
+            &mut bookmark_dashboard,
+            &mut callstacks,
+        );
+        let callstack_dashboard = callstacks.dashboard_mapped(|_| None);
+
+        assert_eq!(
+            memory_dashboard.allocs.samples[0].callstack,
+            CallstackResolution::Resolved
+        );
+        assert_eq!(
+            memory_dashboard.allocs.samples[1].callstack,
+            CallstackResolution::None
+        );
+        assert_eq!(
+            bookmark_dashboard.bookmarks[0].callstack_samples[0].callstack,
+            CallstackResolution::Resolved
+        );
+        assert_eq!(callstack_dashboard.stacks[0].frames.len(), 2);
+
+        let memory_json = serde_json::to_value(&memory_dashboard.allocs.samples[0]).unwrap();
+        let bookmark_json =
+            serde_json::to_value(&bookmark_dashboard.bookmarks[0].callstack_samples[0]).unwrap();
+        let catalog_json = serde_json::to_value(&callstack_dashboard.stacks[0]).unwrap();
+        assert!(memory_json.get("frames").is_none());
+        assert!(bookmark_json.get("frames").is_none());
+        assert_eq!(catalog_json["frames"], serde_json::json!(["0xaa", "0xbb"]));
+        assert_eq!(callstack_dashboard.unresolved_references, 0);
     }
 
     #[test]

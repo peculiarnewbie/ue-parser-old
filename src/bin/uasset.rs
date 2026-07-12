@@ -71,6 +71,8 @@ struct InspectOptions {
     max_frames: usize,
     gpu_timeline_frame: Option<u32>,
     gpu_timeline_limit: usize,
+    /// Repeatable local symbol search roots (`--symbol-path`). Never network.
+    symbol_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -219,6 +221,7 @@ impl Command {
             max_frames: 120,
             gpu_timeline_frame: None,
             gpu_timeline_limit: 500,
+            symbol_paths: Vec::new(),
         }))
     }
 
@@ -230,6 +233,7 @@ impl Command {
         let mut max_frames = 120;
         let mut gpu_timeline_frame = None;
         let mut gpu_timeline_limit = 500;
+        let mut symbol_paths = Vec::new();
         let mut index = 0;
 
         while index < arguments.len() {
@@ -310,6 +314,16 @@ impl Command {
                         "--gpu-timeline-limit",
                     )?;
                 }
+                Some("--symbol-path") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--symbol-path requires a directory".to_owned())?;
+                    symbol_paths.push(PathBuf::from(value));
+                }
+                Some(value) if value.starts_with("--symbol-path=") => {
+                    symbol_paths.push(PathBuf::from(&value["--symbol-path=".len()..]));
+                }
                 Some("-h" | "--help") => {
                     return Err("use `uasset help` for command usage".to_owned());
                 }
@@ -333,6 +347,7 @@ impl Command {
             max_frames,
             gpu_timeline_frame,
             gpu_timeline_limit,
+            symbol_paths,
         })
     }
 
@@ -569,7 +584,8 @@ fn dashboard_utrace(options: &InspectOptions) -> u8 {
         }
     };
 
-    let dashboard = match uasset_parser::utrace::dashboard_with_options(
+    #[allow(unused_mut)] // mutated when `utrace-symbols` is enabled
+    let mut dashboard = match uasset_parser::utrace::dashboard_with_options(
         &bytes,
         uasset_parser::utrace::DashboardOptions {
             timeline_frame: options.timeline_frame,
@@ -586,6 +602,28 @@ fn dashboard_utrace(options: &InspectOptions) -> u8 {
             return exit_code;
         }
     };
+    if !options.symbol_paths.is_empty() {
+        #[cfg(feature = "utrace-symbols")]
+        {
+            let mut resolver =
+                uasset_parser::utrace_symbols::PdbSymbolResolver::new(options.symbol_paths.clone());
+            uasset_parser::utrace_symbols::enrich_callstacks_with_symbols(
+                &mut dashboard.callstacks,
+                &mut resolver,
+            );
+        }
+        #[cfg(not(feature = "utrace-symbols"))]
+        {
+            write_utrace_error(
+                options.format,
+                UtraceErrorOutput::io(
+                    input_name,
+                    "--symbol-path requires the utrace-symbols feature".to_owned(),
+                ),
+            );
+            return EXIT_USAGE;
+        }
+    }
     let output = UtraceDashboardOutput {
         schema_version: UTRACE_SCHEMA_VERSION,
         status: "ok",
@@ -2919,7 +2957,7 @@ uasset - inspect classic Unreal Engine asset packages
 Usage:
   uasset inspect <path|-> [--format text|json]
   uasset utrace inspect <path|-> [--format text|json]
-  uasset utrace dashboard <path|-> [--format text|json] [--frame <n>] [--timeline-limit <n>] [--max-frames <n>] [--gpu-frame <n>] [--gpu-timeline-limit <n>]
+  uasset utrace dashboard <path|-> [--format text|json] [--frame <n>] [--timeline-limit <n>] [--max-frames <n>] [--gpu-frame <n>] [--gpu-timeline-limit <n>] [--symbol-path <dir>]...
   uasset utrace inventory <path|-> [--format text|json]
   uasset utrace coverage <path|-> [--universe <file>] [--format text|json]
   uasset utrace html <path|-> [--output <file>]
@@ -2954,6 +2992,7 @@ Options:
   --frame <n>                 Retain a CPU metadata-frame timeline.
   --timeline-limit <n>        Max retained CPU timeline intervals (default: 500).
   --max-frames <n>            Max retained GPU/correlated frame rows (default: 120).
+  --symbol-path <dir>         Local PDB search root (repeatable; requires utrace-symbols).
   --gpu-frame <n>             Retain a queue-local GPU-frame timeline.
   --gpu-timeline-limit <n>    Max retained GPU timeline intervals (default: 500).
 ";
@@ -3133,6 +3172,7 @@ mod tests {
                 max_frames: 120,
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
+                symbol_paths: Vec::new(),
             })
         );
     }
@@ -3149,6 +3189,7 @@ mod tests {
                 max_frames: 120,
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
+                symbol_paths: Vec::new(),
             })
         );
     }
@@ -3177,6 +3218,7 @@ mod tests {
                 max_frames: 120,
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
+                symbol_paths: Vec::new(),
             }))
         );
     }
@@ -3200,6 +3242,7 @@ mod tests {
                 max_frames: 120,
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
+                symbol_paths: Vec::new(),
             }))
         );
     }
@@ -3227,6 +3270,7 @@ mod tests {
                 max_frames: 10,
                 gpu_timeline_frame: Some(42),
                 gpu_timeline_limit: 5,
+                symbol_paths: Vec::new(),
             }))
         );
     }
@@ -3257,6 +3301,7 @@ mod tests {
                 max_frames: 120,
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
+                symbol_paths: Vec::new(),
             }))
         );
     }
@@ -3279,6 +3324,7 @@ mod tests {
                 max_frames: 120,
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
+                symbol_paths: Vec::new(),
             }))
         );
     }

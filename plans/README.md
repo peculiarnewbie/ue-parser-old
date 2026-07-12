@@ -28,8 +28,8 @@ even though that family is absent from the CPU-frame fixture.
 | 003 | Memory/LLM allocation provider | P0 | L | — (parallel with 001/002 after capture exists) | DONE |
 | 004 | Counter / Stats.EventBatch2 / CSV samples | P1 | M | targeted fixture with samples | DONE |
 | 005 | TaskTrace waits + thread-group membership | P1 | L | 002 helpful for correlating waits to frames | DONE |
-| 006 | Bounded callstack catalog + ID joins | P0 | L | coordinate with 003 | TODO |
-| 007 | Module-aware optional symbolization | P0 | L/XL | 006 | TODO |
+| 006 | Bounded callstack catalog + ID joins | P0 | L | coordinate with 003 | DONE |
+| 007 | Module-aware optional symbolization | P0 | L/XL | 006 | DONE |
 
 Status values: `TODO` | `IN PROGRESS` | `DONE` | `BLOCKED` | `REJECTED`
 
@@ -68,6 +68,7 @@ provider implementation task.
 | `UTRACE_IOSTORE_FIXTURE` | out of P0/P1 scope (keep ignored test as-is) |
 | `UTRACE_TASKS_FIXTURE` | TaskTrace wait traffic (`WaitingStarted` / `WaitingFinished`) |
 | `UTRACE_CALLSTACK_FIXTURE` | CallstackSpec + module diagnostics + at least one callstack-bearing consumer |
+| `UTRACE_SYMBOL_PATH` | Optional local PDB root for ignored callstack fixture symbolization (`utrace-symbols`) |
 
 Capture recipes live inside plans 003 and 004. The CPU-frame fixture will
 **never** exercise Memory/LLM; that is expected, not a parser failure.
