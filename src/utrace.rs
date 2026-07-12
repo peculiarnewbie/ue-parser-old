@@ -5,6 +5,7 @@ use std::fmt;
 
 use serde::Serialize;
 
+use crate::utrace_format_args::{format_arg_display_strings, render_format_message};
 use crate::utrace_memory::{
     LlmTag, LlmTagSet, LlmTracker, MemoryAllocation, MemoryFree, MemoryInit, MemoryProvider,
     MemoryTag,
@@ -1151,6 +1152,10 @@ pub struct BookmarkSummary {
     pub line: Option<i32>,
     pub count: u64,
     pub format_args_bytes: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sample_args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_cycle: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1976,7 +1981,7 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
         logger: "Misc",
         event: "Bookmark",
         status: DecodeStatus::Partial,
-        note: "Bookmark events counted per spec; printf format args not rendered.",
+        note: "Bookmark events with typed FormatArgs samples rendered against the spec format string.",
     },
     EventCoverage {
         logger: "Misc",
@@ -2090,7 +2095,7 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
         logger: "Logging",
         event: "LogMessage",
         status: DecodeStatus::Partial,
-        note: "Log messages counted per log point; printf format args not rendered.",
+        note: "Log messages counted per log point; FormatArgs rendered when the typed stream is present.",
     },
     EventCoverage {
         logger: "Diagnostics",
@@ -5816,6 +5821,8 @@ struct BookmarkSpec {
 struct BookmarkState {
     count: u64,
     format_args_bytes: u64,
+    sample_args: Vec<String>,
+    sample_message: Option<String>,
     first_cycle: Option<u64>,
     last_cycle: Option<u64>,
     callstack_count: u64,
@@ -5872,7 +5879,6 @@ fn decode_misc_annotation_event(
 ) -> Result<(), TraceError> {
     match event.event.as_str() {
         "Bookmark" => {
-            let aux = parse_protocol5_aux(data, event_data_size(event), base_offset)?;
             let bookmark_point = read_pointer_field(event, data, "BookmarkPoint", base_offset)?;
             let cycle = read_u64_field(event, data, "Cycle", base_offset)?;
             let callstack_id = read_u32_field(event, data, "CallstackId", base_offset)?;
@@ -5881,9 +5887,24 @@ fn decode_misc_annotation_event(
             }
             let state = bookmark_states.entry(bookmark_point).or_default();
             state.count += 1;
-            state.format_args_bytes = state
-                .format_args_bytes
-                .saturating_add(u64::try_from(aux_bytes_len(event, &aux, "FormatArgs")).unwrap());
+            if let Some(format_args) = read_aux_bytes(event, data, "FormatArgs", base_offset)? {
+                state.format_args_bytes = state
+                    .format_args_bytes
+                    .saturating_add(u64::try_from(format_args.len()).unwrap());
+                if state.sample_message.is_none() {
+                    let format_string = bookmark_specs
+                        .get(&bookmark_point)
+                        .map(|spec| spec.format_string.as_str())
+                        .unwrap_or("");
+                    if let Some(message) = render_format_message(format_string, &format_args) {
+                        state.sample_message = Some(message);
+                    }
+                    let decoded = crate::utrace_format_args::decode_format_args(&format_args);
+                    if !decoded.args.is_empty() {
+                        state.sample_args = format_arg_display_strings(&decoded.args);
+                    }
+                }
+            }
             if state.first_cycle.is_none() {
                 state.first_cycle = Some(cycle);
             }
@@ -5997,6 +6018,8 @@ fn bookmark_dashboard(
                 line: spec.line,
                 count: state.count,
                 format_args_bytes: state.format_args_bytes,
+                sample_args: state.sample_args,
+                sample_message: state.sample_message,
                 first_cycle: state.first_cycle,
                 last_cycle: state.last_cycle,
                 callstack_count: state.callstack_count,
@@ -6080,6 +6103,7 @@ struct LogMessageState {
     count: u64,
     format_args_bytes: u64,
     sample_args: Vec<String>,
+    sample_message: Option<String>,
     first_cycle: Option<u64>,
     last_cycle: Option<u64>,
 }
@@ -6134,8 +6158,21 @@ fn decode_log_message(
         state.format_args_bytes = state
             .format_args_bytes
             .saturating_add(u64::try_from(format_args.len()).unwrap());
-        if state.sample_args.is_empty() {
-            state.sample_args = decode_log_format_args(&format_args);
+        if state.sample_args.is_empty() && state.sample_message.is_none() {
+            let format_string = specs
+                .get(&log_point)
+                .map(|spec| spec.format_string.as_str())
+                .unwrap_or("%s");
+            if let Some(message) = render_format_message(format_string, &format_args) {
+                state.sample_message = Some(message);
+            }
+            let decoded = crate::utrace_format_args::decode_format_args(&format_args);
+            if !decoded.args.is_empty() {
+                state.sample_args = format_arg_display_strings(&decoded.args);
+            } else {
+                // Preserve prior heuristic sample-arg extraction for non-typed blobs.
+                state.sample_args = decode_log_format_args(&format_args);
+            }
         }
     }
     if state.first_cycle.is_none() {
@@ -6528,7 +6565,10 @@ fn log_dashboard(
             count: state.count,
             format_args_bytes: state.format_args_bytes,
             sample_args: state.sample_args.clone(),
-            sample_message: render_log_sample(&spec.format_string, &state.sample_args),
+            sample_message: state
+                .sample_message
+                .clone()
+                .or_else(|| render_log_sample(&spec.format_string, &state.sample_args)),
             first_cycle: state.first_cycle,
             last_cycle: state.last_cycle,
         });
@@ -10717,11 +10757,14 @@ mod tests {
         let mut unresolved_bookmark_events = 0;
         let mut region_state = RegionState::default();
 
+        let format_args = crate::utrace_format_args::encode::encode_args(&[
+            crate::utrace_format_args::encode::EncodedPart::Wide("PackageA"),
+        ]);
         let mut bookmark_data = Vec::new();
         bookmark_data.extend_from_slice(&100_u64.to_le_bytes());
         bookmark_data.extend_from_slice(&0xabc_u64.to_le_bytes());
         bookmark_data.extend_from_slice(&42_u32.to_le_bytes());
-        bookmark_data.extend_from_slice(&aux(2, &[1, 2, 3]));
+        bookmark_data.extend_from_slice(&aux(2, &format_args));
         bookmark_data.push(3);
         decode_misc_annotation_event(
             &bookmark_event,
@@ -10803,8 +10846,19 @@ mod tests {
         );
         assert_eq!(dashboard.bookmarks.specs, 1);
         assert_eq!(dashboard.bookmarks.events, 1);
-        assert_eq!(dashboard.bookmarks.format_args_bytes, 3);
+        assert_eq!(
+            dashboard.bookmarks.format_args_bytes,
+            u64::try_from(format_args.len()).unwrap()
+        );
         assert_eq!(dashboard.bookmarks.bookmarks[0].format_string, "Loading %s");
+        assert_eq!(
+            dashboard.bookmarks.bookmarks[0].sample_message.as_deref(),
+            Some("Loading PackageA")
+        );
+        assert_eq!(
+            dashboard.bookmarks.bookmarks[0].sample_args,
+            vec!["PackageA".to_owned()]
+        );
         assert_eq!(
             dashboard.bookmarks.bookmarks[0].file.as_deref(),
             Some("Source.cpp")
@@ -10899,10 +10953,13 @@ mod tests {
 
         let mut states = BTreeMap::new();
         let mut unresolved_messages = 0;
+        let format_args = crate::utrace_format_args::encode::encode_args(&[
+            crate::utrace_format_args::encode::EncodedPart::Wide("World"),
+        ]);
         let mut message_data = Vec::new();
         message_data.extend_from_slice(&0x10c_u64.to_le_bytes());
         message_data.extend_from_slice(&900_u64.to_le_bytes());
-        message_data.extend_from_slice(&aux(2, &[1, 2, 3, 4]));
+        message_data.extend_from_slice(&aux(2, &format_args));
         message_data.push(3);
         decode_log_message(
             &message_event,
@@ -10934,7 +10991,10 @@ mod tests {
         assert_eq!(dashboard.categories, 1);
         assert_eq!(dashboard.message_specs, 1);
         assert_eq!(dashboard.messages, 2);
-        assert_eq!(dashboard.format_args_bytes, 5);
+        assert_eq!(
+            dashboard.format_args_bytes,
+            u64::try_from(format_args.len() + 1).unwrap()
+        );
         assert_eq!(dashboard.unresolved_messages, 1);
         assert_eq!(dashboard.specs_with_unknown_category, 0);
         assert_eq!(
@@ -10953,9 +11013,12 @@ mod tests {
         assert_eq!(message.file.as_deref(), Some("Source.cpp"));
         assert_eq!(message.line, Some(123));
         assert_eq!(message.count, 1);
-        assert_eq!(message.format_args_bytes, 4);
-        assert!(message.sample_args.is_empty());
-        assert_eq!(message.sample_message, None);
+        assert_eq!(
+            message.format_args_bytes,
+            u64::try_from(format_args.len()).unwrap()
+        );
+        assert_eq!(message.sample_args, vec!["World".to_owned()]);
+        assert_eq!(message.sample_message.as_deref(), Some("Hello World"));
         assert_eq!(message.first_cycle, Some(900));
         let category = &dashboard.top_categories[0];
         assert_eq!(category.name, "LogTemp");
