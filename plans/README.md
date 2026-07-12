@@ -26,8 +26,8 @@ even though that family is absent from the CPU-frame fixture.
 | 001 | Fix inflated CPU scope totals | P0 | M | — | DONE |
 | 002 | Bounded timelines + configurable frame caps | P0/P1 | L | 001 | DONE |
 | 003 | Memory/LLM allocation provider | P0 | L | — (parallel with 001/002 after capture exists) | DONE |
-| 004 | Counter / Stats.EventBatch2 / CSV samples | P1 | M | targeted fixture with samples | TODO |
-| 005 | TaskTrace waits + thread-group membership | P1 | L | 002 helpful for correlating waits to frames | TODO |
+| 004 | Counter / Stats.EventBatch2 / CSV samples | P1 | M | targeted fixture with samples | DONE |
+| 005 | TaskTrace waits + thread-group membership | P1 | L | 002 helpful for correlating waits to frames | DONE |
 | 006 | Bounded callstack catalog + ID joins | P0 | L | coordinate with 003 | TODO |
 | 007 | Module-aware optional symbolization | P0 | L/XL | 006 | TODO |
 
@@ -66,6 +66,7 @@ provider implementation task.
 | `UTRACE_TARGETED_FIXTURE` / `_DIR` | LoadTime + Counters samples + MemoryScope + MetadataStack restore |
 | `UTRACE_MEMORY_FIXTURE` (**new**, plan 003) | MemAllocChannel + MemTagChannel capture with Alloc/Free + LLM TagValue |
 | `UTRACE_IOSTORE_FIXTURE` | out of P0/P1 scope (keep ignored test as-is) |
+| `UTRACE_TASKS_FIXTURE` | TaskTrace wait traffic (`WaitingStarted` / `WaitingFinished`) |
 | `UTRACE_CALLSTACK_FIXTURE` | CallstackSpec + module diagnostics + at least one callstack-bearing consumer |
 
 Capture recipes live inside plans 003 and 004. The CPU-frame fixture will
@@ -76,7 +77,7 @@ Capture recipes live inside plans 003 and 004. The CPU-frame fixture will
 Do **not** dump new providers into `src/utrace.rs`. Prefer new modules:
 
 - `src/utrace_memory.rs` — Memory + LLM (plan 003)
-- `src/utrace_stats_batch.rs` or fold into a small `utrace_counters.rs` (plan 004)
+- `src/utrace_stats_batch.rs` / `src/utrace_csv.rs` — Stats.EventBatch2 + CSV samples (plan 004)
 - `src/utrace_tasks.rs` — TaskTrace (plan 005)
 - `src/utrace_callstacks.rs` — raw callstack catalog and bounded joins (plan 006)
 - `src/utrace_symbols.rs` — optional resolver boundary/backend (plan 007)
