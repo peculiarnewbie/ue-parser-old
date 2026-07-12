@@ -111,6 +111,18 @@ fn iostore_fixture() -> PathBuf {
         })
 }
 
+fn platform_file_fixture() -> PathBuf {
+    std::env::var_os("UTRACE_PLATFORM_FILE_FIXTURE")
+        .map(PathBuf::from)
+        .map(|path| require_file_or_skip(path, "UTRACE_PLATFORM_FILE_FIXTURE"))
+        .unwrap_or_else(|| {
+            missing_fixture(
+                "set UTRACE_PLATFORM_FILE_FIXTURE to a trace with FileChannel / PlatformFile traffic"
+                    .to_owned(),
+            )
+        })
+}
+
 fn memory_fixture() -> PathBuf {
     if let Some(path) = std::env::var_os("UTRACE_MEMORY_FIXTURE").map(PathBuf::from) {
         return require_file_or_skip(path, "UTRACE_MEMORY_FIXTURE");
@@ -607,6 +619,20 @@ fn real_utrace_fixture_exposes_cpu_dashboard_summary() {
     assert!(
         io_store["backends"].as_array().is_some(),
         "fixture dashboard should expose IoStore backend catalog field"
+    );
+    let platform_file = &json["dashboard"]["platform_file"];
+    assert_eq!(
+        platform_file["opens"].as_u64().unwrap(),
+        0,
+        "current CPU-frame fixture has no PlatformFile traffic; keep the decoder surface explicit"
+    );
+    assert!(
+        platform_file["files"].as_array().is_some(),
+        "fixture dashboard should expose PlatformFile catalog field"
+    );
+    assert!(
+        platform_file["activity_samples"].as_array().is_some(),
+        "fixture dashboard should expose PlatformFile activity samples field"
     );
     let dispatch = &json["dashboard"]["dispatch"];
     assert_eq!(
@@ -1524,4 +1550,43 @@ fn iostore_utrace_fixture_exercises_request_lifecycle() {
             > 0
     );
     assert!(!io_store["request_samples"].as_array().unwrap().is_empty());
+}
+
+#[test]
+#[ignore = "requires a FileChannel capture; set UTRACE_PLATFORM_FILE_FIXTURE"]
+fn platform_file_utrace_fixture_exercises_file_activity() {
+    let fixture = platform_file_fixture();
+    let output = binary()
+        .args([
+            "utrace",
+            "dashboard",
+            fixture.to_str().unwrap(),
+            "--format=json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let platform_file = &json["dashboard"]["platform_file"];
+    assert!(
+        platform_file["opens"].as_u64().unwrap() > 0
+            || platform_file["reads"].as_u64().unwrap() > 0
+            || platform_file["writes"].as_u64().unwrap() > 0,
+        "PlatformFile fixture should observe open/read/write traffic"
+    );
+    assert!(
+        platform_file["file_count"].as_u64().unwrap() > 0,
+        "PlatformFile fixture should retain at least one path"
+    );
+    assert!(
+        !platform_file["activity_samples"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }

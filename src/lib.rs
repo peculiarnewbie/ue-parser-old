@@ -15,6 +15,8 @@ pub mod utrace;
 pub mod utrace_dispatch;
 #[cfg(feature = "utrace")]
 pub(crate) mod utrace_memory;
+#[cfg(feature = "utrace")]
+pub(crate) mod utrace_platform_file;
 pub mod version;
 
 #[cfg(test)]
