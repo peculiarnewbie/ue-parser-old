@@ -13,6 +13,7 @@ use crate::utrace_memory::{
 use crate::utrace_modules::{
     ModuleProvider, decode_module_init, decode_module_load, decode_module_unload,
 };
+use crate::utrace_platform_file::PlatformFileProvider;
 use crate::{ArchiveError, ArchiveErrorKind, Reader};
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -59,6 +60,7 @@ pub struct TraceDashboard {
     pub csv: CsvDashboard,
     pub loading: LoadingDashboard,
     pub io_store: IoStoreDashboard,
+    pub platform_file: PlatformFileDashboard,
     pub trace_timing: TraceTimingDashboard,
     pub memory: MemoryDashboard,
     pub callstacks: CallstackDashboard,
@@ -944,6 +946,84 @@ pub enum IoStoreRequestStatus {
     Completed,
     Failed,
     Unresolved,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct PlatformFileDashboard {
+    pub file_count: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub file_overflow: u64,
+    pub files: Vec<PlatformFileSummary>,
+    pub opens: u64,
+    pub open_failures: u64,
+    pub reopens: u64,
+    pub closes: u64,
+    pub reads: u64,
+    pub writes: u64,
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+    pub bytes_requested_read: u64,
+    pub bytes_requested_write: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub unpaired_ends: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub unknown_handle_ops: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub open_handle_overflow: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub active_op_overflow: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub activity_sample_overflow: u64,
+    pub activity_samples: Vec<PlatformFileActivitySample>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PlatformFileSummary {
+    pub path: String,
+    pub opens: u64,
+    pub open_failures: u64,
+    pub reopens: u64,
+    pub closes: u64,
+    pub reads: u64,
+    pub writes: u64,
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+    pub bytes_requested_read: u64,
+    pub bytes_requested_write: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformFileActivityKind {
+    Open,
+    ReOpen,
+    Close,
+    Read,
+    Write,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PlatformFileActivitySample {
+    pub kind: PlatformFileActivityKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub thread_id: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_handle: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub op_handle: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_size: Option<u64>,
+    pub start_cycle: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_cycle: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_cycles: Option<u64>,
+    pub failed: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -2197,6 +2277,66 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
         note: "IoStore unresolved request count and sample status.",
     },
     EventCoverage {
+        logger: "PlatformFile",
+        event: "BeginOpen",
+        status: DecodeStatus::Partial,
+        note: "Platform file open begin with wide path; paired by thread to EndOpen.",
+    },
+    EventCoverage {
+        logger: "PlatformFile",
+        event: "EndOpen",
+        status: DecodeStatus::Partial,
+        note: "Platform file open end; handle u64::MAX marks a failed open.",
+    },
+    EventCoverage {
+        logger: "PlatformFile",
+        event: "BeginReOpen",
+        status: DecodeStatus::Partial,
+        note: "Platform file reopen begin against an existing file handle.",
+    },
+    EventCoverage {
+        logger: "PlatformFile",
+        event: "EndReOpen",
+        status: DecodeStatus::Partial,
+        note: "Platform file reopen end with replacement handle.",
+    },
+    EventCoverage {
+        logger: "PlatformFile",
+        event: "BeginClose",
+        status: DecodeStatus::Partial,
+        note: "Platform file close begin; drops the open-handle mapping.",
+    },
+    EventCoverage {
+        logger: "PlatformFile",
+        event: "EndClose",
+        status: DecodeStatus::Partial,
+        note: "Platform file close end paired by thread to BeginClose.",
+    },
+    EventCoverage {
+        logger: "PlatformFile",
+        event: "BeginRead",
+        status: DecodeStatus::Partial,
+        note: "Platform file read begin with offset/size; paired by ReadHandle.",
+    },
+    EventCoverage {
+        logger: "PlatformFile",
+        event: "EndRead",
+        status: DecodeStatus::Partial,
+        note: "Platform file read end with SizeRead byte accounting.",
+    },
+    EventCoverage {
+        logger: "PlatformFile",
+        event: "BeginWrite",
+        status: DecodeStatus::Partial,
+        note: "Platform file write begin with offset/size; paired by WriteHandle.",
+    },
+    EventCoverage {
+        logger: "PlatformFile",
+        event: "EndWrite",
+        status: DecodeStatus::Partial,
+        note: "Platform file write end with SizeWritten byte accounting.",
+    },
+    EventCoverage {
         logger: "Memory",
         event: "Init",
         status: DecodeStatus::Partial,
@@ -3048,6 +3188,7 @@ struct DecodedDashboardEvents {
     csv: CsvDashboard,
     loading: LoadingDashboard,
     io_store: IoStoreDashboard,
+    platform_file: PlatformFileDashboard,
     trace_timing: TraceTimingDashboard,
     memory: MemoryDashboard,
     callstacks: CallstackDashboard,
@@ -3113,6 +3254,7 @@ pub fn dashboard_with_options(
         csv: dashboard.csv,
         loading: dashboard.loading,
         io_store: dashboard.io_store,
+        platform_file: dashboard.platform_file,
         trace_timing: dashboard.trace_timing,
         memory: dashboard.memory,
         callstacks: dashboard.callstacks,
@@ -3237,6 +3379,7 @@ fn read_dashboard_events(
     let mut csv_stats = BTreeMap::<u64, CsvStat>::new();
     let mut load_time = LoadTimeState::default();
     let mut io_store = IoStoreState::default();
+    let mut platform_file = PlatformFileProvider::default();
     let mut trace_thread_timing = BTreeMap::<u16, TraceThreadTimingSummary>::new();
     let mut cpu_end_threads = Vec::<CpuEndThreadSummary>::new();
     let mut memory = MemoryProvider::default();
@@ -3338,6 +3481,15 @@ fn read_dashboard_events(
                         event,
                         raw_event.data,
                         &mut io_store,
+                        raw_event.offset + 4,
+                    )?;
+                }
+                ("PlatformFile", _) => {
+                    decode_platform_file_event(
+                        event,
+                        raw_event.data,
+                        &mut platform_file,
+                        thread_id,
                         raw_event.offset + 4,
                     )?;
                 }
@@ -3637,6 +3789,8 @@ fn read_dashboard_events(
             decode_load_time_event(event, &raw_event.data, &mut load_time, 0)?;
         } else if event.logger.as_str() == "IoStore" {
             decode_io_store_event(event, &raw_event.data, &mut io_store, 0)?;
+        } else if event.logger.as_str() == "PlatformFile" {
+            decode_platform_file_event(event, &raw_event.data, &mut platform_file, thread_id, 0)?;
         } else if (event.logger.as_str(), event.event.as_str()) == ("$Trace", "ThreadTiming") {
             let timing = decode_trace_thread_timing(event, &raw_event.data, 0, thread_id)?;
             trace_thread_timing.insert(timing.thread_id, timing);
@@ -3785,6 +3939,7 @@ fn read_dashboard_events(
     csv_samples.apply_to_dashboard(&mut decoded.csv);
     decoded.loading = load_time.dashboard();
     decoded.io_store = io_store.dashboard();
+    decoded.platform_file = platform_file.dashboard();
     decoded.trace_timing = trace_timing_dashboard(trace_thread_timing);
     decoded.memory = memory.dashboard();
     decoded.metadata_stack = metadata_stack.dashboard();
@@ -5598,6 +5753,77 @@ impl IoStoreState {
             request_samples,
         }
     }
+}
+
+fn decode_platform_file_event(
+    event: &EventTypeInfo,
+    data: &[u8],
+    state: &mut PlatformFileProvider,
+    thread_id: u16,
+    base_offset: u64,
+) -> Result<(), TraceError> {
+    match event.event.as_str() {
+        "BeginOpen" => {
+            let aux = parse_protocol5_aux(data, event_data_size(event), base_offset)?;
+            let cycle = read_u64_field(event, data, "Cycle", base_offset)?;
+            let path = read_aux_text(event, &aux, "Path")?;
+            state.begin_open(thread_id, cycle, path);
+        }
+        "EndOpen" => {
+            let cycle = read_u64_field(event, data, "Cycle", base_offset)?;
+            let file_handle = read_u64_field(event, data, "FileHandle", base_offset)?;
+            state.end_open(thread_id, cycle, file_handle);
+        }
+        "BeginReOpen" => {
+            let cycle = read_u64_field(event, data, "Cycle", base_offset)?;
+            let old_file_handle = read_u64_field(event, data, "OldFileHandle", base_offset)?;
+            state.begin_reopen(thread_id, cycle, old_file_handle);
+        }
+        "EndReOpen" => {
+            let cycle = read_u64_field(event, data, "Cycle", base_offset)?;
+            let new_file_handle = read_u64_field(event, data, "NewFileHandle", base_offset)?;
+            state.end_reopen(thread_id, cycle, new_file_handle);
+        }
+        "BeginClose" => {
+            let cycle = read_u64_field(event, data, "Cycle", base_offset)?;
+            let file_handle = read_u64_field(event, data, "FileHandle", base_offset)?;
+            state.begin_close(thread_id, cycle, file_handle);
+        }
+        "EndClose" => {
+            let cycle = read_u64_field(event, data, "Cycle", base_offset)?;
+            state.end_close(thread_id, cycle);
+        }
+        "BeginRead" => {
+            let cycle = read_u64_field(event, data, "Cycle", base_offset)?;
+            let read_handle = read_u64_field(event, data, "ReadHandle", base_offset)?;
+            let file_handle = read_u64_field(event, data, "FileHandle", base_offset)?;
+            let offset = read_u64_field(event, data, "Offset", base_offset)?;
+            let size = read_u64_field(event, data, "Size", base_offset)?;
+            state.begin_read(thread_id, cycle, read_handle, file_handle, offset, size);
+        }
+        "EndRead" => {
+            let cycle = read_u64_field(event, data, "Cycle", base_offset)?;
+            let read_handle = read_u64_field(event, data, "ReadHandle", base_offset)?;
+            let size_read = read_u64_field(event, data, "SizeRead", base_offset)?;
+            state.end_read(cycle, read_handle, size_read);
+        }
+        "BeginWrite" => {
+            let cycle = read_u64_field(event, data, "Cycle", base_offset)?;
+            let write_handle = read_u64_field(event, data, "WriteHandle", base_offset)?;
+            let file_handle = read_u64_field(event, data, "FileHandle", base_offset)?;
+            let offset = read_u64_field(event, data, "Offset", base_offset)?;
+            let size = read_u64_field(event, data, "Size", base_offset)?;
+            state.begin_write(thread_id, cycle, write_handle, file_handle, offset, size);
+        }
+        "EndWrite" => {
+            let cycle = read_u64_field(event, data, "Cycle", base_offset)?;
+            let write_handle = read_u64_field(event, data, "WriteHandle", base_offset)?;
+            let size_written = read_u64_field(event, data, "SizeWritten", base_offset)?;
+            state.end_write(cycle, write_handle, size_written);
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn decode_trace_thread_timing(
@@ -9849,6 +10075,109 @@ mod tests {
             dashboard.request_samples[0].status,
             IoStoreRequestStatus::Completed
         );
+    }
+
+    #[test]
+    fn summarizes_platform_file_open_read_close() {
+        let begin_open = test_event_type(
+            50,
+            "PlatformFile",
+            "BeginOpen",
+            &[
+                regular_field(0, 8, UINT64, "Cycle"),
+                regular_field(8, 0, WIDE_STRING, "Path"),
+            ],
+        );
+        let end_open = test_event_type(
+            51,
+            "PlatformFile",
+            "EndOpen",
+            &[
+                regular_field(0, 8, UINT64, "Cycle"),
+                regular_field(8, 8, UINT64, "FileHandle"),
+            ],
+        );
+        let begin_read = test_event_type(
+            52,
+            "PlatformFile",
+            "BeginRead",
+            &[
+                regular_field(0, 8, UINT64, "Cycle"),
+                regular_field(8, 8, UINT64, "ReadHandle"),
+                regular_field(16, 8, UINT64, "FileHandle"),
+                regular_field(24, 8, UINT64, "Offset"),
+                regular_field(32, 8, UINT64, "Size"),
+            ],
+        );
+        let end_read = test_event_type(
+            53,
+            "PlatformFile",
+            "EndRead",
+            &[
+                regular_field(0, 8, UINT64, "Cycle"),
+                regular_field(8, 8, UINT64, "ReadHandle"),
+                regular_field(16, 8, UINT64, "SizeRead"),
+            ],
+        );
+        let begin_close = test_event_type(
+            54,
+            "PlatformFile",
+            "BeginClose",
+            &[
+                regular_field(0, 8, UINT64, "Cycle"),
+                regular_field(8, 8, UINT64, "FileHandle"),
+            ],
+        );
+        let end_close = test_event_type(
+            55,
+            "PlatformFile",
+            "EndClose",
+            &[regular_field(0, 8, UINT64, "Cycle")],
+        );
+
+        let mut state = PlatformFileProvider::default();
+
+        let mut begin_open_data = Vec::new();
+        begin_open_data.extend_from_slice(&10_u64.to_le_bytes());
+        begin_open_data.extend_from_slice(&aux(1, &wide("/Game/Pack.uasset")));
+        begin_open_data.push(3);
+        decode_platform_file_event(&begin_open, &begin_open_data, &mut state, 7, 0).unwrap();
+
+        let mut end_open_data = Vec::new();
+        end_open_data.extend_from_slice(&20_u64.to_le_bytes());
+        end_open_data.extend_from_slice(&0xabc_u64.to_le_bytes());
+        decode_platform_file_event(&end_open, &end_open_data, &mut state, 7, 0).unwrap();
+
+        let mut begin_read_data = Vec::new();
+        begin_read_data.extend_from_slice(&30_u64.to_le_bytes());
+        begin_read_data.extend_from_slice(&0x111_u64.to_le_bytes());
+        begin_read_data.extend_from_slice(&0xabc_u64.to_le_bytes());
+        begin_read_data.extend_from_slice(&0_u64.to_le_bytes());
+        begin_read_data.extend_from_slice(&512_u64.to_le_bytes());
+        decode_platform_file_event(&begin_read, &begin_read_data, &mut state, 7, 0).unwrap();
+
+        let mut end_read_data = Vec::new();
+        end_read_data.extend_from_slice(&45_u64.to_le_bytes());
+        end_read_data.extend_from_slice(&0x111_u64.to_le_bytes());
+        end_read_data.extend_from_slice(&256_u64.to_le_bytes());
+        decode_platform_file_event(&end_read, &end_read_data, &mut state, 7, 0).unwrap();
+
+        let mut begin_close_data = Vec::new();
+        begin_close_data.extend_from_slice(&50_u64.to_le_bytes());
+        begin_close_data.extend_from_slice(&0xabc_u64.to_le_bytes());
+        decode_platform_file_event(&begin_close, &begin_close_data, &mut state, 7, 0).unwrap();
+        decode_platform_file_event(&end_close, &60_u64.to_le_bytes(), &mut state, 7, 0).unwrap();
+
+        let dashboard = state.dashboard();
+        assert_eq!(dashboard.opens, 1);
+        assert_eq!(dashboard.reads, 1);
+        assert_eq!(dashboard.closes, 1);
+        assert_eq!(dashboard.bytes_requested_read, 512);
+        assert_eq!(dashboard.bytes_read, 256);
+        assert_eq!(dashboard.files[0].path, "/Game/Pack.uasset");
+        assert_eq!(dashboard.activity_samples.len(), 3);
+        assert_eq!(dashboard.activity_samples[1].duration_cycles, Some(15));
+        assert_eq!(dashboard.activity_samples[1].actual_size, Some(256));
     }
 
     #[test]

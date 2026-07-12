@@ -27,6 +27,8 @@ pub(crate) mod utrace_tasks;
 pub(crate) mod utrace_modules;
 #[cfg(feature = "utrace")]
 pub mod utrace_symbols;
+#[cfg(feature = "utrace")]
+pub(crate) mod utrace_platform_file;
 pub mod version;
 
 #[cfg(test)]

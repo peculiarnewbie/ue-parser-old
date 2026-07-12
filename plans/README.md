@@ -18,6 +18,7 @@ even though that family is absent from the CPU-frame fixture.
 | P1 | Wait / TaskTrace + thread-group membership | parser + fixture | [005](005-tasktrace-waits-thread-groups.md) |
 | P0 | Raw callstack catalog + consumer joins | parser + fixture | [006](006-callstack-catalog-and-joins.md) |
 | P0 | Module-aware symbolization | parser + optional tooling | [007](007-module-aware-symbolization.md) |
+| P1 | PlatformFile open/read/write activity | parser + fixture | [008](008-platform-file-activity.md) |
 
 ## Execution order & status
 
@@ -30,6 +31,7 @@ even though that family is absent from the CPU-frame fixture.
 | 005 | TaskTrace waits + thread-group membership | P1 | L | 002 helpful for correlating waits to frames | DONE |
 | 006 | Bounded callstack catalog + ID joins | P0 | L | coordinate with 003 | DONE |
 | 007 | Module-aware optional symbolization | P0 | L/XL | 006 | DONE |
+| 008 | PlatformFile activity summaries | P1 | M | — (independent of 004–007) | DONE |
 
 Status values: `TODO` | `IN PROGRESS` | `DONE` | `BLOCKED` | `REJECTED`
 
@@ -65,8 +67,9 @@ provider implementation task.
 | `UTRACE_FIXTURE` | `basic-cpu-frame.utrace` — CPU/GPU volume, totals, timelines, correlation |
 | `UTRACE_TARGETED_FIXTURE` / `_DIR` | LoadTime + Counters samples + MemoryScope + MetadataStack restore |
 | `UTRACE_MEMORY_FIXTURE` (**new**, plan 003) | MemAllocChannel + MemTagChannel capture with Alloc/Free + LLM TagValue |
-| `UTRACE_IOSTORE_FIXTURE` | out of P0/P1 scope (keep ignored test as-is) |
+| `UTRACE_IOSTORE_FIXTURE` | out of P0/P1 scope for 004–007; keep ignored test as-is |
 | `UTRACE_TASKS_FIXTURE` | TaskTrace wait traffic (`WaitingStarted` / `WaitingFinished`) |
+| `UTRACE_PLATFORM_FILE_FIXTURE` | FileChannel / `PlatformFile.*` traffic (plan 008) |
 | `UTRACE_CALLSTACK_FIXTURE` | CallstackSpec + module diagnostics + at least one callstack-bearing consumer |
 | `UTRACE_SYMBOL_PATH` | Optional local PDB root for ignored callstack fixture symbolization (`utrace-symbols`) |
 
@@ -82,6 +85,7 @@ Do **not** dump new providers into `src/utrace.rs`. Prefer new modules:
 - `src/utrace_tasks.rs` — TaskTrace (plan 005)
 - `src/utrace_callstacks.rs` — raw callstack catalog and bounded joins (plan 006)
 - `src/utrace_symbols.rs` — optional resolver boundary/backend (plan 007)
+- `src/utrace_platform_file.rs` — PlatformFile activity (plan 008)
 - Timeline collectors may stay near existing `CpuTimelineCollector` initially,
   but extract if `utrace.rs` growth exceeds ~reviewable hunks.
 

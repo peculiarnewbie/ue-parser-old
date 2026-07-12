@@ -69,7 +69,7 @@ The area-level status table below is the human narrative layer on top of that.
 | Trace channels | partial | `Trace.ChannelAnnounce`, `Trace.ChannelToggle` | `channels.channels` | Dashboard decodes trace channel declarations, read-only flags, latest enabled state, and toggle counts. Distinct from the `$Trace` logger used for the prologue and threads. |
 | Memory + LLM | partial | `Memory.Init`, `TagSpec`, `MemoryScope`, `Alloc*`, `Free*`, `ReallocAlloc*`, `ReallocFree*`; `LLM.TagsSpec`, `TrackerSpec`, `TagSetSpec`, `TagValue` | `memory.init`, `memory.tags`, `memory.scopes`, `memory.allocs`, `memory.llm` | Dashboard validates supported Memory trace versions (1–2), resolves scope tag names, unpacks sizes using `SizeShift`, and summarizes allocation/free/reallocation bytes by root heap. Retained allocation samples (40), outstanding address tracking (262,144 entries), LLM catalogs (4,096 tags), and latest LLM values (4,096 tracker/tag pairs) are explicitly bounded; overflow is surfaced in the dashboard. Allocation-to-current-tag attribution needs scoped Memory event style support and remains deferred. The current provider capture declares no LLM events, so the LLM wire path is synthetic-tested pending a MemTag capture. |
 | Loading/assets | partial | `LoadTime.ClassInfo`, `LoadTime.StartAsyncLoading`, `LoadTime.SuspendAsyncLoading`, `LoadTime.ResumeAsyncLoading`, `LoadTime.PackageSummary`, `LoadTime.BeginRequest`, `LoadTime.EndRequest`, `LoadTime.NewAsyncPackage`, `LoadTime.DestroyAsyncPackage` | `loading.classes`, `loading.packages`, `loading.requests`, `loading.async_loading` | Class catalog, package summaries, request begin/end pairing with bounded samples, and async loading start/suspend/resume counts are decoded. Full Unreal Insights load-time analyzer semantics (object graphs, package state machines) are not emitted yet. This fixture currently exercises only `ClassInfo`. |
-| IO/file | partial | `IoStore.*` lifecycle events | `io_store.backends`, `io_store.request_samples`, request/byte counters | IoStore backend catalog and request create/start/complete/fail lifecycle are decoded with bounded samples. `File.*` activity and full chunk-resolution timelines are not decoded yet. The current CPU-frame fixture declares no IoStore traffic. |
+| IO/file | partial | `IoStore.*`, `PlatformFile.*` | `io_store.*`, `platform_file.*` | IoStore backend catalog and request create/start/complete/fail lifecycle are decoded with bounded samples. PlatformFile open/reopen/close/read/write intervals are paired (Insights thread/handle semantics) into path catalogs, byte totals, and ≤40 activity samples with explicit overflow counters. Full unbounded file timelines and LoadTime↔IoStore↔PlatformFile joins remain deferred. The current CPU-frame fixture declares no IoStore or PlatformFile traffic. |
 | Logs/diagnostics | partial | `Logging.LogCategory`, `Logging.LogMessageSpec`, `Logging.LogMessage`, `Diagnostics.Session2` | `logging.categories`, `logging.message_specs`, `logging.verbosity`, `logging.top_categories`, `logging.top_messages`, `session` | Dashboard decodes the log category catalog (name + default verbosity), message specs (log points) resolved to file/line/format/category, per-verbosity spec and message counts, and message counts per log point. It renders simple `%s` sample log arguments and formats the `Diagnostics.Session2` instance id as a GUID. Full printf argument expansion, per-message timelines, and `Diagnostics.Session` (v1) are not decoded. |
 | Metadata stack | partial | `MetadataStack.ClearScope`, `MetadataStack.SaveStack`, `MetadataStack.RestoreStack` | `metadata_stack`, `cpu.metadata` | Clear-scope events, saved stack ids, restored stack ids, per-id save/restore counts, and restores without an observed save are counted. Per-thread restored metadata contexts are conservatively applied to later plain CPU profiler scopes and surfaced through `cpu.batches.restored_metadata_scopes`; event ordering is preserved across CPU batch flushes. |
 | Slate | partial | `SlateTrace.AddWidget` | `slate.widgets` | Widget add events are counted by widget id with cycle bounds. Full Slate analysis is not decoded yet. |
@@ -106,6 +106,7 @@ emits:
 - CSV profiler category/stat summaries with explicit sample-event counts
 - load-time class catalog plus package/request/async-loading summaries when present
 - IoStore backend/request lifecycle summaries when present
+- PlatformFile open/read/write/close summaries with bounded activity samples when present
 - memory scope tag counts
 - bounded raw callstack catalog with hex program-counter frames, module-mapped
   `mapped_frames`, optional PDB enrichment via `--symbol-path`, and id joins on
@@ -172,9 +173,10 @@ gaps, in priority order:
 4. **Unified performance curves** — Counters/Stats/CSV samples decode when
    present; still need frame-aligned time series with units and a studio
    capture that actually emits Stats.EventBatch2 / CSV sample events.
-5. **Asset-loading critical paths** — join LoadTime, IoStore/File activity,
+5. **Asset-loading critical paths** — join LoadTime, IoStore/PlatformFile activity,
    CPU work, and package dependencies so a loading hitch can be attributed to
-   the responsible asset and stage.
+   the responsible asset and stage. PlatformFile lifecycle summaries now decode;
+   cross-provider joins remain open.
 6. **Memory attribution** — join allocations to active tags and resolved
    callstacks, add frame-aligned allocation/live-memory curves, and clearly
    surface when bounded outstanding tracking makes totals incomplete.
