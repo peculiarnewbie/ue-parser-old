@@ -19,6 +19,7 @@ even though that family is absent from the CPU-frame fixture.
 | P0 | Raw callstack catalog + consumer joins | parser + fixture | [006](006-callstack-catalog-and-joins.md) |
 | P0 | Module-aware symbolization | parser + optional tooling | [007](007-module-aware-symbolization.md) |
 | P1 | PlatformFile open/read/write activity | parser + fixture | [008](008-platform-file-activity.md) |
+| P1 | Bookmark/log FormatArgs rendering | parser | [009](009-format-args-rendering.md) |
 
 ## Execution order & status
 
@@ -32,6 +33,7 @@ even though that family is absent from the CPU-frame fixture.
 | 006 | Bounded callstack catalog + ID joins | P0 | L | coordinate with 003 | DONE |
 | 007 | Module-aware optional symbolization | P0 | L/XL | 006 | DONE |
 | 008 | PlatformFile activity summaries | P1 | M | — (independent of 004–007) | DONE |
+| 009 | Bookmark/log FormatArgs rendering | P1 | M | — (independent) | DONE |
 
 Status values: `TODO` | `IN PROGRESS` | `DONE` | `BLOCKED` | `REJECTED`
 
@@ -86,6 +88,7 @@ Do **not** dump new providers into `src/utrace.rs`. Prefer new modules:
 - `src/utrace_callstacks.rs` — raw callstack catalog and bounded joins (plan 006)
 - `src/utrace_symbols.rs` — optional resolver boundary/backend (plan 007)
 - `src/utrace_platform_file.rs` — PlatformFile activity (plan 008)
+- `src/utrace_format_args.rs` — FormatArgs decode/render (plan 009)
 - Timeline collectors may stay near existing `CpuTimelineCollector` initially,
   but extract if `utrace.rs` growth exceeds ~reviewable hunks.
 
