@@ -16,6 +16,12 @@
 - **Depends on**: fixture with samples (`UTRACE_TARGETED_FIXTURE` and/or richer capture)
 - **Category**: direction
 - **Planned at**: commit `3c97e3c`, 2026-07-11
+- **Status**: DONE (2026-07-12)
+- **Fixture inventory (studio traces)**:
+  - `targeted-providers.utrace`: `Counters.SetValueInt` observed; Stats/CSV catalogs only — **no** `EventBatch2` / BeginStat / CustomStat samples
+  - `basic-cpu-frame.utrace`: catalogs only; Counter samples = 0
+  - Stats/CSV sample paths unit-tested synthetically; live `sample_events > 0` needs StatsChannel + CSV profiler capture
+- **Delivered**: `utrace_stats_batch.rs`, `utrace_csv.rs`, real sample_events, EVENT_COVERAGE Partial rows
 
 ## Why this matters
 

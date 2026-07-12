@@ -126,6 +126,16 @@ fn memory_fixture() -> PathBuf {
     )
 }
 
+fn tasks_fixture() -> PathBuf {
+    if let Some(path) = std::env::var_os("UTRACE_TASKS_FIXTURE").map(PathBuf::from) {
+        return require_file_or_skip(path, "UTRACE_TASKS_FIXTURE");
+    }
+    missing_fixture(
+        "set UTRACE_TASKS_FIXTURE to a trace with TaskTrace.WaitingStarted/WaitingFinished traffic"
+            .to_owned(),
+    )
+}
+
 fn missing_fixture(message: String) -> ! {
     panic!("{message}");
 }
@@ -854,6 +864,32 @@ fn real_utrace_fixture_exposes_cpu_dashboard_summary() {
             ),
         "fixture should decode named thread groups"
     );
+    let thread_info = json["dashboard"]["thread_info"].as_array().unwrap();
+    assert!(
+        thread_info.iter().any(|thread| {
+            thread["active_group"].as_str() == Some("BackgroundThreadPool")
+                && thread["name"]
+                    .as_str()
+                    .is_some_and(|name| name.contains("Background") || name.contains("Worker"))
+        }),
+        "Background workers registered inside ThreadGroupBegin should list BackgroundThreadPool"
+    );
+    assert!(
+        thread_info.iter().any(|thread| {
+            thread["name"].as_str() == Some("GameThread")
+                && thread
+                    .get("active_group")
+                    .is_none_or(|value| value.is_null())
+        }),
+        "GameThread should not inherit BackgroundThreadPool membership"
+    );
+    assert_eq!(
+        json["dashboard"]["tasks"]["wait_count"]
+            .as_u64()
+            .unwrap_or(0),
+        0,
+        "basic-cpu-frame fixture has no TaskTrace wait samples (use UTRACE_TASKS_FIXTURE)"
+    );
     let bookmarks = &json["dashboard"]["annotations"]["bookmarks"];
     assert!(
         bookmarks["specs"].as_u64().unwrap() > 0,
@@ -1524,4 +1560,61 @@ fn iostore_utrace_fixture_exercises_request_lifecycle() {
             > 0
     );
     assert!(!io_store["request_samples"].as_array().unwrap().is_empty());
+}
+
+#[test]
+#[ignore = "requires TaskTrace wait traffic; set UTRACE_TASKS_FIXTURE"]
+fn tasks_utrace_fixture_exposes_wait_summaries() {
+    let fixture = tasks_fixture();
+    let inventory_output = binary()
+        .args([
+            "utrace",
+            "inventory",
+            fixture.to_str().unwrap(),
+            "--format=json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        inventory_output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&inventory_output.stderr)
+    );
+    let inventory: Value = serde_json::from_slice(&inventory_output.stdout).unwrap();
+    let waiting = inventory["inventory"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["logger"] == "TaskTrace" && event["event"] == "WaitingStarted")
+        .expect("fixture must declare TaskTrace.WaitingStarted");
+    assert!(
+        waiting["observed_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "fixture must observe WaitingStarted payloads"
+    );
+
+    let dashboard_output = binary()
+        .args([
+            "utrace",
+            "dashboard",
+            fixture.to_str().unwrap(),
+            "--format=json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        dashboard_output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&dashboard_output.stderr)
+    );
+    let dashboard: Value = serde_json::from_slice(&dashboard_output.stdout).unwrap();
+    let tasks = &dashboard["dashboard"]["tasks"];
+    assert!(
+        tasks["wait_count"].as_u64().unwrap() > 0,
+        "expected paired TaskTrace wait samples"
+    );
+    assert!(!tasks["wait_samples"].as_array().unwrap().is_empty());
 }

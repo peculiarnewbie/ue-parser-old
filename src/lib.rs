@@ -12,9 +12,15 @@ pub mod schema;
 #[cfg(feature = "utrace")]
 pub mod utrace;
 #[cfg(feature = "utrace")]
+pub(crate) mod utrace_csv;
+#[cfg(feature = "utrace")]
 pub mod utrace_dispatch;
 #[cfg(feature = "utrace")]
 pub(crate) mod utrace_memory;
+#[cfg(feature = "utrace")]
+pub(crate) mod utrace_stats_batch;
+#[cfg(feature = "utrace")]
+pub(crate) mod utrace_tasks;
 pub mod version;
 
 #[cfg(test)]

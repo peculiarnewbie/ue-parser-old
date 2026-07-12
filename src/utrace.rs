@@ -61,6 +61,7 @@ pub struct TraceDashboard {
     pub slate: SlateDashboard,
     pub channels: TraceChannelDashboard,
     pub thread_groups: ThreadGroupDashboard,
+    pub tasks: TasksDashboard,
     pub annotations: AnnotationDashboard,
     pub logging: LogDashboard,
     pub unmodeled: UnmodeledTraceDashboard,
@@ -439,6 +440,10 @@ pub struct CpuThreadSummary {
     pub system_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_group: Option<String>,
     pub count: u64,
     pub total_cycles: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -722,8 +727,38 @@ pub struct StatsDashboard {
     pub memory_specs: u64,
     pub clear_every_frame_specs: u64,
     pub sample_events: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub unresolved_samples: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub malformed_batches: u64,
     pub groups: Vec<StatGroupSummary>,
     pub stats: Vec<StatSpecSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<StatSampleSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StatSampleSummary {
+    pub id: u32,
+    pub samples: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_cycle: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_cycle: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sample_points: Vec<StatSamplePoint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StatSamplePoint {
+    pub cycle: u64,
+    pub value: f64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -754,8 +789,45 @@ pub struct CsvDashboard {
     pub inline_stats: u64,
     pub unresolved_stats: u64,
     pub sample_events: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub begin_events: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub end_events: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub unmatched_ends: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub custom_int_samples: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub custom_float_samples: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub open_begins: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub sample_unresolved_stats: u64,
     pub top_categories: Vec<CsvCategorySummary>,
     pub stat_defs: Vec<CsvStatSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub duration_samples: Vec<CsvDurationSample>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub value_samples: Vec<CsvValueSample>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CsvDurationSample {
+    pub thread_id: u16,
+    pub stat_id: u64,
+    pub begin_cycle: u64,
+    pub end_cycle: u64,
+    pub duration_cycles: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CsvValueSample {
+    pub thread_id: u16,
+    pub stat_id: u64,
+    pub cycle: u64,
+    pub value: f64,
+    pub op_type: u8,
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -1127,6 +1199,50 @@ pub struct ThreadGroupSummary {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct TasksDashboard {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub init_version: Option<u32>,
+    pub created: u64,
+    pub launched: u64,
+    pub scheduled: u64,
+    pub started: u64,
+    pub finished: u64,
+    pub completed: u64,
+    pub destroyed: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub subsequent_added: u64,
+    pub wait_count: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub wait_started: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub wait_finished: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub unmatched_wait_ends: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub open_waits: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub wait_samples: Vec<TaskWaitSample>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub named_tasks: Vec<TaskNameSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TaskWaitSample {
+    pub thread_id: u16,
+    pub start_cycle: u64,
+    pub end_cycle: u64,
+    pub duration_cycles: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub task_ids: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TaskNameSummary {
+    pub task_id: u64,
+    pub debug_name: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct AnnotationDashboard {
     pub bookmarks: BookmarkDashboard,
     pub regions: RegionDashboard,
@@ -1335,6 +1451,11 @@ pub struct TraceThreadInfo {
     pub system_id: u32,
     pub sort_hint: i32,
     pub name: String,
+    /// Groups active when this thread was registered (`$Trace.ThreadGroupBegin` stack).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_group: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1640,7 +1761,7 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
         logger: "$Trace",
         event: "ThreadGroupBegin",
         status: DecodeStatus::Partial,
-        note: "Thread group begin stack accounting by group name.",
+        note: "Thread group begin; ThreadInfo rows inherit the active group stack.",
     },
     EventCoverage {
         logger: "$Trace",
@@ -1721,6 +1842,12 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
         note: "Stat catalog: id, name, description, group, and stat flags.",
     },
     EventCoverage {
+        logger: "Stats",
+        event: "EventBatch2",
+        status: DecodeStatus::Partial,
+        note: "Batch samples summarized (min/max/latest, ≤40 points / top 64 stats); no full series.",
+    },
+    EventCoverage {
         logger: "CsvProfiler",
         event: "RegisterCategory",
         status: DecodeStatus::Partial,
@@ -1737,6 +1864,96 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
         event: "DefineInlineStat",
         status: DecodeStatus::Partial,
         note: "CSV inline stat catalog: id, category, and name.",
+    },
+    EventCoverage {
+        logger: "CsvProfiler",
+        event: "BeginStat",
+        status: DecodeStatus::Partial,
+        note: "Non-exclusive CSV begin; paired with EndStat into bounded duration samples.",
+    },
+    EventCoverage {
+        logger: "CsvProfiler",
+        event: "EndStat",
+        status: DecodeStatus::Partial,
+        note: "Non-exclusive CSV end; unmatched ends counted.",
+    },
+    EventCoverage {
+        logger: "CsvProfiler",
+        event: "CustomStatInt",
+        status: DecodeStatus::Partial,
+        note: "CSV integer custom-stat samples (bounded).",
+    },
+    EventCoverage {
+        logger: "CsvProfiler",
+        event: "CustomStatFloat",
+        status: DecodeStatus::Partial,
+        note: "CSV float custom-stat samples (bounded).",
+    },
+    EventCoverage {
+        logger: "TaskTrace",
+        event: "Init",
+        status: DecodeStatus::Partial,
+        note: "TaskTrace init version.",
+    },
+    EventCoverage {
+        logger: "TaskTrace",
+        event: "Created",
+        status: DecodeStatus::Partial,
+        note: "Task created count.",
+    },
+    EventCoverage {
+        logger: "TaskTrace",
+        event: "Launched",
+        status: DecodeStatus::Partial,
+        note: "Task launched; optional debug name retained for a bounded set.",
+    },
+    EventCoverage {
+        logger: "TaskTrace",
+        event: "Scheduled",
+        status: DecodeStatus::Partial,
+        note: "Task scheduled count.",
+    },
+    EventCoverage {
+        logger: "TaskTrace",
+        event: "SubsequentAdded",
+        status: DecodeStatus::Partial,
+        note: "Subsequent dependency edge count (no full graph).",
+    },
+    EventCoverage {
+        logger: "TaskTrace",
+        event: "Started",
+        status: DecodeStatus::Partial,
+        note: "Task started count.",
+    },
+    EventCoverage {
+        logger: "TaskTrace",
+        event: "Finished",
+        status: DecodeStatus::Partial,
+        note: "Task finished count.",
+    },
+    EventCoverage {
+        logger: "TaskTrace",
+        event: "Completed",
+        status: DecodeStatus::Partial,
+        note: "Task completed count.",
+    },
+    EventCoverage {
+        logger: "TaskTrace",
+        event: "Destroyed",
+        status: DecodeStatus::Partial,
+        note: "Task destroyed count.",
+    },
+    EventCoverage {
+        logger: "TaskTrace",
+        event: "WaitingStarted",
+        status: DecodeStatus::Partial,
+        note: "Wait begin with optional waited-task id array.",
+    },
+    EventCoverage {
+        logger: "TaskTrace",
+        event: "WaitingFinished",
+        status: DecodeStatus::Partial,
+        note: "Wait end paired by thread into bounded duration samples.",
     },
     EventCoverage {
         logger: "LoadTime",
@@ -2632,6 +2849,7 @@ struct RawFieldInfo {
 struct DecodedImportantEvents {
     prologue: Option<TracePrologue>,
     thread_info: Vec<TraceThreadInfo>,
+    thread_groups: ThreadGroupDashboard,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2649,6 +2867,7 @@ struct DecodedDashboardEvents {
     slate: SlateDashboard,
     channels: TraceChannelDashboard,
     thread_groups: ThreadGroupDashboard,
+    tasks: TasksDashboard,
     annotations: AnnotationDashboard,
     logging: LogDashboard,
     unmodeled: UnmodeledTraceDashboard,
@@ -2711,6 +2930,7 @@ pub fn dashboard_with_options(
         slate: dashboard.slate,
         channels: dashboard.channels,
         thread_groups: dashboard.thread_groups,
+        tasks: dashboard.tasks,
         annotations: dashboard.annotations,
         logging: dashboard.logging,
         unmodeled: dashboard.unmodeled,
@@ -2735,6 +2955,7 @@ fn read_known_important_events(
         .map(|event| (event.uid, event))
         .collect::<BTreeMap<_, _>>();
     let mut decoded = DecodedImportantEvents::default();
+    let mut thread_groups = ThreadGroupState::default();
 
     for thread_id in [0_u16, 1_u16] {
         let Some(stream) = streams.get(&thread_id) else {
@@ -2762,9 +2983,19 @@ fn read_known_important_events(
                     decoded.prologue = Some(decode_new_trace(event, data, event_offset + 4)?);
                 }
                 ("$Trace", "ThreadInfo") => {
-                    decoded
-                        .thread_info
-                        .push(decode_thread_info(event, data, event_offset + 4)?);
+                    let mut info = decode_thread_info(event, data, event_offset + 4)?;
+                    if !thread_groups.stack.is_empty() {
+                        info.groups = thread_groups.stack.clone();
+                        info.active_group = thread_groups.stack.last().cloned();
+                    }
+                    decoded.thread_info.push(info);
+                }
+                ("$Trace", "ThreadGroupBegin") => {
+                    let name = decode_thread_group_begin(event, data, event_offset + 4)?;
+                    thread_groups.begin(name);
+                }
+                ("$Trace", "ThreadGroupEnd") => {
+                    thread_groups.end();
                 }
                 _ => {}
             }
@@ -2772,6 +3003,7 @@ fn read_known_important_events(
     }
 
     decoded.thread_info.sort_by_key(|thread| thread.thread_id);
+    decoded.thread_groups = thread_groups.dashboard();
     Ok(decoded)
 }
 
@@ -2820,7 +3052,9 @@ fn read_dashboard_events(
     let mut metadata_stack = MetadataStackState::default();
     let mut slate_widgets = BTreeMap::<u64, SlateWidgetState>::new();
     let mut trace_channels = BTreeMap::<u32, TraceChannelState>::new();
-    let mut thread_groups = ThreadGroupState::default();
+    let mut stats_samples = crate::utrace_stats_batch::StatsSampleProvider::default();
+    let mut csv_samples = crate::utrace_csv::CsvSampleProvider::default();
+    let mut tasks = crate::utrace_tasks::TaskProvider::default();
     let mut bookmark_specs = BTreeMap::<u64, BookmarkSpec>::new();
     let mut bookmark_states = BTreeMap::<u64, BookmarkState>::new();
     let mut unresolved_bookmark_events = 0_u64;
@@ -2939,13 +3173,9 @@ fn read_dashboard_events(
                         .or_default()
                         .toggle(toggle.is_enabled);
                 }
-                ("$Trace", "ThreadGroupBegin") => {
-                    let name =
-                        decode_thread_group_begin(event, raw_event.data, raw_event.offset + 4)?;
-                    thread_groups.begin(name);
-                }
-                ("$Trace", "ThreadGroupEnd") => {
-                    thread_groups.end();
+                ("$Trace", "ThreadGroupBegin") | ("$Trace", "ThreadGroupEnd") => {
+                    // Handled in read_known_important_events so ThreadInfo
+                    // membership stays ordered with the group stack.
                 }
                 ("Misc", "BookmarkSpec") => {
                     let spec = decode_bookmark_spec(event, raw_event.data, raw_event.offset + 4)?;
@@ -3159,6 +3389,17 @@ fn read_dashboard_events(
                 &mut unresolved_counter_samples,
                 0,
             )?;
+        } else if (event.logger.as_str(), event.event.as_str()) == ("Stats", "EventBatch2") {
+            stats_samples.record_batch(event, &raw_event.data, 0)?;
+        } else if event.logger.as_str() == "CsvProfiler"
+            && matches!(
+                event.event.as_str(),
+                "BeginStat" | "EndStat" | "CustomStatInt" | "CustomStatFloat"
+            )
+        {
+            csv_samples.record_event(event, &raw_event.data, thread_id, &csv_stats, 0)?;
+        } else if event.logger.as_str() == "TaskTrace" {
+            tasks.record_event(event, &raw_event.data, thread_id, 0)?;
         } else if event.logger.as_str() == "Misc" {
             decode_misc_annotation_event(
                 event,
@@ -3278,6 +3519,8 @@ fn read_dashboard_events(
                 thread_id,
                 system_id: info.map(|thread| thread.system_id),
                 name: info.map(|thread| thread.name.clone()),
+                groups: info.map(|thread| thread.groups.clone()).unwrap_or_default(),
+                active_group: info.and_then(|thread| thread.active_group.clone()),
                 count,
                 total_cycles,
                 total_seconds: cycle_frequency
@@ -3320,7 +3563,9 @@ fn read_dashboard_events(
     }
     decoded.counters = counter_dashboard(counter_specs, counter_states, unresolved_counter_samples);
     decoded.stats = stats_dashboard(stat_specs);
+    stats_samples.apply_to_dashboard(&mut decoded.stats);
     decoded.csv = csv_dashboard(csv_categories, csv_stats);
+    csv_samples.apply_to_dashboard(&mut decoded.csv);
     decoded.loading = load_time.dashboard();
     decoded.io_store = io_store.dashboard();
     decoded.trace_timing = trace_timing_dashboard(trace_thread_timing);
@@ -3328,7 +3573,8 @@ fn read_dashboard_events(
     decoded.metadata_stack = metadata_stack.dashboard();
     decoded.slate = slate_dashboard(slate_widgets);
     decoded.channels = trace_channel_dashboard(trace_channels);
-    decoded.thread_groups = thread_groups.dashboard();
+    decoded.thread_groups = importants.thread_groups.clone();
+    decoded.tasks = tasks.dashboard();
     decoded.annotations = annotation_dashboard(
         bookmark_specs,
         bookmark_states,
@@ -4598,8 +4844,11 @@ fn stats_dashboard(specs: BTreeMap<u32, StatSpec>) -> StatsDashboard {
         )
         .unwrap(),
         sample_events: 0,
+        unresolved_samples: 0,
+        malformed_batches: 0,
         groups,
         stats,
+        samples: Vec::new(),
     }
 }
 
@@ -4740,8 +4989,17 @@ fn csv_dashboard(
         .unwrap(),
         unresolved_stats,
         sample_events: 0,
+        begin_events: 0,
+        end_events: 0,
+        unmatched_ends: 0,
+        custom_int_samples: 0,
+        custom_float_samples: 0,
+        open_begins: 0,
+        sample_unresolved_stats: 0,
         top_categories,
         stat_defs,
+        duration_samples: Vec::new(),
+        value_samples: Vec::new(),
     }
 }
 
@@ -5387,7 +5645,7 @@ fn read_llm_tag_id_field(
     }
 }
 
-fn read_required_aux_bytes<'a>(
+pub(crate) fn read_required_aux_bytes<'a>(
     event: &EventTypeInfo,
     aux: &'a BTreeMap<u8, Vec<u8>>,
     name: &str,
@@ -8170,10 +8428,12 @@ fn decode_thread_info(
         system_id: read_u32_field(event, data, "SystemId", base_offset)?,
         sort_hint: read_i32_field(event, data, "SortHint", base_offset)?,
         name: read_aux_string(event, &aux, "Name")?,
+        groups: Vec::new(),
+        active_group: None,
     })
 }
 
-fn read_u8_field(
+pub(crate) fn read_u8_field(
     event: &EventTypeInfo,
     data: &[u8],
     name: &str,
@@ -8183,7 +8443,7 @@ fn read_u8_field(
     Ok(bytes[0])
 }
 
-fn read_u16_field(
+pub(crate) fn read_u16_field(
     event: &EventTypeInfo,
     data: &[u8],
     name: &str,
@@ -8196,7 +8456,7 @@ fn read_u16_field(
     ))
 }
 
-fn read_u32_field(
+pub(crate) fn read_u32_field(
     event: &EventTypeInfo,
     data: &[u8],
     name: &str,
@@ -8235,7 +8495,7 @@ fn read_optional_i32_field(
     }
 }
 
-fn read_i32_field(
+pub(crate) fn read_i32_field(
     event: &EventTypeInfo,
     data: &[u8],
     name: &str,
@@ -8248,7 +8508,7 @@ fn read_i32_field(
     ))
 }
 
-fn read_i64_field(
+pub(crate) fn read_i64_field(
     event: &EventTypeInfo,
     data: &[u8],
     name: &str,
@@ -8261,7 +8521,7 @@ fn read_i64_field(
     ))
 }
 
-fn read_u64_field(
+pub(crate) fn read_u64_field(
     event: &EventTypeInfo,
     data: &[u8],
     name: &str,
@@ -8293,7 +8553,20 @@ fn read_pointer_field(
     }
 }
 
-fn read_f64_field(
+pub(crate) fn read_f32_field(
+    event: &EventTypeInfo,
+    data: &[u8],
+    name: &str,
+    base_offset: u64,
+) -> Result<f32, TraceError> {
+    Ok(f32::from_le_bytes(
+        fixed_field_bytes(event, data, name, 4, base_offset)?
+            .try_into()
+            .expect("fixed field length was checked"),
+    ))
+}
+
+pub(crate) fn read_f64_field(
     event: &EventTypeInfo,
     data: &[u8],
     name: &str,
@@ -8306,7 +8579,7 @@ fn read_f64_field(
     ))
 }
 
-fn fixed_field_bytes<'a>(
+pub(crate) fn fixed_field_bytes<'a>(
     event: &EventTypeInfo,
     data: &'a [u8],
     name: &str,
@@ -8342,7 +8615,10 @@ fn fixed_field_bytes<'a>(
     Ok(&data[start..end])
 }
 
-fn find_field<'a>(event: &'a EventTypeInfo, name: &str) -> Result<&'a FieldInfo, TraceError> {
+pub(crate) fn find_field<'a>(
+    event: &'a EventTypeInfo,
+    name: &str,
+) -> Result<&'a FieldInfo, TraceError> {
     event
         .fields
         .iter()
@@ -8357,7 +8633,7 @@ fn find_field<'a>(event: &'a EventTypeInfo, name: &str) -> Result<&'a FieldInfo,
         })
 }
 
-fn event_data_size(event: &EventTypeInfo) -> usize {
+pub(crate) fn event_data_size(event: &EventTypeInfo) -> usize {
     event
         .fields
         .iter()
@@ -8366,7 +8642,7 @@ fn event_data_size(event: &EventTypeInfo) -> usize {
         .unwrap_or(0)
 }
 
-fn parse_protocol5_aux(
+pub(crate) fn parse_protocol5_aux(
     data: &[u8],
     event_data_size: usize,
     base_offset: u64,
@@ -8433,7 +8709,7 @@ fn parse_protocol5_aux(
     Ok(aux)
 }
 
-fn read_aux_string(
+pub(crate) fn read_aux_string(
     event: &EventTypeInfo,
     aux: &BTreeMap<u8, Vec<u8>>,
     name: &str,
@@ -8830,6 +9106,8 @@ mod tests {
                 system_id: 99,
                 sort_hint: -7,
                 name: "GameThread".to_owned(),
+                groups: Vec::new(),
+                active_group: None,
             }]
         );
     }

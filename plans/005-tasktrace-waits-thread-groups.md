@@ -16,6 +16,9 @@
 - **Depends on**: plan 002 helpful (frame correlation for wait spans); not hard-blocked
 - **Category**: direction
 - **Planned at**: commit `3c97e3c`, 2026-07-11
+- **Status**: DONE (2026-07-12)
+- **Fixture inventory**: CPU-frame has ThreadGroup* but no TaskTrace; waits unit-tested; `UTRACE_TASKS_FIXTURE` ignored gate; WaitForTasks overlap correlation deferred
+- **Delivered**: thread-group membership on thread_info/cpu.threads; `utrace_tasks.rs`; dashboard `tasks`; EVENT_COVERAGE
 
 ## Why this matters
 
