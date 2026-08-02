@@ -197,6 +197,133 @@ fn utrace_json_success_decodes_prologue_and_threads() {
 
 #[cfg(feature = "utrace")]
 #[test]
+fn utrace_dashboard_progress_is_ordered_ndjson_with_terminal_bundle() {
+    let output = run_with_stdin(
+        &[
+            "utrace",
+            "dashboard-progress",
+            "-",
+            "--format=json",
+            "--max-frames=10",
+        ],
+        &synthetic_utrace(),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.len() >= 2);
+    assert_eq!(events.first().unwrap()["type"], "bootstrap");
+    assert_eq!(
+        events.first().unwrap()["bootstrap"]["prologue"]["start_cycle"],
+        100
+    );
+    for (expected, event) in events.iter().enumerate() {
+        assert_eq!(event["protocol_version"], 1);
+        assert_eq!(event["sequence"], u64::try_from(expected).unwrap());
+    }
+    let complete = events.last().unwrap();
+    assert_eq!(complete["type"], "complete");
+    assert_eq!(complete["dashboard"]["schema_version"], 2);
+    assert_eq!(complete["inventory"]["schema_version"], 2);
+}
+
+#[cfg(feature = "utrace")]
+#[test]
+fn utrace_dashboard_progress_reports_an_optional_timeline_index() {
+    let index_path = std::env::temp_dir().join(format!(
+        "uasset-parser-utrace-{}-progress.utix",
+        std::process::id()
+    ));
+    let output = run_with_stdin(
+        &[
+            "utrace",
+            "dashboard-progress",
+            "-",
+            "--format=json",
+            "--timeline-index-output",
+            index_path.to_str().unwrap(),
+            "--timeline-index-max-intervals=1",
+        ],
+        &synthetic_utrace(),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let complete = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .last()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .unwrap();
+    assert_eq!(complete["type"], "complete");
+    let expected_path = index_path.to_string_lossy();
+    assert_eq!(
+        complete["timeline_index"]["index_path"].as_str(),
+        Some(expected_path.as_ref())
+    );
+    assert!(index_path.is_file());
+    std::fs::remove_file(index_path).unwrap();
+}
+
+#[cfg(feature = "utrace")]
+#[test]
+fn utrace_timeline_index_and_query_json_contracts() {
+    let dir = std::env::temp_dir();
+    let trace_path = dir.join(format!(
+        "uasset-parser-utrace-{}-timeline.utrace",
+        std::process::id()
+    ));
+    let index_path = dir.join(format!(
+        "uasset-parser-utrace-{}-timeline.utix",
+        std::process::id()
+    ));
+    std::fs::write(&trace_path, synthetic_utrace()).unwrap();
+
+    let build = binary()
+        .args([
+            "utrace",
+            "timeline",
+            "index",
+            trace_path.to_str().unwrap(),
+            "--output",
+            index_path.to_str().unwrap(),
+            "--format=json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(build.status.code(), Some(0));
+    assert!(build.stderr.is_empty());
+    let build_json: Value = serde_json::from_slice(&build.stdout).unwrap();
+    assert_eq!(build_json["schema_version"], 2);
+    assert_eq!(build_json["index"]["indexed_interval_count"], 0);
+    assert!(index_path.exists());
+
+    let query = binary()
+        .args([
+            "utrace",
+            "timeline",
+            "query",
+            index_path.to_str().unwrap(),
+            "--format=json",
+        ])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&trace_path);
+    let _ = std::fs::remove_file(&index_path);
+
+    assert_eq!(query.status.code(), Some(0));
+    assert!(query.stderr.is_empty());
+    let query_json: Value = serde_json::from_slice(&query.stdout).unwrap();
+    assert_eq!(query_json["schema_version"], 2);
+    assert_eq!(query_json["timeline"]["interval_count"], 0);
+    assert_eq!(query_json["timeline"]["intervals"], serde_json::json!([]));
+}
+
+#[cfg(feature = "utrace")]
+#[test]
 fn utrace_coverage_json_contract_cross_references_universe() {
     let dir = std::env::temp_dir();
     let trace_path = dir.join(format!(

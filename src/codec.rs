@@ -3,8 +3,9 @@
 use crate::archive::Reader;
 use crate::package::{Package, PackageIndex};
 use crate::property::{
-    MapEntry, PropertyError, PropertyRecord, PropertyStream, PropertyTagFlags, PropertyTypeName,
-    PropertyValue, RawReason, TextValue, VectorValue, read_tagged_property_stream,
+    IntPointValue, MapEntry, PropertyError, PropertyRecord, PropertyStream, PropertyTagFlags,
+    PropertyTypeName, PropertyValue, RawReason, TextValue, VectorValue,
+    read_tagged_property_stream,
 };
 
 /// UE `INDEX_NONE` marks a full container replace in map property payloads.
@@ -293,15 +294,42 @@ fn decode_binary_or_native_value(
     context: &DecodeContext<'_>,
     path: &str,
 ) -> Result<Option<PropertyValue>, PropertyError> {
-    if type_name == "StructProperty"
-        && resolve_struct_type_name(context.package, type_tree).as_deref() == Some("Vector")
-    {
-        return Ok(Some(PropertyValue::Vector(decode_vector_value(
-            payload, path,
-        )?)));
+    if type_name == "StructProperty" {
+        match resolve_struct_type_name(context.package, type_tree).as_deref() {
+            Some("Vector") => {
+                return Ok(Some(PropertyValue::Vector(decode_vector_value(
+                    payload, path,
+                )?)));
+            }
+            Some("IntPoint") => {
+                return Ok(Some(PropertyValue::IntPoint(decode_int_point_value(
+                    payload, path,
+                )?)));
+            }
+            _ => {}
+        }
     }
 
     Ok(None)
+}
+
+fn decode_int_point_value(
+    payload: &mut Reader<'_>,
+    path: &str,
+) -> Result<IntPointValue, PropertyError> {
+    if payload.remaining() != 8 {
+        return Err(PropertyError::new(
+            crate::property::PropertyErrorKind::MalformedData,
+            Some(payload.tell()),
+            path,
+            format!("unsupported FIntPoint payload size {}", payload.remaining()),
+        ));
+    }
+
+    Ok(IntPointValue {
+        x: payload.read_i32(&format!("{path}.X"))?,
+        y: payload.read_i32(&format!("{path}.Y"))?,
+    })
 }
 
 fn decode_array_value(
@@ -1686,6 +1714,29 @@ mod tests {
                 y: 5.0,
                 z: 6.0,
             })
+        );
+    }
+
+    #[test]
+    fn decodes_fint_point_from_native_layout() {
+        let names = vec!["StructProperty".into(), "IntPoint".into()];
+        let mut payload = Vec::new();
+        push_i32(&mut payload, -12);
+        push_i32(&mut payload, 34);
+
+        let value = decode_record(
+            names,
+            0,
+            vec![PropertyTypeName {
+                name: crate::test_support::name_ref(1, 0),
+                parameters: Vec::new(),
+            }],
+            PropertyTagFlags(0x08),
+            &payload,
+        );
+        assert_eq!(
+            value,
+            PropertyValue::IntPoint(IntPointValue { x: -12, y: 34 })
         );
     }
 }

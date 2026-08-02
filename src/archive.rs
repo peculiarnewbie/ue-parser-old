@@ -382,6 +382,7 @@ impl<'a> Reader<'a> {
         Ok(&self.source[start_index..end_index])
     }
 
+    #[inline]
     pub fn read_u8(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<u8, ArchiveError> {
         Ok(self.read_bytes(1, path)?[0])
     }
@@ -390,6 +391,7 @@ impl<'a> Reader<'a> {
         Ok(i8::from_le_bytes([self.read_u8(path)?]))
     }
 
+    #[inline]
     pub fn read_u16(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<u16, ArchiveError> {
         Ok(u16::from_le_bytes(self.read_array(path)?))
     }
@@ -398,6 +400,7 @@ impl<'a> Reader<'a> {
         Ok(i16::from_le_bytes(self.read_array(path)?))
     }
 
+    #[inline]
     pub fn read_u32(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<u32, ArchiveError> {
         Ok(u32::from_le_bytes(self.read_array(path)?))
     }
@@ -406,6 +409,7 @@ impl<'a> Reader<'a> {
         Ok(i32::from_le_bytes(self.read_array(path)?))
     }
 
+    #[inline]
     pub fn read_u64(&mut self, path: &(impl fmt::Display + ?Sized)) -> Result<u64, ArchiveError> {
         Ok(u64::from_le_bytes(self.read_array(path)?))
     }

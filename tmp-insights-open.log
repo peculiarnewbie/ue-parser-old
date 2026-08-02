@@ -1,0 +1,220 @@
+﻿Log file open, 07/12/26 13:00:16
+LogWindows: Failed to load 'aqProf.dll' (GetLastError=126)
+LogWindows: File 'aqProf.dll' does not exist
+LogProfilingDebugging: Loading WinPixEventRuntime.dll for PIX profiling (from ../../../Engine/Binaries/ThirdParty/Windows/WinPixEventRuntime/x64).
+LogWindows: Failed to load 'VtuneApi.dll' (GetLastError=126)
+LogWindows: File 'VtuneApi.dll' does not exist
+LogWindows: Failed to load 'VtuneApi32e.dll' (GetLastError=126)
+LogWindows: File 'VtuneApi32e.dll' does not exist
+LogCore: UTS: Unreal Trace Server launched successfully
+LogStats: Stats thread started at 0.089082
+LogICUInternationalization: ICU TimeZone Detection - Raw Offset: +7:00, Platform Override: ''
+LogInit: Session CrashGUID >====================================================
+         Session CrashGUID >   UECC-Windows-84603F4A4FFD43E76452C98E3E27EBB9
+         Session CrashGUID >====================================================
+LogConfig: No local boot hotfix file found at: [../../../Engine/Programs/UnrealInsights/Saved/PersistentDownloadDir/HotfixForNextBoot.txt]
+LogPluginManager: Mounting Engine plugin AudioInsights
+LogPluginManager: Mounting Engine plugin ChaosInsights
+LogPluginManager: Mounting Engine plugin IoStoreInsights
+LogPluginManager: Mounting Engine plugin MassInsights
+LogPluginManager: Mounting Engine plugin RenderGraphInsights
+LogPluginManager: Mounting Engine plugin SlateInsights
+LogPluginManager: Mounting Engine plugin VisualStudioSourceCodeAccess
+LogPluginManager: Mounting Engine plugin XCodeSourceCodeAccess
+LogPluginManager: Mounting Engine plugin GameplayInsights
+LogPluginManager: Mounting Engine plugin TcpMessaging
+LogPluginManager: Mounting Engine plugin UdpMessaging
+LogPluginManager: Mounting Engine plugin AudioWidgets
+LogPluginManager: Mounting Engine plugin NetworkPredictionInsights
+LogInit: ExecutableName: UnrealInsights.exe
+LogInit: Build: ++UE5+Release-5.7-CL-51494982
+LogInit: Platform=WindowsEditor
+LogInit: MachineId=8657f18b48b987c3a88cfaaf140036d7
+LogInit: DeviceId=
+LogInit: Engine Version: 5.7.4-51494982+++UE5+Release-5.7
+LogInit: Compatible Engine Version: 5.7.0-47537391+++UE5+Release-5.7
+LogInit: Net CL: 47537391
+LogInit: OS: Windows 11 (25H2) [10.0.26200.8655] (), CPU: AMD Ryzen 9 7950X 16-Core Processor            , GPU: AMD Radeon RX 7900 XT
+LogInit: CPU Model ID: 19612, microcode revision: a601206
+LogInit: Compiled (64-bit): Mar  6 2026 12:57:16
+LogInit: Architecture: x64
+LogInit: Compiled with Visual C++: 19.44.35223.00
+LogInit: Build Configuration: Development
+LogInit: Branch Name: ++UE5+Release-5.7
+LogInit: Command Line: -OpenTraceFile="D:\Perforce\Arif_Fixtures\Traces\basic-cpu-frame.utrace" -ABSLOG= C:\Users\Ryzen\git\swag\ue-parser\tmp-insights-open.log -NoSplash -Messaging
+LogInit: Base Directory: C:/Program Files/Epic Games/UE_5.7/Engine/Binaries/Win64/
+LogInit: Allocator: Mimalloc
+LogInit: Installed Engine Build: 1
+LogInit: This binary is optimized with LTO: no, PGO: no, instrumented for PGO data collection: no
+LogDevObjectVersion: Number of dev versions registered: 35
+LogDevObjectVersion:   Dev-Blueprints (B0D832E4-1F89-4F0D-ACCF-7EB736FD4AA2): 10
+LogDevObjectVersion:   Dev-Build (E1C64328-A22C-4D53-A36C-8E866417BD8C): 0
+LogDevObjectVersion:   Dev-Core (375EC13C-06E4-48FB-B500-84F0262A717E): 4
+LogDevObjectVersion:   Dev-Editor (E4B068ED-F494-42E9-A231-DA0B2E46BB41): 40
+LogDevObjectVersion:   Dev-Framework (CFFC743F-43B0-4480-9391-14DF171D2073): 37
+LogDevObjectVersion:   Dev-Mobile (B02B49B5-BB20-44E9-A304-32B752E40360): 3
+LogDevObjectVersion:   Dev-Networking (A4E4105C-59A1-49B5-A7C5-40C4547EDFEE): 0
+LogDevObjectVersion:   Dev-Online (39C831C9-5AE6-47DC-9A44-9C173E1C8E7C): 0
+LogDevObjectVersion:   Dev-Physics (78F01B33-EBEA-4F98-B9B4-84EACCB95AA2): 20
+LogDevObjectVersion:   Dev-Platform (6631380F-2D4D-43E0-8009-CF276956A95A): 0
+LogDevObjectVersion:   Dev-Rendering (12F88B9F-8875-4AFC-A67C-D90C383ABD29): 49
+LogDevObjectVersion:   Dev-Sequencer (7B5AE74C-D270-4C10-A958-57980B212A5A): 13
+LogDevObjectVersion:   Dev-VR (D7296918-1DD6-4BDD-9DE2-64A83CC13884): 3
+LogDevObjectVersion:   Dev-LoadTimes (C2A15278-BFE7-4AFE-6C17-90FF531DF755): 1
+LogDevObjectVersion:   Private-Geometry (6EACA3D4-40EC-4CC1-B786-8BED09428FC5): 3
+LogDevObjectVersion:   Dev-AnimPhys (29E575DD-E0A3-4627-9D10-D276232CDCEA): 17
+LogDevObjectVersion:   Dev-Anim (AF43A65D-7FD3-4947-9873-3E8ED9C1BB05): 15
+LogDevObjectVersion:   Dev-ReflectionCapture (6B266CEC-1EC7-4B8F-A30B-E4D90942FC07): 1
+LogDevObjectVersion:   Dev-Automation (0DF73D61-A23F-47EA-B727-89E90C41499A): 1
+LogDevObjectVersion:   FortniteMain (601D1886-AC64-4F84-AA16-D3DE0DEAC7D6): 225
+LogDevObjectVersion:   FortniteValkyrie (8DBC2C5B-54A7-43E0-A768-FCBB7DA29060): 8
+LogDevObjectVersion:   FortniteSeason (5B4C06B7-2463-4AF8-805B-BF70CDF5D0DD): 15
+LogDevObjectVersion:   FortniteRelease (E7086368-6B23-4C58-8439-1B7016265E91): 17
+LogDevObjectVersion:   Dev-Enterprise (9DFFBCD6-494F-0158-E221-12823C92A888): 11
+LogDevObjectVersion:   Dev-Niagara (F2AED0AC-9AFE-416F-8664-AA7FFA26D6FC): 1
+LogDevObjectVersion:   Dev-Destruction (174F1F0B-B4C6-45A5-B13F-2EE8D0FB917D): 10
+LogDevObjectVersion:   Dev-Physics-Ext (35F94A83-E258-406C-A318-09F59610247C): 41
+LogDevObjectVersion:   Dev-PhysicsMaterial-Chaos (B68FC16E-8B1B-42E2-B453-215C058844FE): 1
+LogDevObjectVersion:   Dev-CineCamera (B2E18506-4273-CFC2-A54E-F4BB758BBA07): 1
+LogDevObjectVersion:   Dev-VirtualProduction (64F58936-FD1B-42BA-BA96-7289D5D0FA4E): 1
+LogDevObjectVersion:   UE5-Main (697DD581-E64F-41AB-AA4A-51ECBEB7B628): 121
+LogDevObjectVersion:   UE5-Release (D89B5E42-24BD-4D46-8412-ACA8DF641779): 61
+LogDevObjectVersion:   UE5-SpecialProject (59DA5D52-1232-4948-B878-597870B8E98B): 9
+LogDevObjectVersion:   Dev-MediaFramework (6F0ED827-A609-4895-9C91-998D90180EA4): 2
+LogDevObjectVersion:   Dev-NaniteResearch (30D58BE3-95EA-4282-A6E3-B159D8EBB06A): 1
+LogInit: Presizing for max 100000 objects, including 0 objects not considered by GC.
+LogInit: Object subsystem initialized
+LogConfig: Applying CVar settings from Section [Startup] File [../../../Engine/Config/ConsoleVariables.ini]
+LogConfig: CVar [[r.DumpShaderDebugInfo:2]] deferred - dummy variable created
+LogConfig: CVar [[p.chaos.AllowCreatePhysxBodies:1]] deferred - dummy variable created
+LogConfig: CVar [[fx.SkipVectorVMBackendOptimizations:1]] deferred - dummy variable created
+LogConfig: Applying CVar settings from Section [Startup_Windows] File [../../../Engine/Config/ConsoleVariables.ini]
+[2026.07.12-06.00.16:185][  0]LogConfig: Applying CVar settings from Section [ConsoleVariables] File [Engine]
+[2026.07.12-06.00.16:185][  0]LogConfig: Set CVar [[WindowsApplication.UseWorkerThreadForRawInput:0]]
+[2026.07.12-06.00.16:185][  0]LogInit: Computer: DESKTOP-WORK-AR
+[2026.07.12-06.00.16:185][  0]LogInit: User: Ryzen
+[2026.07.12-06.00.16:185][  0]LogInit: CPU Page size=4096, Cores=16
+[2026.07.12-06.00.16:185][  0]LogInit: High frequency timer resolution =10.000000 MHz
+[2026.07.12-06.00.16:185][  0]LogInit: Handheld Device: 0
+[2026.07.12-06.00.16:185][  0]LogMemory: Process is running as part of a Windows Job with separate resource limits
+[2026.07.12-06.00.16:185][  0]LogMemory: Memory total: Physical=63.2GB (64GB approx) Virtual=127.2GB
+[2026.07.12-06.00.16:185][  0]LogMemory: Platform Memory Stats for WindowsEditor
+[2026.07.12-06.00.16:185][  0]LogMemory: Process Physical Memory: 94.21 MB used, 94.21 MB peak
+[2026.07.12-06.00.16:185][  0]LogMemory: Process Virtual Memory: 179.66 MB used, 179.66 MB peak
+[2026.07.12-06.00.16:185][  0]LogMemory: Physical Memory: 46572.68 MB used,  18121.28 MB free, 64693.95 MB total
+[2026.07.12-06.00.16:185][  0]LogMemory: Virtual Memory: 75889.92 MB used,  54340.03 MB free, 130229.95 MB total
+[2026.07.12-06.00.16:191][  0]LogUObjectArray: 720 objects as part of root set at end of initial load.
+[2026.07.12-06.00.16:191][  0]LogUObjectArray: CloseDisregardForGC: 0/0 objects in disregard for GC pool
+[2026.07.12-06.00.16:191][  0]LogInit: Using OS detected language (en-US).
+[2026.07.12-06.00.16:191][  0]LogInit: Using OS detected locale (en-US).
+[2026.07.12-06.00.16:191][  0]LogTextLocalizationManager: No specific localization for 'en-US' exists, so 'en' will be used for the language.
+[2026.07.12-06.00.16:224][  0]LogInit: Using OS detected language (en-US).
+[2026.07.12-06.00.16:224][  0]LogInit: Using OS detected locale (en-US).
+[2026.07.12-06.00.16:224][  0]LogTextLocalizationManager: No localization for 'en-US' exists, so 'en' will be used for the language.
+[2026.07.12-06.00.16:224][  0]LogTextLocalizationManager: No localization for 'en-US' exists, so 'en' will be used for the locale.
+[2026.07.12-06.00.16:224][  0]LogPackageLocalizationCache: Processed 4 localized package path(s) for 1 prioritized culture(s) in 0.000114 seconds
+[2026.07.12-06.00.16:224][  0]LogSlate: Using FreeType 2.10.0
+[2026.07.12-06.00.16:224][  0]LogSlate: SlateFontServices - WITH_FREETYPE: 1, WITH_HARFBUZZ: 1
+[2026.07.12-06.00.16:230][  0]LogWindowsTextInputMethodSystem: Available input methods:
+[2026.07.12-06.00.16:230][  0]LogWindowsTextInputMethodSystem:   - English (United States) - (Keyboard).
+[2026.07.12-06.00.16:230][  0]LogWindowsTextInputMethodSystem:   - English (United States) - Touch Input Correction (TSF IME).
+[2026.07.12-06.00.16:230][  0]LogWindowsTextInputMethodSystem: Activated input method: English (United States) - (Keyboard).
+[2026.07.12-06.00.16:236][  0]LogWindowsTouchpad: Display: CacheForceMaxTouchpadSensitivityMode SetMaxTouchpadSensitivity
+[2026.07.12-06.00.16:243][  0]LogSlate: New Slate User Created. Platform User Id 0, User Index 0, Is Virtual User: 0
+[2026.07.12-06.00.16:243][  0]LogSlate: Slate User Registered.  User Index 0, Is Virtual User: 0
+[2026.07.12-06.00.16:256][  0]LogStandaloneRenderer: D3D11 adapters settings:
+[2026.07.12-06.00.16:256][  0]LogStandaloneRenderer: D3D11 adapters:
+[2026.07.12-06.00.16:256][  0]LogStandaloneRenderer: Testing D3D11 adapter: 0. Description: 'AMD Radeon RX 7900 XT'. VendorId: 1002. DeviceId: 744c.
+[2026.07.12-06.00.16:303][  0]LogStandaloneRenderer:   0. 'AMD Radeon RX 7900 XT'. Feature level: 11_1
+[2026.07.12-06.00.16:303][  0]LogStandaloneRenderer: Testing D3D11 adapter: 1. Description: 'AMD Radeon(TM) Graphics'. VendorId: 1002. DeviceId: 164e.
+[2026.07.12-06.00.16:338][  0]LogStandaloneRenderer:   1. 'AMD Radeon(TM) Graphics'. Feature level: 11_1
+[2026.07.12-06.00.16:338][  0]LogStandaloneRenderer: Testing D3D11 adapter: 2. Description: 'Microsoft Basic Render Driver'. VendorId: 1414. DeviceId: 008c.
+[2026.07.12-06.00.16:340][  0]LogStandaloneRenderer:   2. 'Microsoft Basic Render Driver'. Feature level: 11_1
+[2026.07.12-06.00.16:340][  0]LogStandaloneRenderer:   Skip adapter.
+[2026.07.12-06.00.16:340][  0]LogStandaloneRenderer: Selected D3D11 Description: 'AMD Radeon RX 7900 XT'. VendorId: 1002. DeviceId: 744c.
+[2026.07.12-06.00.16:378][  0]LogStreaming: Warning: Failed to read file '../../../Engine/Platforms/VisionOS/Content/Editor/Slate/Launcher/Platform_VisionOS_24x.png' error.
+[2026.07.12-06.00.16:378][  0]LogSlateD3D: Warning: Could not find file for Slate resource: [../../../Engine/Platforms/VisionOS/Content/Editor/Slate/Launcher/Platform_VisionOS_24x.png] '../../../Engine/Platforms/VisionOS/Content/Editor/Slate/Launcher/Platform_VisionOS_24x.png'
+[2026.07.12-06.00.16:378][  0]LogStreaming: Warning: Failed to read file '../../../Engine/Platforms/VisionOS/Content/Editor/Slate/Launcher/Platform_VisionOS_128x.png' error.
+[2026.07.12-06.00.16:378][  0]LogSlateD3D: Warning: Could not find file for Slate resource: [../../../Engine/Platforms/VisionOS/Content/Editor/Slate/Launcher/Platform_VisionOS_128x.png] '../../../Engine/Platforms/VisionOS/Content/Editor/Slate/Launcher/Platform_VisionOS_128x.png'
+[2026.07.12-06.00.16:378][  0]LogStreaming: Warning: Failed to read file '../../../Engine/Platforms/VisionOS/Content/Editor/Slate/Launcher/Platform_VisionOS_128x.png' error.
+[2026.07.12-06.00.16:379][  0]LogSlateD3D: Warning: Could not find file for Slate resource: [../../../Engine/Platforms/VisionOS/Content/Editor/Slate/Launcher/Platform_VisionOS_128x.png] '../../../Engine/Platforms/VisionOS/Content/Editor/Slate/Launcher/Platform_VisionOS_128x.png'
+[2026.07.12-06.00.16:425][  0]LogTimingProfiler: Initialize
+[2026.07.12-06.00.16:425][  0]LogTimingProfiler: OnSessionChanged
+[2026.07.12-06.00.16:425][  0]LoadingProfiler: Initialize
+[2026.07.12-06.00.16:425][  0]LoadingProfiler: OnSessionChanged
+[2026.07.12-06.00.16:425][  0]LogNetworkingProfiler: Initialize
+[2026.07.12-06.00.16:425][  0]LogNetworkingProfiler: OnSessionChanged
+[2026.07.12-06.00.16:425][  0]LogMemoryProfiler: Initialize
+[2026.07.12-06.00.16:425][  0]LogMemoryProfiler: OnSessionChanged
+[2026.07.12-06.00.16:428][  0]LogInit: WinSock: version 1.1 (2.2), MaxSocks=32767, MaxUdp=65467
+[2026.07.12-06.00.16:428][  0]LogTcpMessaging: Initializing TcpMessaging bridge
+[2026.07.12-06.00.16:430][  0]LogUdpMessaging: Display: Work queue size set to 1024.
+[2026.07.12-06.00.16:430][  0]LogUdpMessaging: Initializing bridge on interface 0.0.0.0:0 to multicast group 230.0.0.1:6666.
+[2026.07.12-06.00.16:430][  0]LogUdpMessaging: Display: Unicast socket bound to '0.0.0.0:51930'.
+[2026.07.12-06.00.16:434][  0]LogUdpMessaging: Display: Added local interface '172.27.160.1' to multicast group '230.0.0.1:6666'
+[2026.07.12-06.00.16:434][  0]LogUdpMessaging: Display: Added local interface '192.168.0.183' to multicast group '230.0.0.1:6666'
+[2026.07.12-06.00.16:434][  0]LogUdpMessaging: Display: Added local interface '127.0.0.1' to multicast group '230.0.0.1:6666'
+[2026.07.12-06.00.16:434][  0]LogUdpMessaging: Display: Using asynchronous task graph for message deserialization.
+[2026.07.12-06.00.16:450][  0]LogInit: Setting process to per monitor DPI aware
+[2026.07.12-06.00.16:592][  0]LogSlate: Took 0.000111 seconds to synchronously load lazily loaded font '../../../Engine/Content/Slate/Fonts/Roboto-Regular.ttf' (155K)
+[2026.07.12-06.00.16:615][  0]LogMemoryProfiler: OnSessionChanged
+[2026.07.12-06.00.16:615][  0]LogNetworkingProfiler: OnSessionChanged
+[2026.07.12-06.00.16:615][  0]LoadingProfiler: OnSessionChanged
+[2026.07.12-06.00.16:615][  0]LogTimingProfiler: OnSessionChanged
+[2026.07.12-06.00.16:615][  0]LogInit: Display: Insights slate application initialized successfully.
+[2026.07.12-06.00.16:621][  0]LogTraceServices: [GpuProfiler] Init Version=2
+[2026.07.12-06.00.16:623][  0]LogTimingProfiler: Opening the "Timing Insights" tab...
+[2026.07.12-06.00.16:627][  0]LogTraceServices: Warning: [CpuProfiler] MetadataSpec -- de-duplicated timer for SpecId 4677 -- old: 3002 (UpdateGPUScene) metadata=" NumPrimitiveDataUploads %u" (0 fields) --> new: 4348 (UpdateGPUScene) metadata=" NumPrimitiveDataUploads %u" (0 fields) !!!
+[2026.07.12-06.00.16:627][  0]LogTraceServices: Warning: [CpuProfiler] MetadataSpec -- de-duplicated timer for SpecId 4993 -- old: 4458 (EditorPrimitives) metadata="RenderViewEditorPrimitives %dx%d msaa=%d" (0 fields) --> new: 4569 (EditorPrimitives) metadata="RenderViewEditorForegroundPrimitives %dx%d msaa=%d" (0 fields) !!!
+[2026.07.12-06.00.16:627][  0]LogTraceServices: Warning: [CpuProfiler] MetadataSpec -- de-duplicated timer for SpecId 4994 -- old: 4458 (EditorPrimitives) metadata="RenderViewEditorPrimitives %dx%d msaa=%d" (0 fields) --> new: 4570 (EditorPrimitives) metadata="RenderViewEditorForegroundTranslucentPrimitives %dx%d msaa=%d" (0 fields) !!!
+[2026.07.12-06.00.16:627][  0]TraceInsights: [Tab] SHOW SFrameTrack
+[2026.07.12-06.00.16:630][  0]TraceInsights: [Tab] SHOW STimingView
+[2026.07.12-06.00.16:632][  0]TraceInsights: [Tab] SHOW SLogView
+[2026.07.12-06.00.16:653][  0]TraceInsights: [Tab] SHOW STimersView
+[2026.07.12-06.00.16:664][  0]TraceInsights: [Tab] SHOW SStatsView
+[2026.07.12-06.00.16:670][  0]TraceInsights: [Tab] SHOW STimerTreeView
+[2026.07.12-06.00.16:676][  0]TraceInsights: [Tab] SHOW STimerTreeView
+[2026.07.12-06.00.16:871][  1]TraceInsights: [LogView] Total Log Categories: 1722
+[2026.07.12-06.00.16:879][  1]TraceInsights: Warning: [LogView] Duplicated Log Categories: 25 (+237x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "Http" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "RDG" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "DeformableGaussSeidelMainConstraint" (+2x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "MuscleActivationConstraint" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "USkeletalMeshSimulationComponentLogging" (+5x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "Spline" (+31x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "EditorClassViewer" (+172x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "FSC_Log" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "GeometryCollectionCache" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "UGCC_LOG" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "CqTest" (+3x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "SummarizeTrace" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "WorldPartitionBuilderSourceControlHelper" (+3x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "RHICore" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "IntelBreadcrumbs" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "NvidiaAftermath" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "AutomationTest" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "ScreenshotFunctionalTest" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "DataflowSkeletalMeshNodes" (+3x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "UGeometryCollectionConversionLogging" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "Sequencer" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "RemoteControl" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "MeshPaintSkeletalMeshAdapter" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "VSCodeAccessor" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView]    "CryptoKeys" (+1x)
+[2026.07.12-06.00.16:879][  1]TraceInsights: [LogView] Unique Log Categories: 1485
+[2026.07.12-06.00.17:314][  2]LogTraceServices: [Regions] Analysis completed (0 timers, 0 categories, 0 timing regions, 0 lanes).
+[2026.07.12-06.00.17:314][  2]LogTraceServices: [MemTags] Analysis completed (0 trackers, 1 tag sets, 0 tags).
+[2026.07.12-06.00.17:314][  2]LogTraceServices: [Meta] Analysis completed (0 events, 0 alloc events, 0 allocs, 0 bytes).
+[2026.07.12-06.00.17:314][  2]LogTraceServices: [LoadTime] Analysis completed (0 threads, 0 active async packages, 0 active requests + 0 fake requests, 0 active linkers, 0 active batches, 0 exports, 11 classes).
+[2026.07.12-06.00.17:317][  2]LogTraceServices: [StackSampling] max stack size: 0 frames
+[2026.07.12-06.00.17:317][  2]LogTraceServices: [StackSampling] Analysis completed (0 timers, 0 timelines, 0 threads, 0 stack samples, 0 stack frames).
+[2026.07.12-06.00.17:319][  2]LogTraceServices: Warning: [CpuProfiler] Number of timer/metadata warnings: 3
+[2026.07.12-06.00.17:319][  2]LogTraceServices: [CpuProfiler] Analysis completed (45 threads, 5302 timers, 6390 spec ids, 4191913 scopes, 23457272 bytes, 5.6 bytes/scope).
+[2026.07.12-06.00.17:319][  2]LogTraceServices: [GpuProfiler] Analysis completed (3 queues, 194 timers, 192 breadcrumb specs, 176 breadcrumb names).
+[2026.07.12-06.00.17:319][  2]LogTraceServices: [Verse] Analysis completed (0 timers, 0 samples; max stack size = 0).
+[2026.07.12-06.00.17:379][  3]LogTimingProfiler: [Counters] Request async aggregation (op 1) [0.000000s to 3980.208898s] (3980.208898s)...
+[2026.07.12-06.00.17:384][  3]LogTimingProfiler: [Timers] Request async aggregation (op 1) [0.000000s to 3980.208898s] (3980.208898s)...
+[2026.07.12-06.00.17:384][  3]TraceInsights: Analysis has completed in 766.16 ms (5195.0X speed; session duration: 1h 6m).
+[2026.07.12-06.00.17:617][  4]LogTimingProfiler: [Timers] Start async aggregation (op 1)...
+[2026.07.12-06.00.17:872][  5]LogSlate: Took 0.004402 seconds to synchronously load lazily loaded font '../../../Engine/Content/Slate/Fonts/Roboto-Bold.ttf' (160K)
+[2026.07.12-06.00.17:876][  5]LogTimingProfiler: [Timers] Aggregated stats computed in 0.2585s (0.2559s + 0.0026s) - total: 0.4919s (1 ops)

@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use uasset_parser::asset::{
@@ -19,7 +20,9 @@ use uasset_parser::property::{PropertyRecord, PropertyValue, RawReason};
 use uasset_parser::schema::{ClassSchema, SchemaProvider, StructSchema};
 #[cfg(feature = "utrace")]
 use uasset_parser::utrace::{
-    TraceCoverage, TraceDashboard, TraceError, TraceErrorKind, TraceInspect, TraceInventory,
+    CpuTimelineIndexInfo, CpuTimelineQuery, CpuTimelineQueryResult, TimelineIndexError,
+    TimelineIndexRequest, TraceCoverage, TraceDashboard, TraceError, TraceErrorKind, TraceInspect,
+    TraceInventory,
 };
 use uasset_parser::{Package, PackageSummary};
 
@@ -47,6 +50,7 @@ fn run(arguments: Vec<OsString>) -> u8 {
             write_stdout(format!("uasset {}\n", env!("CARGO_PKG_VERSION")).as_bytes())
         }
         Ok(Command::Inspect(options)) => inspect(&options),
+        Ok(Command::Authoring(options)) => authoring(&options),
         Ok(Command::Utrace(command)) => run_utrace(command),
         Err(error) => {
             eprintln!("uasset: {error}\n\n{USAGE}");
@@ -71,6 +75,9 @@ struct InspectOptions {
     max_frames: usize,
     gpu_timeline_frame: Option<u32>,
     gpu_timeline_limit: usize,
+    /// When set on `dashboard-progress`, write a bounded capture-wide CPU index.
+    timeline_index_output: Option<PathBuf>,
+    timeline_index_max_intervals: usize,
     /// Repeatable local symbol search roots (`--symbol-path`). Never network.
     symbol_paths: Vec<PathBuf>,
 }
@@ -93,6 +100,7 @@ impl Input {
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
     Inspect(InspectOptions),
+    Authoring(InspectOptions),
     Utrace(UtraceCommand),
     Help,
     Version,
@@ -102,10 +110,39 @@ enum Command {
 enum UtraceCommand {
     Inspect(InspectOptions),
     Dashboard(InspectOptions),
+    DashboardBundle(InspectOptions),
+    DashboardProgress(InspectOptions),
     DashboardHelp,
     Inventory(InspectOptions),
     Coverage(CoverageOptions),
     Html(UtraceHtmlOptions),
+    Timeline(TimelineCommand),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum TimelineCommand {
+    Index(TimelineIndexOptions),
+    Query(TimelineQueryOptions),
+    Help,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TimelineIndexOptions {
+    input: Input,
+    output: PathBuf,
+    format: OutputFormat,
+    max_intervals: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TimelineQueryOptions {
+    index: PathBuf,
+    format: OutputFormat,
+    start_cycle: Option<u64>,
+    end_cycle: Option<u64>,
+    thread_id: Option<u16>,
+    search: Option<String>,
+    limit: usize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -129,6 +166,10 @@ impl Command {
         };
         match command.to_str() {
             Some("inspect") => Self::parse_inspect(arguments.collect()),
+            Some("authoring") => match Self::parse_inspect(arguments.collect())? {
+                Self::Inspect(options) => Ok(Self::Authoring(options)),
+                _ => unreachable!("parse_inspect only returns Inspect"),
+            },
             Some("utrace") => Self::parse_utrace(arguments.collect()),
             Some("-h" | "--help" | "help") => {
                 reject_trailing_arguments(arguments)?;
@@ -165,6 +206,12 @@ impl Command {
                     )))
                 }
             }
+            Some("dashboard-bundle") => Ok(Self::Utrace(UtraceCommand::DashboardBundle(
+                Self::parse_utrace_dashboard(arguments.collect())?,
+            ))),
+            Some("dashboard-progress") => Ok(Self::Utrace(UtraceCommand::DashboardProgress(
+                Self::parse_utrace_dashboard(arguments.collect())?,
+            ))),
             Some("inventory") => match Self::parse_inspect(arguments.collect())? {
                 Self::Inspect(options) => Ok(Self::Utrace(UtraceCommand::Inventory(options))),
                 _ => unreachable!("parse_inspect only returns Inspect"),
@@ -175,6 +222,9 @@ impl Command {
             Some("html") => Ok(Self::Utrace(UtraceCommand::Html(Self::parse_utrace_html(
                 arguments.collect(),
             )?))),
+            Some("timeline") => Ok(Self::Utrace(UtraceCommand::Timeline(
+                Self::parse_utrace_timeline(arguments.collect())?,
+            ))),
             Some(command) => Err(format!("unknown utrace command {command:?}")),
             None => Err("utrace command is not valid UTF-8".to_owned()),
         }
@@ -221,6 +271,8 @@ impl Command {
             max_frames: 120,
             gpu_timeline_frame: None,
             gpu_timeline_limit: 500,
+            timeline_index_output: None,
+            timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
             symbol_paths: Vec::new(),
         }))
     }
@@ -233,6 +285,8 @@ impl Command {
         let mut max_frames = 120;
         let mut gpu_timeline_frame = None;
         let mut gpu_timeline_limit = 500;
+        let mut timeline_index_output = None;
+        let mut timeline_index_max_intervals = uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS;
         let mut symbol_paths = Vec::new();
         let mut index = 0;
 
@@ -314,6 +368,32 @@ impl Command {
                         "--gpu-timeline-limit",
                     )?;
                 }
+                Some("--timeline-index-output") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--timeline-index-output requires a file path".to_owned())?;
+                    timeline_index_output = Some(PathBuf::from(value));
+                }
+                Some(value) if value.starts_with("--timeline-index-output=") => {
+                    timeline_index_output =
+                        Some(PathBuf::from(&value["--timeline-index-output=".len()..]));
+                }
+                Some("--timeline-index-max-intervals") => {
+                    index += 1;
+                    let value = arguments.get(index).ok_or_else(|| {
+                        "--timeline-index-max-intervals requires a count".to_owned()
+                    })?;
+                    timeline_index_max_intervals =
+                        parse_usize_arg(value, "--timeline-index-max-intervals")?;
+                }
+                Some(value) if value.starts_with("--timeline-index-max-intervals=") => {
+                    timeline_index_max_intervals = parse_usize_arg(
+                        OsString::from(&value["--timeline-index-max-intervals=".len()..])
+                            .as_os_str(),
+                        "--timeline-index-max-intervals",
+                    )?;
+                }
                 Some("--symbol-path") => {
                     index += 1;
                     let value = arguments
@@ -339,6 +419,10 @@ impl Command {
             index += 1;
         }
 
+        if timeline_index_output.is_some() && timeline_index_max_intervals == 0 {
+            return Err("--timeline-index-max-intervals must be at least one".to_owned());
+        }
+
         Ok(InspectOptions {
             input: input.ok_or_else(|| "dashboard requires a file path or `-`".to_owned())?,
             format,
@@ -347,6 +431,8 @@ impl Command {
             max_frames,
             gpu_timeline_frame,
             gpu_timeline_limit,
+            timeline_index_output,
+            timeline_index_max_intervals,
             symbol_paths,
         })
     }
@@ -440,6 +526,209 @@ impl Command {
             output,
         })
     }
+
+    fn parse_utrace_timeline(arguments: Vec<OsString>) -> Result<TimelineCommand, String> {
+        let mut arguments = arguments.into_iter();
+        let Some(command) = arguments.next() else {
+            return Err("utrace timeline requires `index` or `query`".to_owned());
+        };
+        let arguments = arguments.collect::<Vec<_>>();
+        match command.to_str() {
+            Some("index") => {
+                Self::parse_utrace_timeline_index(arguments).map(TimelineCommand::Index)
+            }
+            Some("query") => {
+                Self::parse_utrace_timeline_query(arguments).map(TimelineCommand::Query)
+            }
+            Some("-h" | "--help" | "help") if arguments.is_empty() => Ok(TimelineCommand::Help),
+            Some("-h" | "--help" | "help") => {
+                Err("utrace timeline help does not accept trailing arguments".to_owned())
+            }
+            Some(command) => Err(format!("unknown utrace timeline command {command:?}")),
+            None => Err("utrace timeline command is not valid UTF-8".to_owned()),
+        }
+    }
+
+    fn parse_utrace_timeline_index(
+        arguments: Vec<OsString>,
+    ) -> Result<TimelineIndexOptions, String> {
+        let mut input = None;
+        let mut output = None;
+        let mut format = OutputFormat::Text;
+        let mut max_intervals = uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS;
+        let mut index = 0;
+        while index < arguments.len() {
+            let argument = &arguments[index];
+            match argument.to_str() {
+                Some("--output") | Some("-o") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--output requires a file path".to_owned())?;
+                    output = Some(PathBuf::from(value));
+                }
+                Some(value) if value.starts_with("--output=") => {
+                    output = Some(PathBuf::from(&value["--output=".len()..]));
+                }
+                Some("--max-intervals") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--max-intervals requires a count".to_owned())?;
+                    max_intervals = parse_usize_arg(value, "--max-intervals")?;
+                }
+                Some(value) if value.starts_with("--max-intervals=") => {
+                    max_intervals = parse_usize_arg(
+                        OsString::from(&value["--max-intervals=".len()..]).as_os_str(),
+                        "--max-intervals",
+                    )?;
+                }
+                Some("--format") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--format requires text or json".to_owned())?;
+                    format = parse_format(value)?;
+                }
+                Some(value) if value.starts_with("--format=") => {
+                    format = parse_format(OsString::from(&value["--format=".len()..]).as_os_str())?;
+                }
+                Some(value) if value.starts_with('-') && value != "-" => {
+                    return Err(format!("unknown timeline index option {value:?}"));
+                }
+                _ if input.is_some() => {
+                    return Err("timeline index accepts exactly one trace input".to_owned());
+                }
+                Some("-") => input = Some(Input::Stdin),
+                _ => input = Some(Input::File(PathBuf::from(argument))),
+            }
+            index += 1;
+        }
+        if max_intervals == 0 {
+            return Err("--max-intervals must be at least one".to_owned());
+        }
+        Ok(TimelineIndexOptions {
+            input: input.ok_or_else(|| "timeline index requires a trace input".to_owned())?,
+            output: output.ok_or_else(|| "timeline index requires --output <path>".to_owned())?,
+            format,
+            max_intervals,
+        })
+    }
+
+    fn parse_utrace_timeline_query(
+        arguments: Vec<OsString>,
+    ) -> Result<TimelineQueryOptions, String> {
+        let mut index_path = None;
+        let mut format = OutputFormat::Text;
+        let mut start_cycle = None;
+        let mut end_cycle = None;
+        let mut thread_id = None;
+        let mut search = None;
+        let mut limit = 500;
+        let mut index = 0;
+        while index < arguments.len() {
+            let argument = &arguments[index];
+            match argument.to_str() {
+                Some("--start-cycle") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--start-cycle requires a cycle".to_owned())?;
+                    start_cycle = Some(parse_u64_arg(value, "--start-cycle")?);
+                }
+                Some(value) if value.starts_with("--start-cycle=") => {
+                    start_cycle = Some(parse_u64_arg(
+                        OsString::from(&value["--start-cycle=".len()..]).as_os_str(),
+                        "--start-cycle",
+                    )?);
+                }
+                Some("--end-cycle") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--end-cycle requires a cycle".to_owned())?;
+                    end_cycle = Some(parse_u64_arg(value, "--end-cycle")?);
+                }
+                Some(value) if value.starts_with("--end-cycle=") => {
+                    end_cycle = Some(parse_u64_arg(
+                        OsString::from(&value["--end-cycle=".len()..]).as_os_str(),
+                        "--end-cycle",
+                    )?);
+                }
+                Some("--thread") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--thread requires a thread id".to_owned())?;
+                    thread_id = Some(parse_u16_arg(value, "--thread")?);
+                }
+                Some(value) if value.starts_with("--thread=") => {
+                    thread_id = Some(parse_u16_arg(
+                        OsString::from(&value["--thread=".len()..]).as_os_str(),
+                        "--thread",
+                    )?);
+                }
+                Some("--search") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--search requires text".to_owned())?;
+                    search = Some(
+                        value
+                            .to_str()
+                            .ok_or_else(|| "--search must be valid UTF-8".to_owned())?
+                            .to_owned(),
+                    );
+                }
+                Some(value) if value.starts_with("--search=") => {
+                    search = Some(value["--search=".len()..].to_owned());
+                }
+                Some("--limit") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--limit requires a count".to_owned())?;
+                    limit = parse_usize_arg(value, "--limit")?;
+                }
+                Some(value) if value.starts_with("--limit=") => {
+                    limit = parse_usize_arg(
+                        OsString::from(&value["--limit=".len()..]).as_os_str(),
+                        "--limit",
+                    )?;
+                }
+                Some("--format") => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .ok_or_else(|| "--format requires text or json".to_owned())?;
+                    format = parse_format(value)?;
+                }
+                Some(value) if value.starts_with("--format=") => {
+                    format = parse_format(OsString::from(&value["--format=".len()..]).as_os_str())?;
+                }
+                Some(value) if value.starts_with('-') => {
+                    return Err(format!("unknown timeline query option {value:?}"));
+                }
+                _ if index_path.is_some() => {
+                    return Err("timeline query accepts exactly one index path".to_owned());
+                }
+                _ => index_path = Some(PathBuf::from(argument)),
+            }
+            index += 1;
+        }
+        if limit == 0 {
+            return Err("--limit must be at least one".to_owned());
+        }
+        Ok(TimelineQueryOptions {
+            index: index_path.ok_or_else(|| "timeline query requires an index path".to_owned())?,
+            format,
+            start_cycle,
+            end_cycle,
+            thread_id,
+            search,
+            limit,
+        })
+    }
 }
 
 fn reject_trailing_arguments(mut arguments: impl Iterator<Item = OsString>) -> Result<(), String> {
@@ -464,6 +753,22 @@ fn parse_u32_arg(value: &std::ffi::OsStr, flag: &str) -> Result<u32, String> {
         return Err(format!("{flag} value is not valid UTF-8"));
     };
     text.parse::<u32>()
+        .map_err(|_| format!("{flag} requires an unsigned integer, got {text:?}"))
+}
+
+fn parse_u16_arg(value: &std::ffi::OsStr, flag: &str) -> Result<u16, String> {
+    let Some(text) = value.to_str() else {
+        return Err(format!("{flag} value is not valid UTF-8"));
+    };
+    text.parse::<u16>()
+        .map_err(|_| format!("{flag} requires an unsigned 16-bit integer, got {text:?}"))
+}
+
+fn parse_u64_arg(value: &std::ffi::OsStr, flag: &str) -> Result<u64, String> {
+    let Some(text) = value.to_str() else {
+        return Err(format!("{flag} value is not valid UTF-8"));
+    };
+    text.parse::<u64>()
         .map_err(|_| format!("{flag} requires an unsigned integer, got {text:?}"))
 }
 
@@ -514,15 +819,79 @@ fn inspect(options: &InspectOptions) -> u8 {
     }
 }
 
+fn authoring(options: &InspectOptions) -> u8 {
+    if options.format != OutputFormat::Json {
+        eprintln!("uasset: authoring requires --format json");
+        return EXIT_USAGE;
+    }
+
+    let input_name = options.input.display_name();
+    let bytes = match read_input(&options.input) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            write_error(
+                options.format,
+                ErrorOutput::io(input_name, error.to_string()),
+            );
+            return EXIT_IO;
+        }
+    };
+    let package = match Package::parse(&bytes) {
+        Ok(package) => package,
+        Err(error) => {
+            let exit_code = exit_code_for_package_error(&error);
+            write_error(options.format, ErrorOutput::package(input_name, &error));
+            return exit_code;
+        }
+    };
+    let output = InspectOutput::from_package(input_name, &bytes, &package);
+    let mut tables = output
+        .assets
+        .iter()
+        .filter(|asset| matches!(asset.kind, "DataTable" | "CompositeDataTable"));
+    let Some(table) = tables.next() else {
+        eprintln!("uasset: package contains no supported DataTable export");
+        return EXIT_UNSUPPORTED;
+    };
+    if tables.next().is_some() {
+        eprintln!("uasset: package contains more than one DataTable export");
+        return EXIT_UNSUPPORTED;
+    }
+
+    let authoring = AuthoringSnapshotOutput::from_inspect(&output, table);
+    let partial = authoring.completeness == "partial";
+    let mut rendered = match serde_json::to_vec(&authoring) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            eprintln!("uasset: failed to serialize authoring output: {error}");
+            return EXIT_INTERNAL;
+        }
+    };
+    rendered.push(b'\n');
+    let exit = write_stdout(&rendered);
+    if exit == EXIT_SUCCESS && partial {
+        EXIT_PARTIAL
+    } else {
+        exit
+    }
+}
+
 #[cfg(feature = "utrace")]
 fn run_utrace(command: UtraceCommand) -> u8 {
     match command {
         UtraceCommand::Inspect(options) => inspect_utrace(&options),
         UtraceCommand::Dashboard(options) => dashboard_utrace(&options),
+        UtraceCommand::DashboardBundle(options) => dashboard_bundle_utrace(&options),
+        UtraceCommand::DashboardProgress(options) => dashboard_progress_utrace(&options),
         UtraceCommand::DashboardHelp => write_stdout(UTRACE_DASHBOARD_HELP.as_bytes()),
         UtraceCommand::Inventory(options) => inventory_utrace(&options),
         UtraceCommand::Coverage(options) => coverage_utrace(&options),
         UtraceCommand::Html(options) => html_utrace(&options),
+        UtraceCommand::Timeline(TimelineCommand::Index(options)) => timeline_index_utrace(&options),
+        UtraceCommand::Timeline(TimelineCommand::Query(options)) => timeline_query_utrace(&options),
+        UtraceCommand::Timeline(TimelineCommand::Help) => {
+            write_stdout(UTRACE_TIMELINE_HELP.as_bytes())
+        }
     }
 }
 
@@ -572,6 +941,10 @@ fn inspect_utrace(options: &InspectOptions) -> u8 {
 
 #[cfg(feature = "utrace")]
 fn dashboard_utrace(options: &InspectOptions) -> u8 {
+    if options.timeline_index_output.is_some() {
+        eprintln!("uasset: --timeline-index-output is only supported by dashboard-progress");
+        return EXIT_USAGE;
+    }
     let input_name = options.input.display_name();
     let bytes = match read_input(&options.input) {
         Ok(bytes) => bytes,
@@ -638,6 +1011,372 @@ fn dashboard_utrace(options: &InspectOptions) -> u8 {
         }
     };
     write_stdout(&rendered)
+}
+
+#[cfg(feature = "utrace")]
+fn dashboard_bundle_utrace(options: &InspectOptions) -> u8 {
+    if options.timeline_index_output.is_some() {
+        eprintln!("uasset: --timeline-index-output is only supported by dashboard-progress");
+        return EXIT_USAGE;
+    }
+    if options.format != OutputFormat::Json {
+        eprintln!("uasset: dashboard-bundle requires --format json");
+        return EXIT_USAGE;
+    }
+    let input_name = options.input.display_name();
+    let bytes = match read_input(&options.input) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            write_utrace_error(
+                options.format,
+                UtraceErrorOutput::io(input_name, error.to_string()),
+            );
+            return EXIT_IO;
+        }
+    };
+    let (dashboard, inventory) = match uasset_parser::utrace::dashboard_and_inventory_with_options(
+        &bytes,
+        uasset_parser::utrace::DashboardOptions {
+            timeline_frame: options.timeline_frame,
+            timeline_limit: Some(options.timeline_limit),
+            max_frames: Some(options.max_frames),
+            gpu_timeline_frame: options.gpu_timeline_frame,
+            gpu_timeline_limit: Some(options.gpu_timeline_limit),
+        },
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            let exit_code = exit_code_for_trace_error(&error);
+            write_utrace_error(options.format, UtraceErrorOutput::trace(input_name, &error));
+            return exit_code;
+        }
+    };
+    let output = UtraceDashboardBundleOutput {
+        schema_version: UTRACE_SCHEMA_VERSION,
+        status: "ok",
+        path: input_name,
+        dashboard,
+        inventory,
+    };
+    match serde_json::to_vec_pretty(&output) {
+        Ok(mut rendered) => {
+            rendered.push(b'\n');
+            write_stdout(&rendered)
+        }
+        Err(error) => {
+            eprintln!("uasset: failed to serialize utrace output: {error}");
+            EXIT_INTERNAL
+        }
+    }
+}
+
+#[cfg(feature = "utrace")]
+fn dashboard_progress_utrace(options: &InspectOptions) -> u8 {
+    if options.format != OutputFormat::Json || !options.symbol_paths.is_empty() {
+        eprintln!("uasset: dashboard-progress requires JSON output and does not support symbols");
+        return EXIT_USAGE;
+    }
+    let input_name = options.input.display_name();
+    let total_bytes = match &options.input {
+        Input::File(path) => fs::metadata(path).ok().map(|metadata| metadata.len()),
+        Input::Stdin => None,
+    };
+    let input: Box<dyn Read> = match &options.input {
+        Input::File(path) => match fs::File::open(path) {
+            Ok(file) => Box::new(file),
+            Err(error) => {
+                write_progress_failure(0, error.to_string());
+                return EXIT_IO;
+            }
+        },
+        Input::Stdin => Box::new(io::stdin()),
+    };
+    let mut input = io::BufReader::with_capacity(1024 * 1024, input);
+    let mut session = uasset_parser::utrace::ProgressiveDashboardSession::new(
+        uasset_parser::utrace::DashboardOptions {
+            timeline_frame: options.timeline_frame,
+            timeline_limit: Some(options.timeline_limit),
+            max_frames: Some(options.max_frames),
+            gpu_timeline_frame: options.gpu_timeline_frame,
+            gpu_timeline_limit: Some(options.gpu_timeline_limit),
+        },
+    );
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut sequence = 0_u64;
+    let mut bootstrap_emitted = false;
+    let mut last_transport_snapshot = Instant::now();
+    let mut last_frame_snapshot = Instant::now();
+    let mut last_packet_count = 0_u64;
+    let mut last_frame_revision = 0_u64;
+    loop {
+        let count = match input.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) => {
+                write_progress_failure(sequence, error.to_string());
+                return EXIT_IO;
+            }
+        };
+        if count == 0 {
+            break;
+        }
+        if let Err(error) = session.push_chunk(&buffer[..count]) {
+            write_progress_failure(sequence, error.to_string());
+            return exit_code_for_trace_error(&error);
+        }
+        if !bootstrap_emitted {
+            if let Some((progress, bootstrap)) = session.bootstrap(total_bytes) {
+                if write_progress_json(&ProgressiveCliEvent::Bootstrap {
+                    protocol_version: uasset_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
+                    sequence,
+                    progress,
+                    bootstrap,
+                }) != EXIT_SUCCESS
+                {
+                    return EXIT_INTERNAL;
+                }
+                sequence += 1;
+                bootstrap_emitted = true;
+            }
+        }
+        let (progress, patch) = session.transport_patch(total_bytes);
+        if progress.packets_observed.saturating_sub(last_packet_count) >= 256
+            && last_transport_snapshot.elapsed() >= Duration::from_millis(100)
+        {
+            last_packet_count = progress.packets_observed;
+            last_transport_snapshot = Instant::now();
+            if write_progress_json(&ProgressiveCliEvent::Snapshot {
+                protocol_version: uasset_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
+                sequence,
+                progress,
+                patch,
+            }) != EXIT_SUCCESS
+            {
+                return EXIT_INTERNAL;
+            }
+            sequence += 1;
+        }
+        let (progress, patch) = session.frame_patch(total_bytes);
+        let frame_revision = session.frame_revision();
+        if frame_revision != last_frame_revision
+            && (last_frame_revision == 0
+                || last_frame_snapshot.elapsed() >= Duration::from_millis(100))
+        {
+            last_frame_revision = frame_revision;
+            last_frame_snapshot = Instant::now();
+            if write_progress_json(&ProgressiveCliEvent::Snapshot {
+                protocol_version: uasset_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
+                sequence,
+                progress,
+                patch,
+            }) != EXIT_SUCCESS
+            {
+                return EXIT_INTERNAL;
+            }
+            sequence += 1;
+        }
+    }
+    let (progress, patch) = session.frame_patch(total_bytes);
+    if session.frame_revision() != last_frame_revision {
+        if write_progress_json(&ProgressiveCliEvent::Snapshot {
+            protocol_version: uasset_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
+            sequence,
+            progress,
+            patch,
+        }) != EXIT_SUCCESS
+        {
+            return EXIT_INTERNAL;
+        }
+        sequence += 1;
+    }
+    let (progress, patch) = session.analyzing_patch(total_bytes);
+    if write_progress_json(&ProgressiveCliEvent::Snapshot {
+        protocol_version: uasset_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
+        sequence,
+        progress,
+        patch,
+    }) != EXIT_SUCCESS
+    {
+        return EXIT_INTERNAL;
+    }
+    sequence += 1;
+    let complete_progress = session.complete_progress(total_bytes);
+    let timeline_index_request =
+        options
+            .timeline_index_output
+            .as_ref()
+            .map(|output| TimelineIndexRequest {
+                output: output.clone(),
+                max_intervals: options.timeline_index_max_intervals,
+            });
+    let (dashboard, inventory, timeline_index) =
+        match session.finish_with_inventory_and_timeline_index(timeline_index_request) {
+            Ok(output) => output,
+            Err(error) => {
+                write_progress_failure(sequence, error.to_string());
+                return exit_code_for_trace_error(&error);
+            }
+        };
+    let (timeline_index, timeline_index_warning) = match timeline_index {
+        Some(build) => match build.result {
+            Ok(index) => (
+                Some(ProgressiveTimelineIndexOutput {
+                    index_path: build.output.to_string_lossy().into_owned(),
+                    index,
+                }),
+                None,
+            ),
+            Err(error) => (None, Some(error.to_string())),
+        },
+        None => (None, None),
+    };
+    write_progress_json(&ProgressiveCliEvent::Complete {
+        protocol_version: uasset_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
+        sequence,
+        progress: complete_progress,
+        dashboard: Box::new(UtraceDashboardOutput {
+            schema_version: UTRACE_SCHEMA_VERSION,
+            status: "ok",
+            path: input_name.clone(),
+            dashboard,
+        }),
+        inventory: Box::new(UtraceInventoryOutput {
+            schema_version: UTRACE_SCHEMA_VERSION,
+            status: "ok",
+            path: input_name,
+            inventory,
+        }),
+        timeline_index,
+        timeline_index_warning,
+    })
+}
+
+#[cfg(feature = "utrace")]
+fn write_progress_failure(sequence: u64, error: String) {
+    let _ = write_progress_json(&ProgressiveCliEvent::Failed {
+        protocol_version: uasset_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
+        sequence,
+        error,
+    });
+}
+
+#[cfg(feature = "utrace")]
+fn write_progress_json(event: &ProgressiveCliEvent) -> u8 {
+    match serde_json::to_vec(event) {
+        Ok(mut rendered) => {
+            rendered.push(b'\n');
+            write_stdout(&rendered)
+        }
+        Err(error) => {
+            eprintln!("uasset: failed to serialize progressive event: {error}");
+            EXIT_INTERNAL
+        }
+    }
+}
+
+#[cfg(feature = "utrace")]
+fn timeline_index_utrace(options: &TimelineIndexOptions) -> u8 {
+    let input_name = options.input.display_name();
+    let (bytes, source_identity) = match read_timeline_input(&options.input) {
+        Ok(input) => input,
+        Err(error) => {
+            write_utrace_error(
+                options.format,
+                UtraceErrorOutput::io(input_name, error.to_string()),
+            );
+            return EXIT_IO;
+        }
+    };
+    let index = match uasset_parser::utrace::build_cpu_timeline_index_with_source_identity(
+        &bytes,
+        &options.output,
+        options.max_intervals,
+        source_identity,
+    ) {
+        Ok(index) => index,
+        Err(error) => {
+            let exit_code = exit_code_for_timeline_index_error(&error);
+            write_utrace_error(
+                options.format,
+                UtraceErrorOutput::io(input_name, error.to_string()),
+            );
+            return exit_code;
+        }
+    };
+    let output = UtraceTimelineIndexOutput {
+        schema_version: UTRACE_SCHEMA_VERSION,
+        status: "ok",
+        path: input_name,
+        index_path: options.output.to_string_lossy().into_owned(),
+        index,
+    };
+    match render_utrace_timeline_index_output(options.format, &output) {
+        Ok(rendered) => write_stdout(&rendered),
+        Err(error) => {
+            eprintln!("uasset: failed to serialize utrace timeline index output: {error}");
+            EXIT_INTERNAL
+        }
+    }
+}
+
+#[cfg(feature = "utrace")]
+fn read_timeline_input(
+    input: &Input,
+) -> io::Result<(Vec<u8>, uasset_parser::utrace::SourceIdentity)> {
+    let mut reader: Box<dyn Read> = match input {
+        Input::File(path) => Box::new(fs::File::open(path)?),
+        Input::Stdin => Box::new(io::stdin()),
+    };
+    let mut bytes = Vec::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut fingerprint = uasset_parser::utrace::SourceFingerprint::new();
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let chunk = &buffer[..count];
+        fingerprint.update(chunk);
+        bytes.extend_from_slice(chunk);
+    }
+    Ok((bytes, fingerprint.finish()))
+}
+
+#[cfg(feature = "utrace")]
+fn timeline_query_utrace(options: &TimelineQueryOptions) -> u8 {
+    let path = options.index.to_string_lossy().into_owned();
+    let timeline = match uasset_parser::utrace::query_cpu_timeline_index(
+        &options.index,
+        &CpuTimelineQuery {
+            start_cycle: options.start_cycle,
+            end_cycle: options.end_cycle,
+            thread_id: options.thread_id,
+            search: options.search.clone(),
+            limit: Some(options.limit),
+        },
+    ) {
+        Ok(timeline) => timeline,
+        Err(error) => {
+            let exit_code = exit_code_for_timeline_index_error(&error);
+            write_utrace_error(
+                options.format,
+                UtraceErrorOutput::io(path, error.to_string()),
+            );
+            return exit_code;
+        }
+    };
+    let output = UtraceTimelineQueryOutput {
+        schema_version: UTRACE_SCHEMA_VERSION,
+        status: "ok",
+        path,
+        timeline,
+    };
+    match render_utrace_timeline_query_output(options.format, &output) {
+        Ok(rendered) => write_stdout(&rendered),
+        Err(error) => {
+            eprintln!("uasset: failed to serialize utrace timeline query output: {error}");
+            EXIT_INTERNAL
+        }
+    }
 }
 
 #[cfg(feature = "utrace")]
@@ -862,6 +1601,36 @@ fn render_utrace_coverage_output(
 ) -> Result<Vec<u8>, serde_json::Error> {
     match format {
         OutputFormat::Text => Ok(render_utrace_coverage_text_output(output).into_bytes()),
+        OutputFormat::Json => {
+            let mut rendered = serde_json::to_vec(output)?;
+            rendered.push(b'\n');
+            Ok(rendered)
+        }
+    }
+}
+
+#[cfg(feature = "utrace")]
+fn render_utrace_timeline_index_output(
+    format: OutputFormat,
+    output: &UtraceTimelineIndexOutput,
+) -> Result<Vec<u8>, serde_json::Error> {
+    match format {
+        OutputFormat::Text => Ok(render_utrace_timeline_index_text_output(output).into_bytes()),
+        OutputFormat::Json => {
+            let mut rendered = serde_json::to_vec(output)?;
+            rendered.push(b'\n');
+            Ok(rendered)
+        }
+    }
+}
+
+#[cfg(feature = "utrace")]
+fn render_utrace_timeline_query_output(
+    format: OutputFormat,
+    output: &UtraceTimelineQueryOutput,
+) -> Result<Vec<u8>, serde_json::Error> {
+    match format {
+        OutputFormat::Text => Ok(render_utrace_timeline_query_text_output(output).into_bytes()),
         OutputFormat::Json => {
             let mut rendered = serde_json::to_vec(output)?;
             rendered.push(b'\n');
@@ -1295,6 +2064,64 @@ fn render_utrace_inventory_text_output(output: &UtraceInventoryOutput) -> String
             )
             .unwrap();
         }
+    }
+    rendered
+}
+
+#[cfg(feature = "utrace")]
+fn render_utrace_timeline_index_text_output(output: &UtraceTimelineIndexOutput) -> String {
+    let index = &output.index;
+    let mut rendered = String::new();
+    writeln!(rendered, "path: {}", output.path).unwrap();
+    writeln!(rendered, "index: {}", output.index_path).unwrap();
+    writeln!(
+        rendered,
+        "cpu intervals: {} indexed / {} observed{}",
+        index.indexed_interval_count,
+        index.total_interval_count,
+        if index.truncated { " (capped)" } else { "" },
+    )
+    .unwrap();
+    if let (Some(begin), Some(end)) = (index.begin_cycle, index.end_cycle) {
+        writeln!(rendered, "cycle range: {begin}..{end}").unwrap();
+    }
+    rendered
+}
+
+#[cfg(feature = "utrace")]
+fn render_utrace_timeline_query_text_output(output: &UtraceTimelineQueryOutput) -> String {
+    let timeline = &output.timeline;
+    let mut rendered = String::new();
+    writeln!(rendered, "index: {}", output.path).unwrap();
+    writeln!(
+        rendered,
+        "cycle range: {}..{}",
+        timeline.begin_cycle, timeline.end_cycle
+    )
+    .unwrap();
+    writeln!(
+        rendered,
+        "cpu intervals: {} matched / {} returned{}",
+        timeline.interval_count,
+        timeline.intervals.len(),
+        if timeline.truncated {
+            " (truncated)"
+        } else {
+            ""
+        },
+    )
+    .unwrap();
+    for interval in &timeline.intervals {
+        writeln!(
+            rendered,
+            "  [{}] {} {}..{} ({} cycles)",
+            interval.thread_id,
+            interval.rendered_name.as_deref().unwrap_or(&interval.name),
+            interval.start_cycle,
+            interval.end_cycle,
+            interval.duration,
+        )
+        .unwrap();
     }
     rendered
 }
@@ -2074,6 +2901,17 @@ fn exit_code_for_trace_error(error: &TraceError) -> u8 {
     }
 }
 
+#[cfg(feature = "utrace")]
+fn exit_code_for_timeline_index_error(error: &TimelineIndexError) -> u8 {
+    match error {
+        TimelineIndexError::Io(_) => EXIT_IO,
+        TimelineIndexError::Malformed(_) => EXIT_MALFORMED,
+        TimelineIndexError::InvalidQuery(_) => EXIT_USAGE,
+        TimelineIndexError::ResourceLimit(_) => EXIT_RESOURCE_LIMIT,
+        _ => EXIT_INTERNAL,
+    }
+}
+
 #[derive(Serialize)]
 struct InspectOutput {
     schema_version: u32,
@@ -2093,6 +2931,334 @@ struct DecodeErrorOutput {
     class_path: Option<String>,
     kind: &'static str,
     message: String,
+}
+
+#[derive(Serialize)]
+struct AuthoringSnapshotOutput {
+    contract: AuthoringContractOutput,
+    authority: AuthoringAuthorityOutput,
+    completeness: &'static str,
+    table: AuthoringTableOutput,
+    diagnostics: Vec<AuthoringDiagnosticOutput>,
+}
+
+#[derive(Serialize)]
+struct AuthoringContractOutput {
+    name: &'static str,
+    version: AuthoringVersionOutput,
+}
+
+#[derive(Serialize)]
+struct AuthoringVersionOutput {
+    major: u32,
+    minor: u32,
+}
+
+#[derive(Serialize)]
+struct AuthoringAuthorityOutput {
+    kind: &'static str,
+    #[serde(rename = "packageName")]
+    package_name: String,
+}
+
+#[derive(Serialize)]
+struct AuthoringTableOutput {
+    kind: &'static str,
+    #[serde(rename = "objectPath")]
+    object_path: String,
+    #[serde(rename = "rowStruct")]
+    row_struct: String,
+    #[serde(rename = "parentTables")]
+    parent_tables: Vec<String>,
+    rows: Vec<AuthoringRowOutput>,
+}
+
+#[derive(Serialize)]
+struct AuthoringRowOutput {
+    id: String,
+    name: String,
+    fields: Vec<AuthoringFieldOutput>,
+}
+
+#[derive(Serialize)]
+struct AuthoringFieldOutput {
+    name: String,
+    #[serde(rename = "typeName")]
+    type_name: String,
+    value: AuthoringValueOutput,
+}
+
+#[derive(Serialize)]
+struct AuthoringMapEntryOutput {
+    key: AuthoringValueOutput,
+    value: AuthoringValueOutput,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum AuthoringValueOutput {
+    Bool {
+        value: bool,
+    },
+    Int {
+        value: String,
+    },
+    Uint {
+        value: String,
+    },
+    Float {
+        value: AuthoringFloatOutput,
+    },
+    Double {
+        value: AuthoringFloatOutput,
+    },
+    Name {
+        value: String,
+    },
+    Enum {
+        value: String,
+    },
+    String {
+        value: String,
+    },
+    Text {
+        value: String,
+    },
+    Vector {
+        x: f32,
+        y: f32,
+        z: f32,
+    },
+    ObjectRef {
+        value: Option<String>,
+    },
+    Guid {
+        value: String,
+    },
+    SoftObjectPath {
+        value: String,
+    },
+    Array {
+        values: Vec<AuthoringValueOutput>,
+    },
+    Set {
+        values: Vec<AuthoringValueOutput>,
+    },
+    Map {
+        entries: Vec<AuthoringMapEntryOutput>,
+    },
+    Struct {
+        fields: Vec<AuthoringFieldOutput>,
+    },
+    Unsupported {
+        reason: String,
+        #[serde(rename = "byteSize")]
+        byte_size: u64,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum AuthoringFloatOutput {
+    Finite(f64),
+    Special(&'static str),
+}
+
+impl AuthoringFloatOutput {
+    fn from_f64(value: f64) -> Self {
+        if value.is_nan() {
+            Self::Special("nan")
+        } else if value == f64::INFINITY {
+            Self::Special("infinity")
+        } else if value == f64::NEG_INFINITY {
+            Self::Special("-infinity")
+        } else {
+            Self::Finite(value)
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AuthoringDiagnosticOutput {
+    code: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+impl AuthoringSnapshotOutput {
+    fn from_inspect(inspect: &InspectOutput, table: &AssetOutput) -> Self {
+        let mut partial = !inspect.decode_errors.is_empty();
+        let rows = table
+            .rows
+            .iter()
+            .map(|row| {
+                let fields = row
+                    .properties
+                    .iter()
+                    .map(|property| {
+                        if property.value.contains_unsupported() {
+                            partial = true;
+                        }
+                        AuthoringFieldOutput::from_property(property)
+                    })
+                    .collect();
+                AuthoringRowOutput {
+                    id: format!("row:{}", row.name),
+                    name: row.name.clone(),
+                    fields,
+                }
+            })
+            .collect();
+        Self {
+            contract: AuthoringContractOutput {
+                name: "unreal-authoring",
+                version: AuthoringVersionOutput { major: 1, minor: 0 },
+            },
+            authority: AuthoringAuthorityOutput {
+                kind: "project_files",
+                package_name: inspect.package.name.clone(),
+            },
+            completeness: if partial { "partial" } else { "complete" },
+            table: AuthoringTableOutput {
+                kind: if table.kind == "CompositeDataTable" {
+                    "composite_data_table"
+                } else {
+                    "data_table"
+                },
+                object_path: table.object_path.clone(),
+                row_struct: table.row_struct.clone().unwrap_or_default(),
+                parent_tables: table.parent_tables.clone(),
+                rows,
+            },
+            diagnostics: inspect
+                .decode_errors
+                .iter()
+                .map(|error| AuthoringDiagnosticOutput {
+                    code: error.kind,
+                    message: error.message.clone(),
+                    path: Some(error.object_path.clone()),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl AuthoringFieldOutput {
+    fn from_property(property: &PropertyOutput) -> Self {
+        Self {
+            name: property.name.clone(),
+            type_name: property.type_name.clone(),
+            value: AuthoringValueOutput::from_property(&property.value),
+        }
+    }
+}
+
+impl AuthoringValueOutput {
+    fn from_property(value: &PropertyValueOutput) -> Self {
+        match value {
+            PropertyValueOutput::Bool { value } => Self::Bool { value: *value },
+            PropertyValueOutput::Int { value } => Self::Int {
+                value: value.to_string(),
+            },
+            PropertyValueOutput::Uint { value } => Self::Uint {
+                value: value.to_string(),
+            },
+            PropertyValueOutput::Float { value } => Self::Float {
+                value: AuthoringFloatOutput::from_f64(f64::from(*value)),
+            },
+            PropertyValueOutput::Double { value } => Self::Double {
+                value: AuthoringFloatOutput::from_f64(*value),
+            },
+            PropertyValueOutput::Name { value } => Self::Name {
+                value: value.clone(),
+            },
+            PropertyValueOutput::Enum { value } => Self::Enum {
+                value: value.clone(),
+            },
+            PropertyValueOutput::String { value } => Self::String {
+                value: value.clone(),
+            },
+            PropertyValueOutput::Text { value } => Self::Text {
+                value: value.clone(),
+            },
+            PropertyValueOutput::Vector { x, y, z } => Self::Vector {
+                x: *x,
+                y: *y,
+                z: *z,
+            },
+            PropertyValueOutput::IntPoint { x, y } => Self::Struct {
+                fields: vec![
+                    AuthoringFieldOutput {
+                        name: "X".to_owned(),
+                        type_name: "IntProperty".to_owned(),
+                        value: Self::Int {
+                            value: x.to_string(),
+                        },
+                    },
+                    AuthoringFieldOutput {
+                        name: "Y".to_owned(),
+                        type_name: "IntProperty".to_owned(),
+                        value: Self::Int {
+                            value: y.to_string(),
+                        },
+                    },
+                ],
+            },
+            PropertyValueOutput::ObjectRef { value } => Self::ObjectRef {
+                value: value.clone(),
+            },
+            PropertyValueOutput::Guid { value } => Self::Guid {
+                value: value.clone(),
+            },
+            PropertyValueOutput::SoftObjectPath { value } => Self::SoftObjectPath {
+                value: value.clone(),
+            },
+            PropertyValueOutput::Array { values } => Self::Array {
+                values: values.iter().map(Self::from_property).collect(),
+            },
+            PropertyValueOutput::Set { values } => Self::Set {
+                values: values.iter().map(Self::from_property).collect(),
+            },
+            PropertyValueOutput::Map { entries } => Self::Map {
+                entries: entries
+                    .iter()
+                    .map(|entry| AuthoringMapEntryOutput {
+                        key: Self::from_property(&entry.key),
+                        value: Self::from_property(&entry.value),
+                    })
+                    .collect(),
+            },
+            PropertyValueOutput::Struct { properties } => Self::Struct {
+                fields: properties
+                    .iter()
+                    .map(AuthoringFieldOutput::from_property)
+                    .collect(),
+            },
+            PropertyValueOutput::Raw { reason, size } => Self::Unsupported {
+                reason: reason.clone(),
+                byte_size: *size,
+            },
+        }
+    }
+}
+
+impl PropertyValueOutput {
+    fn contains_unsupported(&self) -> bool {
+        match self {
+            Self::Raw { .. } => true,
+            Self::Array { values } | Self::Set { values } => {
+                values.iter().any(Self::contains_unsupported)
+            }
+            Self::Map { entries } => entries.iter().any(|entry| {
+                entry.key.contains_unsupported() || entry.value.contains_unsupported()
+            }),
+            Self::Struct { properties } => properties
+                .iter()
+                .any(|property| property.value.contains_unsupported()),
+            _ => false,
+        }
+    }
 }
 
 #[cfg(feature = "utrace")]
@@ -2115,6 +3281,57 @@ struct UtraceDashboardOutput {
 
 #[cfg(feature = "utrace")]
 #[derive(Serialize)]
+struct UtraceDashboardBundleOutput {
+    schema_version: u32,
+    status: &'static str,
+    path: String,
+    dashboard: TraceDashboard,
+    inventory: TraceInventory,
+}
+
+#[cfg(feature = "utrace")]
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ProgressiveCliEvent {
+    Bootstrap {
+        protocol_version: u32,
+        sequence: u64,
+        progress: uasset_parser::utrace_progress::DecodeProgress,
+        bootstrap: uasset_parser::utrace_progress::DashboardBootstrap,
+    },
+    Snapshot {
+        protocol_version: u32,
+        sequence: u64,
+        progress: uasset_parser::utrace_progress::DecodeProgress,
+        patch: uasset_parser::utrace_progress::DashboardPatch,
+    },
+    Complete {
+        protocol_version: u32,
+        sequence: u64,
+        progress: uasset_parser::utrace_progress::DecodeProgress,
+        dashboard: Box<UtraceDashboardOutput>,
+        inventory: Box<UtraceInventoryOutput>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeline_index: Option<ProgressiveTimelineIndexOutput>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeline_index_warning: Option<String>,
+    },
+    Failed {
+        protocol_version: u32,
+        sequence: u64,
+        error: String,
+    },
+}
+
+#[cfg(feature = "utrace")]
+#[derive(Serialize)]
+struct ProgressiveTimelineIndexOutput {
+    index_path: String,
+    index: CpuTimelineIndexInfo,
+}
+
+#[cfg(feature = "utrace")]
+#[derive(Serialize)]
 struct UtraceInventoryOutput {
     schema_version: u32,
     status: &'static str,
@@ -2129,6 +3346,25 @@ struct UtraceCoverageOutput {
     status: &'static str,
     path: String,
     coverage: TraceCoverage,
+}
+
+#[cfg(feature = "utrace")]
+#[derive(Serialize)]
+struct UtraceTimelineIndexOutput {
+    schema_version: u32,
+    status: &'static str,
+    path: String,
+    index_path: String,
+    index: CpuTimelineIndexInfo,
+}
+
+#[cfg(feature = "utrace")]
+#[derive(Serialize)]
+struct UtraceTimelineQueryOutput {
+    schema_version: u32,
+    status: &'static str,
+    path: String,
+    timeline: CpuTimelineQueryResult,
 }
 
 impl InspectOutput {
@@ -2624,6 +3860,10 @@ impl PropertyOutput {
                 y: vector.y,
                 z: vector.z,
             },
+            PropertyValue::IntPoint(point) => PropertyValueOutput::IntPoint {
+                x: point.x,
+                y: point.y,
+            },
             PropertyValue::ObjectRef(index) => PropertyValueOutput::ObjectRef {
                 value: resolve_object_ref(package, *index),
             },
@@ -2693,6 +3933,7 @@ enum PropertyValueOutput {
     String { value: String },
     Text { value: String },
     Vector { x: f32, y: f32, z: f32 },
+    IntPoint { x: i32, y: i32 },
     ObjectRef { value: Option<String> },
     Guid { value: String },
     SoftObjectPath { value: String },
@@ -2726,6 +3967,10 @@ fn value_output(package: &Package, value: &PropertyValue) -> PropertyValueOutput
             x: vector.x,
             y: vector.y,
             z: vector.z,
+        },
+        PropertyValue::IntPoint(point) => PropertyValueOutput::IntPoint {
+            x: point.x,
+            y: point.y,
         },
         PropertyValue::ObjectRef(index) => PropertyValueOutput::ObjectRef {
             value: resolve_object_ref(package, *index),
@@ -2784,6 +4029,7 @@ impl PropertyValueOutput {
             Self::String { value } => format!("{value:?}"),
             Self::Text { value } => format!("{value:?}"),
             Self::Vector { x, y, z } => format!("({x}, {y}, {z})"),
+            Self::IntPoint { x, y } => format!("({x}, {y})"),
             Self::ObjectRef { value } => value.clone().unwrap_or_else(|| "null".to_owned()),
             Self::Guid { value } => value.clone(),
             Self::SoftObjectPath { value } => {
@@ -2953,23 +4199,27 @@ impl UtraceErrorOutput {
     }
 }
 
-const USAGE: &str = "Usage: uasset inspect <path|-> [--format text|json]";
+const USAGE: &str = "Usage: uasset <inspect|authoring> <path|-> [--format text|json]";
 
 const HELP: &str = "\
 uasset - inspect classic Unreal Engine asset packages
 
 Usage:
   uasset inspect <path|-> [--format text|json]
+  uasset authoring <path|-> --format json
   uasset utrace inspect <path|-> [--format text|json]
   uasset utrace dashboard <path|-> [--format text|json] [--frame <n>] [--timeline-limit <n>] [--max-frames <n>] [--gpu-frame <n>] [--gpu-timeline-limit <n>] [--symbol-path <dir>]...
   uasset utrace inventory <path|-> [--format text|json]
   uasset utrace coverage <path|-> [--universe <file>] [--format text|json]
   uasset utrace html <path|-> [--output <file>]
+  uasset utrace timeline index <path|-> --output <path> [--max-intervals <n>] [--format text|json]
+  uasset utrace timeline query <index> [--start-cycle <n>] [--end-cycle <n>] [--thread <id>] [--search <text>] [--limit <n>] [--format text|json]
   uasset help
   uasset version
 
 Commands:
   inspect    Parse one package summary. Use `-` to read package bytes from stdin.
+  authoring  Emit the versioned Unreal authoring snapshot for one DataTable package.
   utrace     Inspect or summarize Unreal Trace (`.utrace`) files when built with `--features utrace`.
 
 Output contract:
@@ -2984,6 +4234,7 @@ Exit codes:
   3          Unsupported format, version, or capability
   4          Input/output failure
   5          Internal output failure
+  6          Partial authoring or inspection result
   7          Parser resource limit exceeded
   64         Invalid command-line usage
 ";
@@ -2999,6 +4250,25 @@ Options:
   --symbol-path <dir>         Local PDB search root (repeatable; requires utrace-symbols).
   --gpu-frame <n>             Retain a queue-local GPU-frame timeline.
   --gpu-timeline-limit <n>    Max retained GPU timeline intervals (default: 500).
+";
+
+const UTRACE_TIMELINE_HELP: &str = "\
+Usage:
+  uasset utrace timeline index <path|-> --output <path> [options]
+  uasset utrace timeline query <index> [options]
+
+Index options:
+  --output <path>             Destination CPU timeline sidecar (required).
+  --max-intervals <n>         Max CPU intervals indexed (default: 1000000).
+  --format <text|json>        Output format (default: text).
+
+Query options:
+  --start-cycle <n>           Inclusive query start cycle.
+  --end-cycle <n>             Inclusive query end cycle.
+  --thread <id>               Keep one UE trace thread.
+  --search <text>             Case-insensitive scope/rendered-name filter.
+  --limit <n>                 Max returned intervals (default: 500; max: 10000).
+  --format <text|json>        Output format (default: text).
 ";
 
 #[cfg(test)]
@@ -3070,6 +4340,35 @@ mod tests {
         assert!(text.contains("namespace: TestNamespace"));
         assert!(text.contains("  Greeting = Hello"));
         assert!(text.contains("decode_error: /Game/Test.Broken [malformed_data] bad tail"));
+    }
+
+    #[test]
+    fn projects_data_tables_to_the_shared_authoring_contract() {
+        use uasset_parser::asset::{DataTableKind, DecodedDataTable};
+        use uasset_parser::package::ObjectPath;
+
+        let package = tiny_package();
+        let asset = asset_output_from_decoded(
+            &package,
+            DecodedAsset::DataTable(DecodedDataTable {
+                kind: DataTableKind::Plain,
+                object_path: ObjectPath::new("/Game/Test.DT_Test"),
+                row_struct: Some(ObjectPath::new("/Script/Test.Row")),
+                parent_tables: Vec::new(),
+                properties: empty_property_stream(),
+                rows: Vec::new(),
+            }),
+        );
+        let inspect = InspectOutput::from_summary("test.uasset".to_owned(), &package.summary);
+        let output = AuthoringSnapshotOutput::from_inspect(&inspect, &asset);
+        let json = serde_json::to_value(output).expect("serialize authoring output");
+
+        assert_eq!(json["contract"]["name"], "unreal-authoring");
+        assert_eq!(json["contract"]["version"]["major"], 1);
+        assert_eq!(json["authority"]["kind"], "project_files");
+        assert_eq!(json["table"]["kind"], "data_table");
+        assert_eq!(json["table"]["objectPath"], "/Game/Test.DT_Test");
+        assert_eq!(json["table"]["rowStruct"], "/Script/Test.Row");
     }
 
     #[test]
@@ -3176,9 +4475,23 @@ mod tests {
                 max_frames: 120,
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
+                timeline_index_output: None,
+                timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
                 symbol_paths: Vec::new(),
             })
         );
+    }
+
+    #[test]
+    fn parses_authoring_contract() {
+        let command = Command::parse(vec![
+            "authoring".into(),
+            "table.uasset".into(),
+            "--format".into(),
+            "json".into(),
+        ])
+        .expect("authoring command");
+        assert!(matches!(command, Command::Authoring(_)));
     }
 
     #[test]
@@ -3193,6 +4506,8 @@ mod tests {
                 max_frames: 120,
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
+                timeline_index_output: None,
+                timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
                 symbol_paths: Vec::new(),
             })
         );
@@ -3222,6 +4537,8 @@ mod tests {
                 max_frames: 120,
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
+                timeline_index_output: None,
+                timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
                 symbol_paths: Vec::new(),
             }))
         );
@@ -3246,6 +4563,8 @@ mod tests {
                 max_frames: 120,
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
+                timeline_index_output: None,
+                timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
                 symbol_paths: Vec::new(),
             }))
         );
@@ -3274,9 +4593,32 @@ mod tests {
                 max_frames: 10,
                 gpu_timeline_frame: Some(42),
                 gpu_timeline_limit: 5,
+                timeline_index_output: None,
+                timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
                 symbol_paths: Vec::new(),
             }))
         );
+    }
+
+    #[test]
+    fn parses_progressive_timeline_index_options() {
+        let command = Command::parse(vec![
+            "utrace".into(),
+            "dashboard-progress".into(),
+            "trace.utrace".into(),
+            "--format=json".into(),
+            "--timeline-index-output=trace.utix".into(),
+            "--timeline-index-max-intervals=17".into(),
+        ])
+        .unwrap();
+        let Command::Utrace(UtraceCommand::DashboardProgress(options)) = command else {
+            panic!("expected dashboard-progress command");
+        };
+        assert_eq!(
+            options.timeline_index_output,
+            Some(PathBuf::from("trace.utix"))
+        );
+        assert_eq!(options.timeline_index_max_intervals, 17);
     }
 
     #[test]
@@ -3326,8 +4668,62 @@ mod tests {
                 max_frames: 120,
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
+                timeline_index_output: None,
+                timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
                 symbol_paths: Vec::new(),
             }))
+        );
+    }
+
+    #[test]
+    fn parses_utrace_timeline_index_and_query_contracts() {
+        assert_eq!(
+            Command::parse(vec![
+                "utrace".into(),
+                "timeline".into(),
+                "index".into(),
+                "trace.utrace".into(),
+                "--output".into(),
+                "trace.utix".into(),
+                "--max-intervals=400".into(),
+                "--format=json".into(),
+            ])
+            .unwrap(),
+            Command::Utrace(UtraceCommand::Timeline(TimelineCommand::Index(
+                TimelineIndexOptions {
+                    input: Input::File(PathBuf::from("trace.utrace")),
+                    output: PathBuf::from("trace.utix"),
+                    format: OutputFormat::Json,
+                    max_intervals: 400,
+                },
+            )))
+        );
+        assert_eq!(
+            Command::parse(vec![
+                "utrace".into(),
+                "timeline".into(),
+                "query".into(),
+                "trace.utix".into(),
+                "--start-cycle=10".into(),
+                "--end-cycle".into(),
+                "20".into(),
+                "--thread=7".into(),
+                "--search".into(),
+                "render".into(),
+                "--limit=42".into(),
+            ])
+            .unwrap(),
+            Command::Utrace(UtraceCommand::Timeline(TimelineCommand::Query(
+                TimelineQueryOptions {
+                    index: PathBuf::from("trace.utix"),
+                    format: OutputFormat::Text,
+                    start_cycle: Some(10),
+                    end_cycle: Some(20),
+                    thread_id: Some(7),
+                    search: Some("render".to_owned()),
+                    limit: 42,
+                },
+            )))
         );
     }
 
@@ -3349,6 +4745,8 @@ mod tests {
                 max_frames: 120,
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
+                timeline_index_output: None,
+                timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
                 symbol_paths: Vec::new(),
             }))
         );

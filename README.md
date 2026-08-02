@@ -65,7 +65,9 @@ Phases 1 through 6 are implemented:
   file — decoded assets are emitted with failures in `decode_errors` and
   `status: "partial"` (exit `6`)
 - `uasset inspect` command with text and schema-versioned JSON output
-  (current `schema_version` is 5)
+  (current `schema_version` is 6)
+- `uasset authoring` projection for DataTable and Composite DataTable packages,
+  using the versioned language-neutral Unreal authoring contract
 - File and stdin input
 - Stable stdout/stderr and exit-code behavior
 
@@ -74,6 +76,17 @@ Phases 1 through 6 are implemented:
 A SolidJS + Vite frontend lives in [`web/`](web/). It provides drop zones for
 `.uasset` and `.utrace` files and shells out to this CLI for JSON inspect /
 dashboard output.
+
+The browser-only UTrace parser is also prepared as the standalone npm package
+[`packages/utrace-parser-wasm/`](packages/utrace-parser-wasm/). Its typed
+facade parses locally in a browser or worker and owns the WASM lifecycle. To
+publish the checked-out `0.1.0` package after the normal Rust checks:
+
+```text
+cd packages/utrace-parser-wasm
+npm login
+npm publish
+```
 
 ```text
 cargo build --features utrace
@@ -84,6 +97,7 @@ cd web && npm install && npm run dev
 uasset inspect Asset.uasset
 uasset inspect Asset.uasset --format json
 uasset inspect - --format json
+uasset authoring DataTable.uasset --format json
 ```
 
 With `--features utrace`, the same binary also exposes preliminary UTrace
@@ -96,6 +110,8 @@ uasset utrace inventory Trace.utrace --format json
 uasset utrace dashboard Trace.utrace --format json
 uasset utrace dashboard Trace.utrace --format json --max-frames 500 --frame 42 --timeline-limit 250
 uasset utrace dashboard Trace.utrace --format json --gpu-frame 42 --gpu-timeline-limit 250
+uasset utrace timeline index Trace.utrace --output Trace.utix --format json
+uasset utrace timeline query Trace.utix --start-cycle 1280000 --end-cycle 1296000 --search Render --format json
 uasset utrace coverage Trace.utrace --format json
 uasset utrace html Trace.utrace --output Trace.html
 ```
@@ -110,6 +126,12 @@ truncation status. `--frame` / `--timeline-limit` select a bounded CPU frame
 timeline; `--gpu-frame` / `--gpu-timeline-limit` do the same for one queue-local
 GPU frame number. These two frame-number spaces are intentionally kept
 separate.
+
+`utrace timeline index` writes a bounded disk-backed CPU scope index (default
+cap: 1,000,000 intervals). `utrace timeline query` reads that sidecar without
+reparsing the trace; it supports arbitrary inclusive cycle ranges, a thread
+filter, and case-insensitive scope/rendered-name search. Both index and query
+report `truncated` when a configured bound means the result is incomplete.
 
 `utrace html` writes a simple static dashboard page for quick local review. It
 uses the same decoded data as `utrace dashboard` and defaults to stdout when

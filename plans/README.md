@@ -34,6 +34,11 @@ even though that family is absent from the CPU-frame fixture.
 | 007 | Module-aware optional symbolization | P0 | L/XL | 006 | DONE |
 | 008 | PlatformFile activity summaries | P1 | M | — (independent of 004–007) | DONE |
 | 009 | Bookmark/log FormatArgs rendering | P1 | M | — (independent) | DONE |
+| 010 | Browser WASM + native comparison modes | P1 | L | — (001–009 already DONE) | IN PROGRESS — worker-backed WASM baseline landed; shared full UAsset contract and repeat/median comparison remain |
+| 011 | Progressive UTrace dashboard streaming | P0 UX/perf | XL | 010 shared output/backend dispatcher | TODO |
+| 012 | Timeline `.utix` build/query performance | P1 perf | M/L | 002 `.utix` format; 011 phase 1 session core (landed) | TODO |
+| 013 | Live frame chart streaming performance | P1 UX/perf | S/M | landed 011 streaming UI; independent of 012 | TODO |
+| 014 | Hot-path parser performance (maps, dispatch, copies) | P1 perf | M/L | 012 phase 1.1 landed | TODO |
 
 Status values: `TODO` | `IN PROGRESS` | `DONE` | `BLOCKED` | `REJECTED`
 
@@ -61,6 +66,23 @@ provider implementation task.
   that output shape before either executor edits it concurrently.
 - **007 starts with a spike** because module/build-id parity and a trustworthy
   offline Windows symbol backend must be proven before committing to an API.
+- **010 preserves the native bridge** and adds WASM as a worker-backed peer.
+  Capture-wide `.utix` range queries and PDB symbolization stay native-only;
+  UAsset inspect plus UTrace inventory/dashboard/selected-frame operations are
+  the parity and performance-comparison surface.
+- **012 phases 1 and 3 are independent of 011**; only phase 2 (building the
+  `.utix` during the progressive parse) rides on the landed session core and
+  extends the `dashboard-progress` protocol, so coordinate its DTO changes
+  with whoever executes 011's remaining phases.
+- **013 is UI-only** (`Utrace.tsx`/`Charts.tsx`, optional `wasm.rs` emission
+  gate) and touches the streaming reducer that 011's remaining phases also
+  own — coordinate, but neither blocks the other. It must not change the
+  progressive protocol or the server's sliding-window semantics.
+- **014 is Rust-only** and independent of 011/013. Phase 1 (streaming hoist,
+  profile flags, LZ4 in-place, single dispatch pass) can land immediately.
+  Phase 3 (FxHashMap) depends on `rustc-hash` being added to `Cargo.toml`.
+  Phase 5 (zero-copy dispatch) should coordinate with whoever last touched
+  `utrace_dispatch.rs` to avoid a rebase conflict.
 
 ## Fixture strategy (shared)
 

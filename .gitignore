@@ -1,4 +1,6 @@
 /target
+/web/src/generated/
+/packages/utrace-parser-wasm/dist/
 Cargo.lock
 tests/fixtures/*
 !tests/fixtures/

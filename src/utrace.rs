@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 
 use crate::utrace_callstacks::{CallstackId, CallstackProvider, decode_callstack_spec};
@@ -15,6 +16,13 @@ use crate::utrace_modules::{
     ModuleProvider, decode_module_init, decode_module_load, decode_module_unload,
 };
 use crate::utrace_platform_file::PlatformFileProvider;
+pub use crate::utrace_session::ProgressiveDashboardSession;
+use crate::utrace_timeline::{CpuTimelineIndexBuilder, CpuTimelineSink, SinkAppetite};
+pub use crate::utrace_timeline::{
+    CpuTimelineIndexInfo, CpuTimelineMemoryIndex, CpuTimelineQuery, CpuTimelineQueryResult,
+    DEFAULT_MAX_INDEXED_INTERVALS, SourceFingerprint, SourceIdentity, TimelineIndexBuild,
+    TimelineIndexError, TimelineIndexRequest, query_cpu_timeline_index,
+};
 use crate::{ArchiveError, ArchiveErrorKind, Reader};
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -74,6 +82,8 @@ pub struct TraceDashboard {
     pub annotations: AnnotationDashboard,
     pub logging: LogDashboard,
     pub unmodeled: UnmodeledTraceDashboard,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_timing: Option<crate::utrace_progress::FrameTimingDashboard>,
     pub frame_correlation: FrameCorrelationDashboard,
     pub frames: Vec<FrameMarker>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,6 +106,12 @@ pub struct CorrelatedFrameSummary {
     pub cpu_metadata_cycles: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_metadata_seconds: Option<f64>,
+    /// Bounds of the CPU scopes attributed to this metadata frame. These make
+    /// the frame row directly queryable through the capture-wide CPU index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_begin_cycle: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_end_cycle: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub top_cpu_scopes: Vec<CpuScopeSummary>,
     pub gpu_queue_count: u64,
@@ -1748,9 +1764,9 @@ pub enum FieldFamily {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct DecodedStreams {
-    summary: PacketSummary,
-    streams: BTreeMap<u16, Vec<u8>>,
+pub(super) struct DecodedStreams {
+    pub(super) summary: PacketSummary,
+    pub(super) streams: BTreeMap<u16, Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1851,6 +1867,13 @@ pub fn inventory(source: &[u8]) -> Result<TraceInventory, TraceError> {
     let mut reader = Reader::new(source);
     let header = read_header(&mut reader)?;
     let decoded = read_packets(&mut reader)?;
+    inventory_from_decoded(header, &decoded)
+}
+
+pub(super) fn inventory_from_decoded(
+    header: TraceHeader,
+    decoded: &DecodedStreams,
+) -> Result<TraceInventory, TraceError> {
     let events = read_event_registry(&header, &decoded.streams)?;
     let registry = events
         .iter()
@@ -2900,7 +2923,7 @@ fn known_event_name(uid: u16) -> &'static str {
     }
 }
 
-fn read_header(reader: &mut Reader<'_>) -> Result<TraceHeader, TraceError> {
+pub(super) fn read_header(reader: &mut Reader<'_>) -> Result<TraceHeader, TraceError> {
     let magic_offset = reader.tell();
     let magic_bytes = reader.read_bytes(4, "Header.Magic")?;
     let (magic, metadata_size) = match magic_bytes {
@@ -2962,6 +2985,42 @@ fn read_header(reader: &mut Reader<'_>) -> Result<TraceHeader, TraceError> {
     })
 }
 
+/// Decompress an LZ4 block directly into `stream`, growing it in place.
+/// On failure the stream length is restored so partial output is never retained.
+pub(super) fn decompress_lz4_into_stream(
+    stream: &mut Vec<u8>,
+    compressed: &[u8],
+    decoded_size: usize,
+    packet_offset: u64,
+) -> Result<(), TraceError> {
+    if decoded_size == 0 {
+        return Ok(());
+    }
+    let start = stream.len();
+    stream.resize(start + decoded_size, 0);
+    match lz4_flex::block::decompress_into(compressed, &mut stream[start..]) {
+        Ok(actual) if actual == decoded_size => Ok(()),
+        Ok(actual) => {
+            stream.truncate(start);
+            Err(TraceError::new(
+                TraceErrorKind::MalformedData,
+                packet_offset,
+                "Packet.DecodedSize",
+                format!("expected {decoded_size} decoded bytes, got {actual}"),
+            ))
+        }
+        Err(error) => {
+            stream.truncate(start);
+            Err(TraceError::new(
+                TraceErrorKind::MalformedData,
+                packet_offset,
+                "Packet.CompressedData",
+                format!("LZ4 block decompression failed: {error}"),
+            ))
+        }
+    }
+}
+
 fn read_packets(reader: &mut Reader<'_>) -> Result<DecodedStreams, TraceError> {
     let mut summary = PacketSummary::default();
     let mut threads = BTreeMap::<u16, ThreadPacketSummary>::new();
@@ -3018,28 +3077,12 @@ fn read_packets(reader: &mut Reader<'_>) -> Result<DecodedStreams, TraceError> {
             let decoded_size = reader.read_u16("Packet.DecodedSize")?;
             let compressed_size = usize::from(packet_size - 6);
             let compressed = reader.read_bytes(compressed_size, "Packet.CompressedData")?;
-            if decoded_size > 0 {
-                let mut decoded = vec![0_u8; usize::from(decoded_size)];
-                let actual = lz4_flex::block::decompress_into(compressed, &mut decoded).map_err(
-                    |error| {
-                        TraceError::new(
-                            TraceErrorKind::MalformedData,
-                            packet_offset,
-                            "Packet.CompressedData",
-                            format!("LZ4 block decompression failed: {error}"),
-                        )
-                    },
-                )?;
-                if actual != usize::from(decoded_size) {
-                    return Err(TraceError::new(
-                        TraceErrorKind::MalformedData,
-                        packet_offset,
-                        "Packet.DecodedSize",
-                        format!("expected {decoded_size} decoded bytes, got {actual}"),
-                    ));
-                }
-                stream.extend_from_slice(&decoded);
-            }
+            decompress_lz4_into_stream(
+                stream,
+                compressed,
+                usize::from(decoded_size),
+                packet_offset,
+            )?;
             summary.compressed_payload_bytes += u64::try_from(compressed_size).unwrap();
             summary.compressed_decoded_bytes += u64::from(decoded_size);
             summary.decoded_bytes += u64::from(decoded_size);
@@ -3096,7 +3139,7 @@ fn read_event_registry(
     Ok(events)
 }
 
-fn decode_new_event(
+pub(super) fn decode_new_event(
     data: &[u8],
     protocol: u8,
     base_offset: u64,
@@ -3239,20 +3282,145 @@ pub fn dashboard_with_options(
     source: &[u8],
     options: DashboardOptions,
 ) -> Result<TraceDashboard, TraceError> {
-    let mut reader = Reader::new(source);
-    let header = read_header(&mut reader)?;
-    let decoded = read_packets(&mut reader)?;
+    let mut session = crate::utrace_session::DashboardSession::new(options);
+    for chunk in source.chunks(crate::utrace_session::MAX_PUSH_CHUNK_BYTES) {
+        session.push_chunk(chunk)?;
+    }
+    session.finish()
+}
+
+/// Decode dashboard and inventory projections from one incremental packet pass.
+pub fn dashboard_and_inventory_with_options(
+    source: &[u8],
+    options: DashboardOptions,
+) -> Result<(TraceDashboard, TraceInventory), TraceError> {
+    let mut session = crate::utrace_session::DashboardSession::new(options);
+    for chunk in source.chunks(crate::utrace_session::MAX_PUSH_CHUNK_BYTES) {
+        session.push_chunk(chunk)?;
+    }
+    session.finish_with_inventory()
+}
+
+pub(super) fn dashboard_from_decoded(
+    header: TraceHeader,
+    decoded: DecodedStreams,
+    options: DashboardOptions,
+) -> Result<TraceDashboard, TraceError> {
+    dashboard_from_decoded_with_timeline_index(header, decoded, options, None)
+        .map(|(dashboard, _)| dashboard)
+}
+
+pub(super) fn dashboard_from_decoded_with_timeline_index(
+    header: TraceHeader,
+    decoded: DecodedStreams,
+    options: DashboardOptions,
+    timeline_index_request: Option<(TimelineIndexRequest, SourceIdentity)>,
+) -> Result<(TraceDashboard, Option<TimelineIndexBuild>), TraceError> {
+    let (mut timeline_index_builder, timeline_index_initialization_error) =
+        match timeline_index_request.as_ref() {
+            Some((request, _)) => match CpuTimelineIndexBuilder::new(request.max_intervals) {
+                Ok(builder) => (Some(builder), None),
+                Err(error) => (None, Some(error)),
+            },
+            None => (None, None),
+        };
+    let (dashboard, timeline_index_builder, cycle_frequency) =
+        dashboard_from_decoded_with_timeline_builder(
+            header,
+            decoded,
+            options,
+            timeline_index_builder.take(),
+        )?;
+    let timeline_index = timeline_index_request.map(|(request, source)| TimelineIndexBuild {
+        output: request.output.clone(),
+        result: match (timeline_index_builder, timeline_index_initialization_error) {
+            (Some(builder), None) => builder.finish(&request.output, source, cycle_frequency),
+            (None, Some(error)) => Err(error),
+            (None, None) => Err(TimelineIndexError::ResourceLimit(
+                "timeline index builder was not initialized".to_owned(),
+            )),
+            (Some(_), Some(_)) => unreachable!("a builder cannot both succeed and fail"),
+        },
+    });
+    Ok((dashboard, timeline_index))
+}
+
+pub(super) fn dashboard_from_decoded_with_memory_timeline_index(
+    header: TraceHeader,
+    decoded: DecodedStreams,
+    options: DashboardOptions,
+    source: SourceIdentity,
+) -> Result<
+    (
+        TraceDashboard,
+        crate::utrace_timeline::CpuTimelineMemoryIndex,
+    ),
+    TraceError,
+> {
+    // A browser session cannot retain every decoded CPU span: a 260 MB trace
+    // can contain tens of millions of scopes, which exceeds practical WASM
+    // linear memory. Keep a bounded representative sample across the complete
+    // capture instead of failing after its frame markers have already streamed.
+    let builder = CpuTimelineIndexBuilder::new_reservoir_sample(DEFAULT_MAX_INDEXED_INTERVALS)
+        .map_err(trace_error_from_timeline_index_error)?;
+    let (dashboard, builder, cycle_frequency) =
+        dashboard_from_decoded_with_timeline_builder(header, decoded, options, Some(builder))?;
+    let index = builder
+        .ok_or_else(|| {
+            TraceError::new(
+                TraceErrorKind::ResourceLimit,
+                0,
+                "TimelineIndex",
+                "memory timeline builder was not retained",
+            )
+        })?
+        .finish_in_memory(source, cycle_frequency)
+        .map_err(trace_error_from_timeline_index_error)?;
+    Ok((dashboard, index))
+}
+
+fn dashboard_from_decoded_with_timeline_builder(
+    header: TraceHeader,
+    decoded: DecodedStreams,
+    options: DashboardOptions,
+    mut timeline_index_builder: Option<CpuTimelineIndexBuilder>,
+) -> Result<(TraceDashboard, Option<CpuTimelineIndexBuilder>, Option<u64>), TraceError> {
     let events = read_event_registry(&header, &decoded.streams)?;
     let decoded_importants = read_known_important_events(&header, &decoded.streams, &events)?;
-    let dashboard = read_dashboard_events(
-        &header,
-        &decoded.streams,
-        &events,
-        &decoded_importants,
-        decoded.summary.sync_count,
-        options,
-    )?;
-    Ok(TraceDashboard {
+    let cycle_frequency = decoded_importants
+        .prologue
+        .as_ref()
+        .map(|prologue| prologue.cycle_frequency)
+        .filter(|frequency| *frequency > 0);
+    let mut timeline_collector = options.timeline_frame.map(|frame_number| {
+        CpuTimelineCollector::new(frame_number, options.timeline_limit.unwrap_or(500))
+    });
+    let mut dashboard = {
+        let mut cpu_timeline_sink =
+            match (timeline_collector.as_mut(), timeline_index_builder.as_mut()) {
+                (Some(collector), Some(index)) => Some(CpuTimelineSinks::Both(
+                    CpuTimelineFanout::new(collector, index),
+                )),
+                (Some(collector), None) => Some(CpuTimelineSinks::Collector(collector)),
+                (None, Some(index)) => Some(CpuTimelineSinks::Index(index)),
+                (None, None) => None,
+            };
+        read_dashboard_events(
+            &header,
+            &decoded.streams,
+            &events,
+            &decoded_importants,
+            decoded.summary.sync_count,
+            DashboardDecodeOptions::full(options),
+            cpu_timeline_sink
+                .as_mut()
+                .map(|sink| sink as &mut dyn CpuTimelineSink),
+        )?
+    };
+    if let Some(collector) = timeline_collector {
+        dashboard.cpu.timeline = Some(collector.into_dashboard(cycle_frequency));
+    }
+    let dashboard = TraceDashboard {
         header,
         prologue: decoded_importants.prologue,
         thread_info: decoded_importants.thread_info,
@@ -3276,11 +3444,129 @@ pub fn dashboard_with_options(
         annotations: dashboard.annotations,
         logging: dashboard.logging,
         unmodeled: dashboard.unmodeled,
+        frame_timing: None,
         frame_correlation: dashboard.frame_correlation,
         frames: dashboard.frames,
         dispatch: dashboard.dispatch,
         session: dashboard.session,
-    })
+    };
+    Ok((dashboard, timeline_index_builder, cycle_frequency))
+}
+
+fn trace_error_from_timeline_index_error(error: TimelineIndexError) -> TraceError {
+    TraceError::new(
+        TraceErrorKind::ResourceLimit,
+        0,
+        "TimelineIndex",
+        error.to_string(),
+    )
+}
+
+/// Build a bounded, disk-backed CPU scope index for repeated timeline queries.
+///
+/// The index is sorted by scope start cycle and includes a prefix end-cycle
+/// accelerator, so range queries can skip unrelated regions without reparsing
+/// the trace. `max_intervals` caps in-memory construction and the resulting
+/// sidecar; callers must surface the returned `truncated` flag.
+pub fn build_cpu_timeline_index(
+    source: &[u8],
+    output: &std::path::Path,
+    max_intervals: usize,
+) -> Result<CpuTimelineIndexInfo, TimelineIndexError> {
+    build_cpu_timeline_index_with_source_identity(
+        source,
+        output,
+        max_intervals,
+        SourceIdentity::from_bytes(source),
+    )
+}
+
+/// Build a CPU timeline index using an identity calculated while the source was
+/// read. This avoids a second full-file fingerprint pass for streaming callers.
+pub fn build_cpu_timeline_index_with_source_identity(
+    source: &[u8],
+    output: &std::path::Path,
+    max_intervals: usize,
+    source_identity: SourceIdentity,
+) -> Result<CpuTimelineIndexInfo, TimelineIndexError> {
+    let mut reader = Reader::new(source);
+    let header = read_header(&mut reader).map_err(trace_error_to_timeline_index_error)?;
+    let decoded = read_packets(&mut reader).map_err(trace_error_to_timeline_index_error)?;
+    let events = read_event_registry(&header, &decoded.streams)
+        .map_err(trace_error_to_timeline_index_error)?;
+    let decoded_importants = read_known_important_events(&header, &decoded.streams, &events)
+        .map_err(trace_error_to_timeline_index_error)?;
+    let cycle_frequency = decoded_importants
+        .prologue
+        .as_ref()
+        .map(|prologue| prologue.cycle_frequency)
+        .filter(|frequency| *frequency > 0);
+    let mut index = CpuTimelineIndexBuilder::new(max_intervals)?;
+    let _ = read_dashboard_events(
+        &header,
+        &decoded.streams,
+        &events,
+        &decoded_importants,
+        decoded.summary.sync_count,
+        DashboardDecodeOptions::cpu_timeline_only(),
+        Some(&mut index),
+    )
+    .map_err(trace_error_to_timeline_index_error)?;
+    index.finish(output, source_identity, cycle_frequency)
+}
+
+/// Internal projection mode for consumers that require only CPU scope data.
+/// Keeping this at the dashboard-pass boundary ensures unrelated providers do
+/// not see or allocate for their events during sidecar construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DashboardDecodeScope {
+    Full,
+    CpuTimelineOnly,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DashboardDecodeOptions {
+    dashboard: DashboardOptions,
+    scope: DashboardDecodeScope,
+}
+
+impl DashboardDecodeOptions {
+    const fn full(dashboard: DashboardOptions) -> Self {
+        Self {
+            dashboard,
+            scope: DashboardDecodeScope::Full,
+        }
+    }
+
+    fn cpu_timeline_only() -> Self {
+        Self {
+            dashboard: DashboardOptions::default(),
+            scope: DashboardDecodeScope::CpuTimelineOnly,
+        }
+    }
+}
+
+impl DashboardDecodeScope {
+    fn includes_important_event(self, event: &EventTypeInfo) -> bool {
+        matches!(self, Self::Full)
+            || matches!(
+                (event.logger.as_str(), event.event.as_str()),
+                ("CpuProfiler", "EventSpec" | "MetadataSpec")
+            )
+    }
+
+    fn includes_normal_event(self, event: &EventTypeInfo) -> bool {
+        matches!(self, Self::Full)
+            || matches!(
+                (event.logger.as_str(), event.event.as_str()),
+                ("CpuProfiler", "Metadata" | "EventBatchV3")
+                    | ("MetadataStack", "ClearScope" | "SaveStack" | "RestoreStack")
+            )
+    }
+}
+
+fn trace_error_to_timeline_index_error(error: TraceError) -> TimelineIndexError {
+    TimelineIndexError::Malformed(error.to_string())
 }
 
 fn read_known_important_events(
@@ -3349,33 +3635,119 @@ fn read_known_important_events(
     Ok(decoded)
 }
 
+/// Hot-path route for normal-stream dashboard events. Resolved once per UID at
+/// registry build time so the dispatch loop does not string-compare every event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum DashboardEventKind {
+    Unknown = 0,
+    CpuProfilerMetadata,
+    CpuProfilerEventBatchV3,
+    CpuProfilerEndThread,
+    MiscBeginFrame,
+    MiscEndFrame,
+    Misc,
+    Cpu,
+    GpuProfiler,
+    Counters,
+    StatsEventBatch2,
+    CsvProfilerStat,
+    TaskTrace,
+    LoggingLogMessage,
+    LoadTime,
+    IoStore,
+    PlatformFile,
+    TraceThreadTiming,
+    MemoryScope,
+    MemoryCallstackSpec,
+    MemoryAlloc,
+    MemoryFree,
+    LlmTagValue,
+    MetadataStack,
+    SlateTraceAddWidget,
+}
+
+fn derive_dashboard_event_kind(logger: &str, event: &str) -> DashboardEventKind {
+    match (logger, event) {
+        ("CpuProfiler", "Metadata") => DashboardEventKind::CpuProfilerMetadata,
+        ("CpuProfiler", "EventBatchV3") => DashboardEventKind::CpuProfilerEventBatchV3,
+        ("CpuProfiler", "EndThread") => DashboardEventKind::CpuProfilerEndThread,
+        ("Misc", "BeginFrame") => DashboardEventKind::MiscBeginFrame,
+        ("Misc", "EndFrame") => DashboardEventKind::MiscEndFrame,
+        ("Misc", _) => DashboardEventKind::Misc,
+        ("Cpu", _) => DashboardEventKind::Cpu,
+        ("GpuProfiler", _) => DashboardEventKind::GpuProfiler,
+        ("Counters", _) => DashboardEventKind::Counters,
+        ("Stats", "EventBatch2") => DashboardEventKind::StatsEventBatch2,
+        ("CsvProfiler", "BeginStat" | "EndStat" | "CustomStatInt" | "CustomStatFloat") => {
+            DashboardEventKind::CsvProfilerStat
+        }
+        ("TaskTrace", _) => DashboardEventKind::TaskTrace,
+        ("Logging", "LogMessage") => DashboardEventKind::LoggingLogMessage,
+        ("LoadTime", _) => DashboardEventKind::LoadTime,
+        ("IoStore", _) => DashboardEventKind::IoStore,
+        ("PlatformFile", _) => DashboardEventKind::PlatformFile,
+        ("$Trace", "ThreadTiming") => DashboardEventKind::TraceThreadTiming,
+        ("Memory", "MemoryScope") => DashboardEventKind::MemoryScope,
+        ("Memory", "CallstackSpec") => DashboardEventKind::MemoryCallstackSpec,
+        (
+            "Memory",
+            "Alloc" | "AllocSystem" | "AllocVideo" | "ReallocAlloc" | "ReallocAllocSystem"
+            | "ReallocAllocVideo",
+        ) => DashboardEventKind::MemoryAlloc,
+        (
+            "Memory",
+            "Free" | "FreeSystem" | "FreeVideo" | "ReallocFree" | "ReallocFreeSystem"
+            | "ReallocFreeVideo",
+        ) => DashboardEventKind::MemoryFree,
+        ("LLM", "TagValue") => DashboardEventKind::LlmTagValue,
+        ("MetadataStack", _) => DashboardEventKind::MetadataStack,
+        ("SlateTrace", "AddWidget") => DashboardEventKind::SlateTraceAddWidget,
+        _ => DashboardEventKind::Unknown,
+    }
+}
+
+fn dashboard_event_kinds(events: &[EventTypeInfo]) -> Vec<DashboardEventKind> {
+    let max_uid = events.iter().map(|event| event.uid).max().unwrap_or(0);
+    let mut kinds = vec![DashboardEventKind::Unknown; usize::from(max_uid) + 1];
+    for event in events {
+        kinds[usize::from(event.uid)] = derive_dashboard_event_kind(&event.logger, &event.event);
+    }
+    kinds
+}
+
 fn read_dashboard_events(
     header: &TraceHeader,
     streams: &BTreeMap<u16, Vec<u8>>,
     events: &[EventTypeInfo],
     importants: &DecodedImportantEvents,
     sync_count: u64,
-    options: DashboardOptions,
+    decode_options: DashboardDecodeOptions,
+    mut cpu_timeline_sink: Option<&mut dyn CpuTimelineSink>,
 ) -> Result<DecodedDashboardEvents, TraceError> {
     if header.protocol < 5 {
         return Ok(DecodedDashboardEvents::default());
     }
+    let options = decode_options.dashboard;
+    let decode_scope = decode_options.scope;
 
     let registry = events
         .iter()
         .map(|event| (event.uid, event))
         .collect::<BTreeMap<_, _>>();
+    let event_kinds = dashboard_event_kinds(events);
     let mut decoded = DecodedDashboardEvents::default();
     let mut spec_by_id = BTreeMap::<u32, CpuScopeSpec>::new();
     let mut metadata_spec_by_id = BTreeMap::<u32, CpuMetadataSpec>::new();
     let mut metadata_by_id = BTreeMap::<u32, CpuMetadataRecord>::new();
-    let mut metadata_scope_totals = BTreeMap::<u32, (u64, u64)>::new();
+    let mut metadata_scope_totals = FxHashMap::<u32, (u64, u64)>::default();
     let mut metadata_interval_state = CpuMetadataIntervalState::default();
-    let mut metadata_stack_contexts = BTreeMap::<u16, CpuMetadataStackRuntimeState>::new();
-    let mut cpu_batch_thread_states = BTreeMap::<u16, CpuBatchThreadState>::new();
-    let mut scope_totals = BTreeMap::<u32, (u64, u64)>::new();
-    let mut frame_scope_totals = BTreeMap::<u32, BTreeMap<u32, (u64, u64)>>::new();
-    let mut thread_scope_totals = BTreeMap::<u16, BTreeMap<u32, (u64, u64)>>::new();
+    let mut metadata_stack_contexts = FxHashMap::<u16, CpuMetadataStackRuntimeState>::default();
+    let mut cpu_batch_thread_states = FxHashMap::<u16, CpuBatchThreadState>::default();
+    let mut scope_totals = FxHashMap::<u32, (u64, u64)>::default();
+    let mut frame_scope_totals = FxHashMap::<u32, FxHashMap<u32, (u64, u64)>>::default();
+    let mut frame_cycle_bounds = FxHashMap::<u32, (u64, u64)>::default();
+    let mut thread_scope_totals = FxHashMap::<u16, FxHashMap<u32, (u64, u64)>>::default();
     let mut cpu_named_events = BTreeMap::<String, CpuNamedEventState>::new();
     let mut gpu_queues = BTreeMap::<u32, GpuQueueState>::new();
     let mut gpu_breadcrumb_specs = BTreeMap::<u32, GpuBreadcrumbSpec>::new();
@@ -3408,12 +3780,9 @@ fn read_dashboard_events(
     let mut log_message_specs = BTreeMap::<u64, LogMessageSpecRec>::new();
     let mut log_message_states = BTreeMap::<u64, LogMessageState>::new();
     let mut unresolved_log_messages = 0_u64;
-    let mut unmodeled_events = BTreeMap::<(String, String), GenericEventState>::new();
+    let mut unmodeled_events = FxHashMap::<u16, GenericEventState>::default();
     let mut session: Option<SessionInfo> = None;
     let mut submission_latency_samples = Vec::<GpuSubmissionLatencySample>::new();
-    let mut timeline_collector = options.timeline_frame.map(|frame_number| {
-        CpuTimelineCollector::new(frame_number, options.timeline_limit.unwrap_or(500))
-    });
     let mut gpu_timeline_collector = options.gpu_timeline_frame.map(|frame_number| {
         GpuTimelineCollector::new(frame_number, options.gpu_timeline_limit.unwrap_or(500))
     });
@@ -3435,11 +3804,15 @@ fn read_dashboard_events(
             let Some(event) = registry.get(&raw_event.uid).copied() else {
                 continue;
             };
+            if !decode_scope.includes_important_event(event) {
+                continue;
+            }
             if decode_status_for(event) == DecodeStatus::Raw {
-                unmodeled_events
-                    .entry((event.logger.clone(), event.event.clone()))
-                    .or_default()
-                    .record(event, raw_event.data, thread_id)?;
+                unmodeled_events.entry(event.uid).or_default().record(
+                    event,
+                    raw_event.data,
+                    thread_id,
+                )?;
                 continue;
             }
             match (event.logger.as_str(), event.event.as_str()) {
@@ -3681,183 +4054,200 @@ fn read_dashboard_events(
     decoded.dispatch = Some(dispatch_summary);
 
     for raw_event in &dispatched_events {
-        let Some(event) = registry.get(&raw_event.uid).copied() else {
-            continue;
-        };
-        if decode_status_for(event) == DecodeStatus::Raw {
-            continue;
-        }
-        if (event.logger.as_str(), event.event.as_str()) == ("CpuProfiler", "Metadata") {
-            let mut record = decode_cpu_metadata_record(event, &raw_event.data, 0)?;
-            enrich_cpu_metadata_record(&metadata_spec_by_id, &mut record);
-            metadata_by_id.insert(record.metadata_id, record);
-        }
-    }
-
-    for raw_event in &dispatched_events {
         let thread_id = raw_event.thread_id;
         let Some(event) = registry.get(&raw_event.uid).copied() else {
             continue;
         };
-        if decode_status_for(event) == DecodeStatus::Raw {
-            unmodeled_events
-                .entry((event.logger.clone(), event.event.clone()))
-                .or_default()
-                .record(event, &raw_event.data, thread_id)?;
+        if !decode_scope.includes_normal_event(event) {
             continue;
         }
-        if (event.logger.as_str(), event.event.as_str()) == ("CpuProfiler", "EventBatchV3") {
-            let Some(data) = read_aux_bytes(event, &raw_event.data, "Data", 0)? else {
-                continue;
-            };
-            let mut batch_state = CpuBatchDecodeState {
-                batches: &mut decoded.cpu.batches,
-                scope_totals: &mut scope_totals,
-                metadata_scope_totals: &mut metadata_scope_totals,
-                metadata_interval_state: &mut metadata_interval_state,
-                metadata_stack_context: metadata_stack_contexts.entry(thread_id).or_default(),
-                thread_state: cpu_batch_thread_states.entry(thread_id).or_default(),
-                batch_base_cycle: raw_event.scope_cycle.or(prologue_start_cycle),
-                frame_scope_totals: &mut frame_scope_totals,
-                thread_scope_totals: thread_scope_totals.entry(thread_id).or_default(),
-                timeline: timeline_collector.as_mut(),
+        if decode_status_for(event) == DecodeStatus::Raw {
+            unmodeled_events.entry(event.uid).or_default().record(
+                event,
+                &raw_event.data,
                 thread_id,
-                cycle_frequency,
-            };
-            decode_cpu_batch(&data, &spec_by_id, &metadata_by_id, &mut batch_state)?;
-        } else if (event.logger.as_str(), event.event.as_str()) == ("Misc", "BeginFrame") {
-            decoded.frames.push(decode_frame_marker(
-                event,
-                &raw_event.data,
-                0,
-                thread_id,
-                FrameMarkerKind::Begin,
-            )?);
-        } else if (event.logger.as_str(), event.event.as_str()) == ("Misc", "EndFrame") {
-            decoded.frames.push(decode_frame_marker(
-                event,
-                &raw_event.data,
-                0,
-                thread_id,
-                FrameMarkerKind::End,
-            )?);
-        } else if event.logger.as_str() == "Cpu" {
-            cpu_named_events
-                .entry(event.event.clone())
-                .or_default()
-                .record(event, &raw_event.data, thread_id)?;
-        } else if event.logger.as_str() == "GpuProfiler" {
-            let mut gpu_state = GpuNormalEventState {
-                specs: &gpu_breadcrumb_specs,
-                queues: &mut gpu_queues,
-                breadcrumb_totals: &mut gpu_breadcrumb_totals,
-                submission_latency_samples: &mut submission_latency_samples,
-                timeline: gpu_timeline_collector.as_mut(),
-            };
-            decode_gpu_normal_event(event, &raw_event.data, &mut gpu_state, 0)?;
-        } else if event.logger.as_str() == "Counters" {
-            decode_counter_value(
-                event,
-                &raw_event.data,
-                &counter_specs,
-                &mut counter_states,
-                &mut unresolved_counter_samples,
-                0,
             )?;
-        } else if (event.logger.as_str(), event.event.as_str()) == ("Stats", "EventBatch2") {
-            stats_samples.record_batch(event, &raw_event.data, &stat_specs, 0)?;
-        } else if event.logger.as_str() == "CsvProfiler"
-            && matches!(
-                event.event.as_str(),
-                "BeginStat" | "EndStat" | "CustomStatInt" | "CustomStatFloat"
-            )
-        {
-            csv_samples.record_event(event, &raw_event.data, thread_id, &csv_stats, 0)?;
-        } else if event.logger.as_str() == "TaskTrace" {
-            tasks.record_event(event, &raw_event.data, thread_id, 0)?;
-        } else if event.logger.as_str() == "Misc" {
-            decode_misc_annotation_event(
-                event,
-                &raw_event.data,
-                &bookmark_specs,
-                &mut bookmark_states,
-                &mut unresolved_bookmark_events,
-                &mut region_state,
-                0,
-            )?;
-        } else if (event.logger.as_str(), event.event.as_str()) == ("Logging", "LogMessage") {
-            decode_log_message(
-                event,
-                &raw_event.data,
-                &log_message_specs,
-                &mut log_message_states,
-                &mut unresolved_log_messages,
-                0,
-            )?;
-        } else if event.logger.as_str() == "LoadTime" {
-            decode_load_time_event(event, &raw_event.data, &mut load_time, 0)?;
-        } else if event.logger.as_str() == "IoStore" {
-            decode_io_store_event(event, &raw_event.data, &mut io_store, 0)?;
-        } else if event.logger.as_str() == "PlatformFile" {
-            decode_platform_file_event(event, &raw_event.data, &mut platform_file, thread_id, 0)?;
-        } else if (event.logger.as_str(), event.event.as_str()) == ("$Trace", "ThreadTiming") {
-            let timing = decode_trace_thread_timing(event, &raw_event.data, 0, thread_id)?;
-            trace_thread_timing.insert(timing.thread_id, timing);
-        } else if (event.logger.as_str(), event.event.as_str()) == ("CpuProfiler", "EndThread") {
-            cpu_end_threads.push(decode_cpu_end_thread(event, &raw_event.data, 0, thread_id)?);
-        } else if event.logger.as_str() == "Memory" {
-            match event.event.as_str() {
-                "MemoryScope" => {
-                    memory.record_scope(decode_memory_scope(event, &raw_event.data, 0)?);
-                }
-                "CallstackSpec" => {
-                    callstacks.record(decode_callstack_spec(event, &raw_event.data, 0)?);
-                }
-                "Alloc" | "AllocSystem" | "AllocVideo" | "ReallocAlloc" | "ReallocAllocSystem"
-                | "ReallocAllocVideo" => {
-                    let init = memory.init().ok_or_else(|| {
-                        TraceError::new(
-                            TraceErrorKind::MalformedData,
-                            0,
-                            "Memory.Init",
-                            "allocation event appeared before required Memory.Init",
-                        )
-                    })?;
-                    memory.record_allocation(decode_memory_allocation(
-                        event,
-                        &raw_event.data,
-                        init,
-                        0,
-                    )?);
-                }
-                "Free" | "FreeSystem" | "FreeVideo" | "ReallocFree" | "ReallocFreeSystem"
-                | "ReallocFreeVideo" => {
-                    memory.record_free(decode_memory_free(event, &raw_event.data, 0)?);
-                }
-                _ => {}
+            continue;
+        }
+        let kind = event_kinds
+            .get(usize::from(raw_event.uid))
+            .copied()
+            .unwrap_or(DashboardEventKind::Unknown);
+        match kind {
+            DashboardEventKind::CpuProfilerMetadata => {
+                let mut record = decode_cpu_metadata_record(event, &raw_event.data, 0)?;
+                enrich_cpu_metadata_record(&metadata_spec_by_id, &mut record);
+                metadata_by_id.insert(record.metadata_id, record);
             }
-        } else if (event.logger.as_str(), event.event.as_str()) == ("LLM", "TagValue") {
-            let sample = decode_llm_tag_values(event, &raw_event.data, 0)?;
-            memory.record_llm_tag_values(
-                sample.tracker_id,
-                sample.cycle,
-                &sample.values,
-                sample.dropped_values,
-            );
-        } else if event.logger.as_str() == "MetadataStack" {
-            decode_metadata_stack_event(event, &raw_event.data, &mut metadata_stack, 0)?;
-            apply_metadata_stack_event_to_cpu_context(
-                event,
-                &raw_event.data,
-                metadata_stack_contexts.entry(thread_id).or_default(),
-                0,
-            )?;
-        } else if (event.logger.as_str(), event.event.as_str()) == ("SlateTrace", "AddWidget") {
-            let widget = decode_slate_add_widget(event, &raw_event.data, 0)?;
-            slate_widgets
-                .entry(widget.widget_id)
-                .or_default()
-                .record(widget.cycle);
+            DashboardEventKind::CpuProfilerEventBatchV3 => {
+                let Some(data) = read_aux_bytes(event, &raw_event.data, "Data", 0)? else {
+                    continue;
+                };
+                let mut batch_state = CpuBatchDecodeState {
+                    batches: &mut decoded.cpu.batches,
+                    scope_totals: &mut scope_totals,
+                    metadata_scope_totals: &mut metadata_scope_totals,
+                    metadata_interval_state: &mut metadata_interval_state,
+                    metadata_stack_context: metadata_stack_contexts.entry(thread_id).or_default(),
+                    thread_state: cpu_batch_thread_states.entry(thread_id).or_default(),
+                    batch_base_cycle: raw_event.scope_cycle.or(prologue_start_cycle),
+                    frame_scope_totals: &mut frame_scope_totals,
+                    frame_cycle_bounds: &mut frame_cycle_bounds,
+                    thread_scope_totals: thread_scope_totals.entry(thread_id).or_default(),
+                    timeline: cpu_timeline_sink.take(),
+                    thread_id,
+                    cycle_frequency,
+                };
+                decode_cpu_batch(&data, &spec_by_id, &metadata_by_id, &mut batch_state)?;
+                cpu_timeline_sink = batch_state.timeline.take();
+            }
+            DashboardEventKind::MiscBeginFrame => {
+                decoded.frames.push(decode_frame_marker(
+                    event,
+                    &raw_event.data,
+                    0,
+                    thread_id,
+                    FrameMarkerKind::Begin,
+                )?);
+            }
+            DashboardEventKind::MiscEndFrame => {
+                decoded.frames.push(decode_frame_marker(
+                    event,
+                    &raw_event.data,
+                    0,
+                    thread_id,
+                    FrameMarkerKind::End,
+                )?);
+            }
+            DashboardEventKind::Cpu => {
+                cpu_named_events
+                    .entry(event.event.clone())
+                    .or_default()
+                    .record(event, &raw_event.data, thread_id)?;
+            }
+            DashboardEventKind::GpuProfiler => {
+                let mut gpu_state = GpuNormalEventState {
+                    specs: &gpu_breadcrumb_specs,
+                    queues: &mut gpu_queues,
+                    breadcrumb_totals: &mut gpu_breadcrumb_totals,
+                    submission_latency_samples: &mut submission_latency_samples,
+                    timeline: gpu_timeline_collector.as_mut(),
+                };
+                decode_gpu_normal_event(event, &raw_event.data, &mut gpu_state, 0)?;
+            }
+            DashboardEventKind::Counters => {
+                decode_counter_value(
+                    event,
+                    &raw_event.data,
+                    &counter_specs,
+                    &mut counter_states,
+                    &mut unresolved_counter_samples,
+                    0,
+                )?;
+            }
+            DashboardEventKind::StatsEventBatch2 => {
+                stats_samples.record_batch(event, &raw_event.data, &stat_specs, 0)?;
+            }
+            DashboardEventKind::CsvProfilerStat => {
+                csv_samples.record_event(event, &raw_event.data, thread_id, &csv_stats, 0)?;
+            }
+            DashboardEventKind::TaskTrace => {
+                tasks.record_event(event, &raw_event.data, thread_id, 0)?;
+            }
+            DashboardEventKind::Misc => {
+                decode_misc_annotation_event(
+                    event,
+                    &raw_event.data,
+                    &bookmark_specs,
+                    &mut bookmark_states,
+                    &mut unresolved_bookmark_events,
+                    &mut region_state,
+                    0,
+                )?;
+            }
+            DashboardEventKind::LoggingLogMessage => {
+                decode_log_message(
+                    event,
+                    &raw_event.data,
+                    &log_message_specs,
+                    &mut log_message_states,
+                    &mut unresolved_log_messages,
+                    0,
+                )?;
+            }
+            DashboardEventKind::LoadTime => {
+                decode_load_time_event(event, &raw_event.data, &mut load_time, 0)?;
+            }
+            DashboardEventKind::IoStore => {
+                decode_io_store_event(event, &raw_event.data, &mut io_store, 0)?;
+            }
+            DashboardEventKind::PlatformFile => {
+                decode_platform_file_event(
+                    event,
+                    &raw_event.data,
+                    &mut platform_file,
+                    thread_id,
+                    0,
+                )?;
+            }
+            DashboardEventKind::TraceThreadTiming => {
+                let timing = decode_trace_thread_timing(event, &raw_event.data, 0, thread_id)?;
+                trace_thread_timing.insert(timing.thread_id, timing);
+            }
+            DashboardEventKind::CpuProfilerEndThread => {
+                cpu_end_threads.push(decode_cpu_end_thread(event, &raw_event.data, 0, thread_id)?);
+            }
+            DashboardEventKind::MemoryScope => {
+                memory.record_scope(decode_memory_scope(event, &raw_event.data, 0)?);
+            }
+            DashboardEventKind::MemoryCallstackSpec => {
+                callstacks.record(decode_callstack_spec(event, &raw_event.data, 0)?);
+            }
+            DashboardEventKind::MemoryAlloc => {
+                let init = memory.init().ok_or_else(|| {
+                    TraceError::new(
+                        TraceErrorKind::MalformedData,
+                        0,
+                        "Memory.Init",
+                        "allocation event appeared before required Memory.Init",
+                    )
+                })?;
+                memory.record_allocation(decode_memory_allocation(
+                    event,
+                    &raw_event.data,
+                    init,
+                    0,
+                )?);
+            }
+            DashboardEventKind::MemoryFree => {
+                memory.record_free(decode_memory_free(event, &raw_event.data, 0)?);
+            }
+            DashboardEventKind::LlmTagValue => {
+                let sample = decode_llm_tag_values(event, &raw_event.data, 0)?;
+                memory.record_llm_tag_values(
+                    sample.tracker_id,
+                    sample.cycle,
+                    &sample.values,
+                    sample.dropped_values,
+                );
+            }
+            DashboardEventKind::MetadataStack => {
+                decode_metadata_stack_event(event, &raw_event.data, &mut metadata_stack, 0)?;
+                apply_metadata_stack_event_to_cpu_context(
+                    event,
+                    &raw_event.data,
+                    metadata_stack_contexts.entry(thread_id).or_default(),
+                    0,
+                )?;
+            }
+            DashboardEventKind::SlateTraceAddWidget => {
+                let widget = decode_slate_add_widget(event, &raw_event.data, 0)?;
+                slate_widgets
+                    .entry(widget.widget_id)
+                    .or_default()
+                    .record(widget.cycle);
+            }
+            DashboardEventKind::Unknown => {}
         }
     }
 
@@ -3917,6 +4307,7 @@ fn read_dashboard_events(
     decoded.frame_correlation = frame_correlation_dashboard(
         &cpu_metadata_rendered_totals,
         frame_scope_totals,
+        frame_cycle_bounds,
         &spec_by_id,
         &gpu_frames,
         cycle_frequency,
@@ -3937,9 +4328,6 @@ fn read_dashboard_events(
     decoded.gpu.submission_latency = gpu_submission_latency(submission_latency_samples);
     if let Some(collector) = gpu_timeline_collector {
         decoded.gpu.timeline = Some(collector.into_dashboard());
-    }
-    if let Some(collector) = timeline_collector {
-        decoded.cpu.timeline = Some(collector.into_dashboard(cycle_frequency));
     }
     decoded.counters = counter_dashboard(counter_specs, counter_states, unresolved_counter_samples);
     decoded.stats = stats_dashboard(stat_specs);
@@ -3984,7 +4372,7 @@ fn read_dashboard_events(
         log_message_states,
         unresolved_log_messages,
     );
-    decoded.unmodeled = unmodeled_trace_dashboard(unmodeled_events);
+    decoded.unmodeled = unmodeled_trace_dashboard(unmodeled_events, &registry);
     decoded.session = session;
     decoded.frames.sort_by_key(|frame| frame.cycle);
     Ok(decoded)
@@ -4851,7 +5239,8 @@ fn gpu_work_summary(queues: &[GpuQueueSummary]) -> GpuWorkSummary {
 
 fn frame_correlation_dashboard(
     cpu_metadata_scope_totals: &BTreeMap<(u32, String), (u64, u64)>,
-    frame_scope_totals: BTreeMap<u32, BTreeMap<u32, (u64, u64)>>,
+    frame_scope_totals: FxHashMap<u32, FxHashMap<u32, (u64, u64)>>,
+    frame_cycle_bounds: FxHashMap<u32, (u64, u64)>,
     specs: &BTreeMap<u32, CpuScopeSpec>,
     gpu_frames: &[GpuFrameSummary],
     cycle_frequency: Option<u64>,
@@ -4869,6 +5258,8 @@ fn frame_correlation_dashboard(
                 cpu_metadata_count: 0,
                 cpu_metadata_cycles: 0,
                 cpu_metadata_seconds: None,
+                cpu_begin_cycle: None,
+                cpu_end_cycle: None,
                 top_cpu_scopes: Vec::new(),
                 gpu_queue_count: 0,
                 gpu_work_count: 0,
@@ -4890,6 +5281,8 @@ fn frame_correlation_dashboard(
                 cpu_metadata_count: 0,
                 cpu_metadata_cycles: 0,
                 cpu_metadata_seconds: None,
+                cpu_begin_cycle: None,
+                cpu_end_cycle: None,
                 top_cpu_scopes: Vec::new(),
                 gpu_queue_count: 0,
                 gpu_work_count: 0,
@@ -4913,6 +5306,8 @@ fn frame_correlation_dashboard(
                     cpu_metadata_count: 0,
                     cpu_metadata_cycles: 0,
                     cpu_metadata_seconds: None,
+                    cpu_begin_cycle: None,
+                    cpu_end_cycle: None,
                     top_cpu_scopes: Vec::new(),
                     gpu_queue_count: 0,
                     gpu_work_count: 0,
@@ -4941,6 +5336,27 @@ fn frame_correlation_dashboard(
             total.0 = total.0.saturating_add(breadcrumb.count);
             total.1 = total.1.saturating_add(breadcrumb.total_cycles);
         }
+    }
+    for (frame_number, (begin_cycle, end_cycle)) in frame_cycle_bounds {
+        let frame = frames
+            .entry(frame_number)
+            .or_insert_with(|| CorrelatedFrameSummary {
+                frame_number,
+                cpu_metadata_count: 0,
+                cpu_metadata_cycles: 0,
+                cpu_metadata_seconds: None,
+                cpu_begin_cycle: None,
+                cpu_end_cycle: None,
+                top_cpu_scopes: Vec::new(),
+                gpu_queue_count: 0,
+                gpu_work_count: 0,
+                gpu_work_cycles: 0,
+                gpu_breadcrumb_count: 0,
+                gpu_breadcrumb_cycles: 0,
+                top_gpu_breadcrumbs: Vec::new(),
+            });
+        frame.cpu_begin_cycle = Some(begin_cycle);
+        frame.cpu_end_cycle = Some(end_cycle);
     }
     let mut frames = frames.into_values().collect::<Vec<_>>();
     for frame in &mut frames {
@@ -7450,7 +7866,7 @@ fn update_first_last(first: &mut Option<u64>, last: &mut Option<u64>, value: u64
 }
 
 fn scope_summaries(
-    totals: BTreeMap<u32, (u64, u64)>,
+    totals: FxHashMap<u32, (u64, u64)>,
     spec_by_id: &BTreeMap<u32, CpuScopeSpec>,
     cycle_frequency: Option<u64>,
 ) -> Vec<CpuScopeSummary> {
@@ -7550,15 +7966,19 @@ impl GenericEventState {
 }
 
 fn unmodeled_trace_dashboard(
-    events: BTreeMap<(String, String), GenericEventState>,
+    events: FxHashMap<u16, GenericEventState>,
+    registry: &BTreeMap<u16, &EventTypeInfo>,
 ) -> UnmodeledTraceDashboard {
     let mut summaries = events
         .into_iter()
-        .map(|((logger, event), state)| UnmodeledTraceEventSummary {
-            logger,
-            event,
-            observed_count: state.observed_count,
-            sample: state.sample,
+        .filter_map(|(uid, state)| {
+            let event = registry.get(&uid).copied()?;
+            Some(UnmodeledTraceEventSummary {
+                logger: event.logger.clone(),
+                event: event.event.clone(),
+                observed_count: state.observed_count,
+                sample: state.sample,
+            })
         })
         .collect::<Vec<_>>();
     summaries.sort_by(|left, right| {
@@ -7618,13 +8038,13 @@ struct OwnedRawEvent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ParsedNormalEvent {
-    uid: u16,
-    offset: usize,
-    total_end: usize,
-    data_start: usize,
-    data_end: usize,
-    has_aux: bool,
+pub(super) struct ParsedNormalEvent {
+    pub(super) uid: u16,
+    pub(super) offset: usize,
+    pub(super) total_end: usize,
+    pub(super) data_start: usize,
+    pub(super) data_end: usize,
+    pub(super) has_aux: bool,
 }
 
 fn read_protocol5_normal_events(
@@ -7682,7 +8102,7 @@ fn read_protocol5_normal_events(
     Ok(events)
 }
 
-fn decode_known_scope_cycle(uid: u16, data: &[u8]) -> Option<u64> {
+pub(super) fn decode_known_scope_cycle(uid: u16, data: &[u8]) -> Option<u64> {
     match uid {
         6 if data.len() == 8 => Some(u64::from_le_bytes(data.try_into().ok()?)),
         8 if data.len() == 7 => {
@@ -7694,9 +8114,29 @@ fn decode_known_scope_cycle(uid: u16, data: &[u8]) -> Option<u64> {
     }
 }
 
-fn parse_protocol5_normal_event(
+/// Lookup used by normal-stream event framing. Accepts both owned registry maps
+/// (`BTreeMap<u16, EventTypeInfo>`) and borrowed views (`BTreeMap<u16, &EventTypeInfo>`).
+pub(super) trait EventTypeRegistry {
+    fn lookup(&self, uid: u16) -> Option<&EventTypeInfo>;
+}
+
+impl EventTypeRegistry for BTreeMap<u16, EventTypeInfo> {
+    #[inline]
+    fn lookup(&self, uid: u16) -> Option<&EventTypeInfo> {
+        self.get(&uid)
+    }
+}
+
+impl EventTypeRegistry for BTreeMap<u16, &EventTypeInfo> {
+    #[inline]
+    fn lookup(&self, uid: u16) -> Option<&EventTypeInfo> {
+        self.get(&uid).copied()
+    }
+}
+
+pub(super) fn parse_protocol5_normal_event(
     reader: &mut Reader<'_>,
-    registry: &BTreeMap<u16, &EventTypeInfo>,
+    registry: &impl EventTypeRegistry,
 ) -> Result<ParsedNormalEvent, TraceError> {
     const USER_UID: u16 = 16;
     let offset = usize::try_from(reader.tell()).unwrap();
@@ -7733,7 +8173,7 @@ fn parse_protocol5_normal_event(
         };
         (size, false)
     } else {
-        let Some(event) = registry.get(&uid).copied() else {
+        let Some(event) = registry.lookup(uid) else {
             return Err(TraceError::new(
                 TraceErrorKind::MalformedData,
                 u64::try_from(offset).unwrap(),
@@ -7848,17 +8288,18 @@ struct CpuMetadataIntervalRecord {
     attribution: CpuMetadataAttribution,
 }
 
-struct CpuBatchDecodeState<'a> {
+struct CpuBatchDecodeState<'a, 'timeline> {
     batches: &'a mut CpuBatchSummary,
-    scope_totals: &'a mut BTreeMap<u32, (u64, u64)>,
-    metadata_scope_totals: &'a mut BTreeMap<u32, (u64, u64)>,
+    scope_totals: &'a mut FxHashMap<u32, (u64, u64)>,
+    metadata_scope_totals: &'a mut FxHashMap<u32, (u64, u64)>,
     metadata_interval_state: &'a mut CpuMetadataIntervalState,
     metadata_stack_context: &'a mut CpuMetadataStackRuntimeState,
     thread_state: &'a mut CpuBatchThreadState,
     batch_base_cycle: Option<u64>,
-    frame_scope_totals: &'a mut BTreeMap<u32, BTreeMap<u32, (u64, u64)>>,
-    thread_scope_totals: &'a mut BTreeMap<u32, (u64, u64)>,
-    timeline: Option<&'a mut CpuTimelineCollector>,
+    frame_scope_totals: &'a mut FxHashMap<u32, FxHashMap<u32, (u64, u64)>>,
+    frame_cycle_bounds: &'a mut FxHashMap<u32, (u64, u64)>,
+    thread_scope_totals: &'a mut FxHashMap<u32, (u64, u64)>,
+    timeline: Option<&'timeline mut dyn CpuTimelineSink>,
     thread_id: u16,
     cycle_frequency: Option<u64>,
 }
@@ -7963,46 +8404,6 @@ impl CpuTimelineCollector {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn record(
-        &mut self,
-        thread_id: u16,
-        spec_id: u32,
-        name: String,
-        start_cycle: u64,
-        end_cycle: u64,
-        duration: u64,
-        metadata_id: Option<u32>,
-        rendered_name: Option<String>,
-        cycle_frequency: Option<u64>,
-        active_frame: Option<u32>,
-    ) {
-        if active_frame != Some(self.frame_number) {
-            return;
-        }
-        self.begin_cycle = Some(
-            self.begin_cycle
-                .map_or(start_cycle, |begin| begin.min(start_cycle)),
-        );
-        self.end_cycle = Some(self.end_cycle.map_or(end_cycle, |end| end.max(end_cycle)));
-        self.interval_count += 1;
-        if self.intervals.len() >= self.limit {
-            self.truncated = true;
-            return;
-        }
-        self.intervals.push(CpuTimelineInterval {
-            thread_id,
-            spec_id,
-            name,
-            start_cycle,
-            end_cycle,
-            duration,
-            duration_seconds: cycle_frequency.map(|frequency| duration as f64 / frequency as f64),
-            metadata_id,
-            rendered_name,
-        });
-    }
-
     fn into_dashboard(self, cycle_frequency: Option<u64>) -> CpuTimelineDashboard {
         let begin_cycle = self.begin_cycle.unwrap_or(0);
         let end_cycle = self.end_cycle.unwrap_or(begin_cycle);
@@ -8015,6 +8416,117 @@ impl CpuTimelineCollector {
             interval_count: self.interval_count,
             truncated: self.truncated,
             intervals: self.intervals,
+        }
+    }
+}
+
+impl CpuTimelineSink for CpuTimelineCollector {
+    fn note(
+        &mut self,
+        start_cycle: u64,
+        end_cycle: u64,
+        active_frame: Option<u32>,
+    ) -> SinkAppetite {
+        if active_frame != Some(self.frame_number) {
+            return SinkAppetite::Full;
+        }
+        self.begin_cycle = Some(
+            self.begin_cycle
+                .map_or(start_cycle, |begin| begin.min(start_cycle)),
+        );
+        self.end_cycle = Some(self.end_cycle.map_or(end_cycle, |end| end.max(end_cycle)));
+        self.interval_count = self.interval_count.saturating_add(1);
+        if self.intervals.len() >= self.limit {
+            self.truncated = true;
+            SinkAppetite::Full
+        } else {
+            SinkAppetite::WantsRecord
+        }
+    }
+
+    fn record(&mut self, interval: CpuTimelineInterval, active_frame: Option<u32>) {
+        debug_assert_eq!(active_frame, Some(self.frame_number));
+        self.intervals.push(interval);
+    }
+}
+
+struct CpuTimelineFanout<'a> {
+    collector: &'a mut CpuTimelineCollector,
+    index: &'a mut CpuTimelineIndexBuilder,
+    collector_wants_record: bool,
+    index_wants_record: bool,
+}
+
+impl<'a> CpuTimelineFanout<'a> {
+    fn new(
+        collector: &'a mut CpuTimelineCollector,
+        index: &'a mut CpuTimelineIndexBuilder,
+    ) -> Self {
+        Self {
+            collector,
+            index,
+            collector_wants_record: false,
+            index_wants_record: false,
+        }
+    }
+}
+
+impl CpuTimelineSink for CpuTimelineFanout<'_> {
+    fn note(
+        &mut self,
+        start_cycle: u64,
+        end_cycle: u64,
+        active_frame: Option<u32>,
+    ) -> SinkAppetite {
+        self.collector_wants_record =
+            self.collector.note(start_cycle, end_cycle, active_frame) == SinkAppetite::WantsRecord;
+        self.index_wants_record =
+            self.index.note(start_cycle, end_cycle, active_frame) == SinkAppetite::WantsRecord;
+        if self.collector_wants_record || self.index_wants_record {
+            SinkAppetite::WantsRecord
+        } else {
+            SinkAppetite::Full
+        }
+    }
+
+    fn record(&mut self, interval: CpuTimelineInterval, active_frame: Option<u32>) {
+        match (self.collector_wants_record, self.index_wants_record) {
+            (true, true) => {
+                self.collector.record(interval.clone(), active_frame);
+                self.index.record(interval, active_frame);
+            }
+            (true, false) => self.collector.record(interval, active_frame),
+            (false, true) => self.index.record(interval, active_frame),
+            (false, false) => debug_assert!(false, "record called without a sink appetite"),
+        }
+    }
+}
+
+enum CpuTimelineSinks<'a> {
+    Collector(&'a mut CpuTimelineCollector),
+    Index(&'a mut CpuTimelineIndexBuilder),
+    Both(CpuTimelineFanout<'a>),
+}
+
+impl CpuTimelineSink for CpuTimelineSinks<'_> {
+    fn note(
+        &mut self,
+        start_cycle: u64,
+        end_cycle: u64,
+        active_frame: Option<u32>,
+    ) -> SinkAppetite {
+        match self {
+            Self::Collector(collector) => collector.note(start_cycle, end_cycle, active_frame),
+            Self::Index(index) => index.note(start_cycle, end_cycle, active_frame),
+            Self::Both(fanout) => fanout.note(start_cycle, end_cycle, active_frame),
+        }
+    }
+
+    fn record(&mut self, interval: CpuTimelineInterval, active_frame: Option<u32>) {
+        match self {
+            Self::Collector(collector) => collector.record(interval, active_frame),
+            Self::Index(index) => index.record(interval, active_frame),
+            Self::Both(fanout) => fanout.record(interval, active_frame),
         }
     }
 }
@@ -8116,7 +8628,7 @@ fn enrich_cpu_metadata_record(
 fn cpu_metadata_dashboard(
     specs: &BTreeMap<u32, CpuMetadataSpec>,
     records: &BTreeMap<u32, CpuMetadataRecord>,
-    totals: BTreeMap<u32, (u64, u64)>,
+    totals: FxHashMap<u32, (u64, u64)>,
     interval_state: CpuMetadataIntervalState,
     total_metadata_scopes: u64,
 ) -> CpuMetadataDashboard {
@@ -8280,7 +8792,7 @@ struct CpuMetadataSpecState {
 fn cpu_metadata_spec_summaries(
     specs: &BTreeMap<u32, CpuMetadataSpec>,
     records: &BTreeMap<u32, CpuMetadataRecord>,
-    totals: &BTreeMap<u32, (u64, u64)>,
+    totals: &FxHashMap<u32, (u64, u64)>,
 ) -> Vec<CpuMetadataSpecSummary> {
     let mut states = BTreeMap::<u32, CpuMetadataSpecState>::new();
 
@@ -8564,7 +9076,7 @@ fn flattened_metadata_values(values: &[MetadataValue]) -> Vec<&MetadataValue> {
     values.iter().collect()
 }
 
-fn decode_frame_marker(
+pub(super) fn decode_frame_marker(
     event: &EventTypeInfo,
     data: &[u8],
     base_offset: u64,
@@ -8583,7 +9095,7 @@ fn decode_cpu_batch(
     data: &[u8],
     specs: &BTreeMap<u32, CpuScopeSpec>,
     metadata: &BTreeMap<u32, CpuMetadataRecord>,
-    state: &mut CpuBatchDecodeState<'_>,
+    state: &mut CpuBatchDecodeState<'_, '_>,
 ) -> Result<(), TraceError> {
     state.batches.count += 1;
     let mut reader = VarintReader::new(data);
@@ -8668,26 +9180,41 @@ fn decode_cpu_batch(
                                     state,
                                 );
                             }
-                            record_cpu_frame_scope(spec_id, duration, metadata, state);
+                            record_cpu_frame_scope(
+                                spec_id,
+                                entry.start_cycle,
+                                cycle,
+                                duration,
+                                metadata,
+                                state,
+                            );
                             if let Some(timeline) = state.timeline.as_mut() {
-                                let name = specs
-                                    .get(&spec_id)
-                                    .map(|spec| spec.name.clone())
-                                    .unwrap_or_else(|| format!("#{spec_id}"));
                                 let active_frame =
                                     state.metadata_stack_context.active_frame_number(metadata);
-                                timeline.record(
-                                    state.thread_id,
-                                    spec_id,
-                                    name,
-                                    entry.start_cycle,
-                                    cycle,
-                                    duration,
-                                    None,
-                                    None,
-                                    state.cycle_frequency,
-                                    active_frame,
-                                );
+                                if timeline.note(entry.start_cycle, cycle, active_frame)
+                                    == SinkAppetite::WantsRecord
+                                {
+                                    let name = specs
+                                        .get(&spec_id)
+                                        .map(|spec| spec.name.clone())
+                                        .unwrap_or_else(|| format!("#{spec_id}"));
+                                    timeline.record(
+                                        CpuTimelineInterval {
+                                            thread_id: state.thread_id,
+                                            spec_id,
+                                            name,
+                                            start_cycle: entry.start_cycle,
+                                            end_cycle: cycle,
+                                            duration,
+                                            duration_seconds: state.cycle_frequency.map(
+                                                |frequency| duration as f64 / frequency as f64,
+                                            ),
+                                            metadata_id: None,
+                                            rendered_name: None,
+                                        },
+                                        active_frame,
+                                    );
+                                }
                             }
                         }
                         CpuStackEntryKind::Metadata {
@@ -8711,27 +9238,35 @@ fn decode_cpu_batch(
                                 state.metadata_interval_state,
                             );
                             if let Some(timeline) = state.timeline.as_mut() {
-                                let name = specs
-                                    .get(&spec_id)
-                                    .map(|spec| spec.name.clone())
-                                    .unwrap_or_else(|| format!("#{spec_id}"));
-                                let rendered = metadata
-                                    .get(&metadata_id)
-                                    .and_then(|record| record.rendered_name.clone());
                                 let active_frame =
                                     state.metadata_stack_context.active_frame_number(metadata);
-                                timeline.record(
-                                    state.thread_id,
-                                    spec_id,
-                                    name,
-                                    entry.start_cycle,
-                                    cycle,
-                                    duration,
-                                    Some(metadata_id),
-                                    rendered,
-                                    state.cycle_frequency,
-                                    active_frame,
-                                );
+                                if timeline.note(entry.start_cycle, cycle, active_frame)
+                                    == SinkAppetite::WantsRecord
+                                {
+                                    let name = specs
+                                        .get(&spec_id)
+                                        .map(|spec| spec.name.clone())
+                                        .unwrap_or_else(|| format!("#{spec_id}"));
+                                    let rendered = metadata
+                                        .get(&metadata_id)
+                                        .and_then(|record| record.rendered_name.clone());
+                                    timeline.record(
+                                        CpuTimelineInterval {
+                                            thread_id: state.thread_id,
+                                            spec_id,
+                                            name,
+                                            start_cycle: entry.start_cycle,
+                                            end_cycle: cycle,
+                                            duration,
+                                            duration_seconds: state.cycle_frequency.map(
+                                                |frequency| duration as f64 / frequency as f64,
+                                            ),
+                                            metadata_id: Some(metadata_id),
+                                            rendered_name: rendered,
+                                        },
+                                        active_frame,
+                                    );
+                                }
                             }
                             state.metadata_stack_context.leave_inline(metadata_id);
                         }
@@ -8851,7 +9386,7 @@ fn record_restored_cpu_metadata_scope(
     end_cycle: u64,
     duration: u64,
     metadata: &BTreeMap<u32, CpuMetadataRecord>,
-    state: &mut CpuBatchDecodeState<'_>,
+    state: &mut CpuBatchDecodeState<'_, '_>,
 ) {
     let Some(record) = metadata.get(&metadata_id) else {
         return;
@@ -8877,9 +9412,11 @@ fn record_restored_cpu_metadata_scope(
 
 fn record_cpu_frame_scope(
     spec_id: u32,
+    start_cycle: u64,
+    end_cycle: u64,
     duration: u64,
     metadata: &BTreeMap<u32, CpuMetadataRecord>,
-    state: &mut CpuBatchDecodeState<'_>,
+    state: &mut CpuBatchDecodeState<'_, '_>,
 ) {
     let Some(frame_number) = state.metadata_stack_context.active_frame_number(metadata) else {
         return;
@@ -8888,6 +9425,12 @@ fn record_cpu_frame_scope(
     let total = frame_totals.entry(spec_id).or_insert((0, 0));
     total.0 += 1;
     total.1 = total.1.saturating_add(duration);
+    let bounds = state
+        .frame_cycle_bounds
+        .entry(frame_number)
+        .or_insert((start_cycle, end_cycle));
+    bounds.0 = bounds.0.min(start_cycle);
+    bounds.1 = bounds.1.max(end_cycle);
 }
 
 fn suspend_cpu_coroutine_stack(
@@ -8947,7 +9490,7 @@ fn record_cpu_metadata_interval(
     }
 }
 
-fn decode_new_trace(
+pub(super) fn decode_new_trace(
     event: &EventTypeInfo,
     data: &[u8],
     base_offset: u64,
@@ -8961,7 +9504,7 @@ fn decode_new_trace(
     })
 }
 
-fn decode_thread_info(
+pub(super) fn decode_thread_info(
     event: &EventTypeInfo,
     data: &[u8],
     base_offset: u64,
@@ -9374,10 +9917,12 @@ impl<'a> VarintReader<'a> {
         Self { bytes, cursor: 0 }
     }
 
+    #[inline]
     fn is_empty(&self) -> bool {
         self.cursor >= self.bytes.len()
     }
 
+    #[inline]
     fn read_u64(&mut self) -> Result<u64, TraceError> {
         let start = self.cursor;
         let mut value = 0_u64;
@@ -10279,7 +10824,8 @@ mod tests {
 
         let dashboard = frame_correlation_dashboard(
             &cpu_metadata_scope_totals,
-            BTreeMap::new(),
+            FxHashMap::default(),
+            FxHashMap::default(),
             &BTreeMap::new(),
             &[],
             None,
@@ -10767,13 +11313,14 @@ mod tests {
         push_varint(&mut data, 80 << 2);
 
         let mut batches = CpuBatchSummary::default();
-        let mut scope_totals = BTreeMap::new();
-        let mut metadata_scope_totals = BTreeMap::new();
+        let mut scope_totals = FxHashMap::default();
+        let mut metadata_scope_totals = FxHashMap::default();
         let mut metadata_interval_state = CpuMetadataIntervalState::default();
         let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
         let mut thread_state = CpuBatchThreadState::default();
-        let mut frame_scope_totals = BTreeMap::new();
-        let mut thread_scope_totals = BTreeMap::new();
+        let mut frame_scope_totals = FxHashMap::default();
+        let mut frame_cycle_bounds = FxHashMap::default();
+        let mut thread_scope_totals = FxHashMap::default();
         let mut state = CpuBatchDecodeState {
             batches: &mut batches,
             scope_totals: &mut scope_totals,
@@ -10783,6 +11330,7 @@ mod tests {
             thread_state: &mut thread_state,
             batch_base_cycle: None,
             frame_scope_totals: &mut frame_scope_totals,
+            frame_cycle_bounds: &mut frame_cycle_bounds,
             thread_scope_totals: &mut thread_scope_totals,
             timeline: None,
             thread_id: 0,
@@ -10820,13 +11368,14 @@ mod tests {
         push_varint(&mut second_batch, 50 << 2);
 
         let mut batches = CpuBatchSummary::default();
-        let mut scope_totals = BTreeMap::new();
-        let mut metadata_scope_totals = BTreeMap::new();
+        let mut scope_totals = FxHashMap::default();
+        let mut metadata_scope_totals = FxHashMap::default();
         let mut metadata_interval_state = CpuMetadataIntervalState::default();
         let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
         let mut thread_state = CpuBatchThreadState::default();
-        let mut frame_scope_totals = BTreeMap::new();
-        let mut thread_scope_totals = BTreeMap::new();
+        let mut frame_scope_totals = FxHashMap::default();
+        let mut frame_cycle_bounds = FxHashMap::default();
+        let mut thread_scope_totals = FxHashMap::default();
 
         for batch in [&first_batch, &second_batch] {
             let mut state = CpuBatchDecodeState {
@@ -10838,6 +11387,7 @@ mod tests {
                 thread_state: &mut thread_state,
                 batch_base_cycle: None,
                 frame_scope_totals: &mut frame_scope_totals,
+                frame_cycle_bounds: &mut frame_cycle_bounds,
                 thread_scope_totals: &mut thread_scope_totals,
                 timeline: None,
                 thread_id: 0,
@@ -10873,13 +11423,14 @@ mod tests {
         push_varint(&mut data, 15 << 2);
 
         let mut batches = CpuBatchSummary::default();
-        let mut scope_totals = BTreeMap::new();
-        let mut metadata_scope_totals = BTreeMap::new();
+        let mut scope_totals = FxHashMap::default();
+        let mut metadata_scope_totals = FxHashMap::default();
         let mut metadata_interval_state = CpuMetadataIntervalState::default();
         let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
         let mut thread_state = CpuBatchThreadState::default();
-        let mut frame_scope_totals = BTreeMap::new();
-        let mut thread_scope_totals = BTreeMap::new();
+        let mut frame_scope_totals = FxHashMap::default();
+        let mut frame_cycle_bounds = FxHashMap::default();
+        let mut thread_scope_totals = FxHashMap::default();
         let mut state = CpuBatchDecodeState {
             batches: &mut batches,
             scope_totals: &mut scope_totals,
@@ -10889,6 +11440,7 @@ mod tests {
             thread_state: &mut thread_state,
             batch_base_cycle: Some(1_000),
             frame_scope_totals: &mut frame_scope_totals,
+            frame_cycle_bounds: &mut frame_cycle_bounds,
             thread_scope_totals: &mut thread_scope_totals,
             timeline: None,
             thread_id: 0,
@@ -10928,13 +11480,14 @@ mod tests {
         push_varint(&mut data, (5 * freq) << 2);
 
         let mut batches = CpuBatchSummary::default();
-        let mut scope_totals = BTreeMap::new();
-        let mut metadata_scope_totals = BTreeMap::new();
+        let mut scope_totals = FxHashMap::default();
+        let mut metadata_scope_totals = FxHashMap::default();
         let mut metadata_interval_state = CpuMetadataIntervalState::default();
         let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
         let mut thread_state = CpuBatchThreadState::default();
-        let mut frame_scope_totals = BTreeMap::new();
-        let mut thread_scope_totals = BTreeMap::new();
+        let mut frame_scope_totals = FxHashMap::default();
+        let mut frame_cycle_bounds = FxHashMap::default();
+        let mut thread_scope_totals = FxHashMap::default();
         let mut state = CpuBatchDecodeState {
             batches: &mut batches,
             scope_totals: &mut scope_totals,
@@ -10944,6 +11497,7 @@ mod tests {
             thread_state: &mut thread_state,
             batch_base_cycle: Some(base),
             frame_scope_totals: &mut frame_scope_totals,
+            frame_cycle_bounds: &mut frame_cycle_bounds,
             thread_scope_totals: &mut thread_scope_totals,
             timeline: None,
             thread_id: 0,
@@ -11012,13 +11566,14 @@ mod tests {
         push_varint(&mut data, 10 << 2);
 
         let mut batches = CpuBatchSummary::default();
-        let mut scope_totals = BTreeMap::new();
-        let mut metadata_scope_totals = BTreeMap::new();
+        let mut scope_totals = FxHashMap::default();
+        let mut metadata_scope_totals = FxHashMap::default();
         let mut metadata_interval_state = CpuMetadataIntervalState::default();
         let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
         let mut thread_state = CpuBatchThreadState::default();
-        let mut frame_scope_totals = BTreeMap::new();
-        let mut thread_scope_totals = BTreeMap::new();
+        let mut frame_scope_totals = FxHashMap::default();
+        let mut frame_cycle_bounds = FxHashMap::default();
+        let mut thread_scope_totals = FxHashMap::default();
         let mut state = CpuBatchDecodeState {
             batches: &mut batches,
             scope_totals: &mut scope_totals,
@@ -11028,6 +11583,7 @@ mod tests {
             thread_state: &mut thread_state,
             batch_base_cycle: Some(base),
             frame_scope_totals: &mut frame_scope_totals,
+            frame_cycle_bounds: &mut frame_cycle_bounds,
             thread_scope_totals: &mut thread_scope_totals,
             timeline: None,
             thread_id: 0,
@@ -11087,13 +11643,14 @@ mod tests {
         push_varint(&mut flush_aligned, 10 << 2);
 
         let mut batches = CpuBatchSummary::default();
-        let mut scope_totals = BTreeMap::new();
-        let mut metadata_scope_totals = BTreeMap::new();
+        let mut scope_totals = FxHashMap::default();
+        let mut metadata_scope_totals = FxHashMap::default();
         let mut metadata_interval_state = CpuMetadataIntervalState::default();
         let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
         let mut thread_state = CpuBatchThreadState::default();
-        let mut frame_scope_totals = BTreeMap::new();
-        let mut thread_scope_totals = BTreeMap::new();
+        let mut frame_scope_totals = FxHashMap::default();
+        let mut frame_cycle_bounds = FxHashMap::default();
+        let mut thread_scope_totals = FxHashMap::default();
         let mut state = CpuBatchDecodeState {
             batches: &mut batches,
             scope_totals: &mut scope_totals,
@@ -11103,6 +11660,7 @@ mod tests {
             thread_state: &mut thread_state,
             batch_base_cycle: Some(base),
             frame_scope_totals: &mut frame_scope_totals,
+            frame_cycle_bounds: &mut frame_cycle_bounds,
             thread_scope_totals: &mut thread_scope_totals,
             timeline: None,
             thread_id: 0,
@@ -11158,13 +11716,14 @@ mod tests {
         push_varint(&mut data, 200 << 2);
 
         let mut batches = CpuBatchSummary::default();
-        let mut scope_totals = BTreeMap::new();
-        let mut metadata_scope_totals = BTreeMap::new();
+        let mut scope_totals = FxHashMap::default();
+        let mut metadata_scope_totals = FxHashMap::default();
         let mut metadata_interval_state = CpuMetadataIntervalState::default();
         let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
         let mut thread_state = CpuBatchThreadState::default();
-        let mut frame_scope_totals = BTreeMap::new();
-        let mut thread_scope_totals = BTreeMap::new();
+        let mut frame_scope_totals = FxHashMap::default();
+        let mut frame_cycle_bounds = FxHashMap::default();
+        let mut thread_scope_totals = FxHashMap::default();
         let mut state = CpuBatchDecodeState {
             batches: &mut batches,
             scope_totals: &mut scope_totals,
@@ -11174,6 +11733,7 @@ mod tests {
             thread_state: &mut thread_state,
             batch_base_cycle: None,
             frame_scope_totals: &mut frame_scope_totals,
+            frame_cycle_bounds: &mut frame_cycle_bounds,
             thread_scope_totals: &mut thread_scope_totals,
             timeline: None,
             thread_id: 0,
@@ -11205,13 +11765,14 @@ mod tests {
         push_varint(&mut data, 50 << 2); // leave with empty stack
 
         let mut batches = CpuBatchSummary::default();
-        let mut scope_totals = BTreeMap::new();
-        let mut metadata_scope_totals = BTreeMap::new();
+        let mut scope_totals = FxHashMap::default();
+        let mut metadata_scope_totals = FxHashMap::default();
         let mut metadata_interval_state = CpuMetadataIntervalState::default();
         let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
         let mut thread_state = CpuBatchThreadState::default();
-        let mut frame_scope_totals = BTreeMap::new();
-        let mut thread_scope_totals = BTreeMap::new();
+        let mut frame_scope_totals = FxHashMap::default();
+        let mut frame_cycle_bounds = FxHashMap::default();
+        let mut thread_scope_totals = FxHashMap::default();
         let mut state = CpuBatchDecodeState {
             batches: &mut batches,
             scope_totals: &mut scope_totals,
@@ -11221,6 +11782,7 @@ mod tests {
             thread_state: &mut thread_state,
             batch_base_cycle: Some(1_000),
             frame_scope_totals: &mut frame_scope_totals,
+            frame_cycle_bounds: &mut frame_cycle_bounds,
             thread_scope_totals: &mut thread_scope_totals,
             timeline: None,
             thread_id: 0,
@@ -11310,12 +11872,13 @@ mod tests {
         push_varint(&mut data, 30 << 2);
 
         let mut batches = CpuBatchSummary::default();
-        let mut scope_totals = BTreeMap::new();
-        let mut metadata_scope_totals = BTreeMap::new();
+        let mut scope_totals = FxHashMap::default();
+        let mut metadata_scope_totals = FxHashMap::default();
         let mut metadata_interval_state = CpuMetadataIntervalState::default();
         let mut thread_state = CpuBatchThreadState::default();
-        let mut frame_scope_totals = BTreeMap::new();
-        let mut thread_scope_totals = BTreeMap::new();
+        let mut frame_scope_totals = FxHashMap::default();
+        let mut frame_cycle_bounds = FxHashMap::default();
+        let mut thread_scope_totals = FxHashMap::default();
         {
             let mut state = CpuBatchDecodeState {
                 batches: &mut batches,
@@ -11326,6 +11889,7 @@ mod tests {
                 thread_state: &mut thread_state,
                 batch_base_cycle: None,
                 frame_scope_totals: &mut frame_scope_totals,
+                frame_cycle_bounds: &mut frame_cycle_bounds,
                 thread_scope_totals: &mut thread_scope_totals,
                 timeline: None,
                 thread_id: 0,
@@ -11339,6 +11903,7 @@ mod tests {
         assert_eq!(batches.restored_metadata_scopes, 1);
         assert_eq!(scope_totals[&1], (1, 20));
         assert_eq!(frame_scope_totals[&366401][&1], (1, 20));
+        assert_eq!(frame_cycle_bounds[&366401], (10, 30));
         assert_eq!(metadata_scope_totals[&7], (1, 20));
         assert_eq!(
             metadata_interval_state.rendered_scope_totals[&(7, "Frame 366401".to_owned())],

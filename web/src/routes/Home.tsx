@@ -3,27 +3,24 @@ import { A } from "@solidjs/router";
 export default function Home() {
   return (
     <section class="hero-page">
-      <p class="eyebrow">Local Unreal file inspector</p>
+      <p class="eyebrow">Local file inspector</p>
       <h1 class="hero-title">
-        Drop a package.
-        <span>Read the wire.</span>
+        Unreal package and trace inspector.
       </h1>
       <p class="hero-lede">
-        Browser UI over the Rust <code>uasset</code> CLI — inspect classic{" "}
-        <code>.uasset</code> packages and summarize <code>.utrace</code> captures
-        without leaving the machine.
+        Inspect classic <code>.uasset</code> packages or summarize <code>.utrace</code>{" "}
+        captures using the local Rust parser.
       </p>
       <div class="hero-actions">
         <A class="btn primary" href="/uasset">
-          Open .uasset
+          Inspect .uasset
         </A>
         <A class="btn ghost" href="/utrace">
-          Open .utrace
+          Inspect .utrace
         </A>
       </div>
       <p class="hero-note">
-        Dev server posts uploads to a Vite middleware that shells out to{" "}
-        <code>target/*/uasset</code> (or <code>cargo run --features utrace</code>).
+        Files stay in this browser. Inspection runs in a dedicated WASM worker.
       </p>
     </section>
   );

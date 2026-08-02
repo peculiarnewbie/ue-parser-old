@@ -11,6 +11,9 @@ import type { CorrelatedFrameSummary } from "../lib/types";
 
 export type FrameRow = {
   frame_number: number;
+  frame_label: string;
+  elapsed_seconds?: number;
+  elapsed_label: string;
   cpu_s: number;
   gpu_work: number;
   gpu_breadcrumbs: number;
@@ -18,24 +21,41 @@ export type FrameRow = {
   spike: boolean;
 };
 
+export type FramePresentation = {
+  label: string;
+  elapsedSeconds?: number;
+  elapsedLabel: string;
+};
+
 type FrameBrowserProps = {
   frames: CorrelatedFrameSummary[];
   selectedFrame: number | null;
   onSelect: (frameNumber: number) => void;
+  presentFrame?: (frame: CorrelatedFrameSummary) => FramePresentation;
 };
 
-function toRows(frames: CorrelatedFrameSummary[]): FrameRow[] {
-  const costs = frames
+function toRows(input: {
+  frames: CorrelatedFrameSummary[];
+  presentFrame?: (frame: CorrelatedFrameSummary) => FramePresentation;
+}): FrameRow[] {
+  const costs = input.frames
     .map((frame) => frame.cpu_metadata_seconds ?? 0)
     .filter((value) => value > 0)
     .sort((a, b) => a - b);
   const p90 =
     costs.length === 0 ? Number.POSITIVE_INFINITY : costs[Math.floor(costs.length * 0.9)]!;
 
-  return frames.map((frame) => {
+  return input.frames.map((frame) => {
     const cpu_s = frame.cpu_metadata_seconds ?? 0;
+    const presentation = input.presentFrame?.(frame) ?? {
+      label: String(frame.frame_number),
+      elapsedLabel: "—",
+    };
     return {
       frame_number: frame.frame_number,
+      frame_label: presentation.label,
+      elapsed_seconds: presentation.elapsedSeconds,
+      elapsed_label: presentation.elapsedLabel,
       cpu_s,
       gpu_work: frame.gpu_work_cycles,
       gpu_breadcrumbs: frame.gpu_breadcrumb_cycles,
@@ -50,13 +70,20 @@ export function FrameBrowser(props: FrameBrowserProps) {
     { id: "cpu_s", desc: true },
   ]);
 
-  const data = createMemo(() => toRows(props.frames));
+  const data = createMemo(() =>
+    toRows({ frames: props.frames, presentFrame: props.presentFrame }),
+  );
 
   const columns = createMemo<ColumnDef<FrameRow>[]>(() => [
     {
       accessorKey: "frame_number",
       header: "Frame",
-      cell: (info) => info.getValue<number>(),
+      cell: (info) => info.row.original.frame_label,
+    },
+    {
+      accessorKey: "elapsed_seconds",
+      header: "Capture time",
+      cell: (info) => info.row.original.elapsed_label,
     },
     {
       accessorKey: "cpu_s",
@@ -101,11 +128,11 @@ export function FrameBrowser(props: FrameBrowserProps) {
     <section class="panel">
       <header class="datatable-head">
         <div>
-          <p class="eyebrow">Frame browser</p>
-          <h2>Pick a frame to inspect</h2>
+          <p class="eyebrow">Correlated CPU frames</p>
+          <h2>Pick a CPU frame to inspect</h2>
           <p class="muted datatable-meta">
             Sorted by CPU cost by default. Spikes (≥ p90) are marked. Click a row
-            to load that frame&apos;s CPU/GPU timeline (re-parses the trace).
+            to query that frame&apos;s CPU cycle window from the browser index.
           </p>
         </div>
       </header>
@@ -145,6 +172,7 @@ export function FrameBrowser(props: FrameBrowserProps) {
               {(row) => (
                 <tr
                   classList={{
+                    clickable: true,
                     selected: props.selectedFrame === row.original.frame_number,
                     spike: row.original.spike,
                   }}

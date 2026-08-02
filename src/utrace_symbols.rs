@@ -398,8 +398,12 @@ fn resolve_pdb_address(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utrace::{ModuleIdentity, SymbolFormat};
+    #[cfg(all(feature = "utrace-symbols", windows))]
+    use crate::utrace::ModuleIdentity;
+    use crate::utrace::SymbolFormat;
+    #[cfg(all(feature = "utrace-symbols", windows))]
     use std::path::PathBuf;
+    #[cfg(all(feature = "utrace-symbols", windows))]
     use std::process::Command;
 
     #[test]

@@ -1,10 +1,12 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import solid from "vite-plugin-solid";
-import { ueParserApiPlugin } from "./vite.parse-plugin.ts";
 
 export default defineConfig({
-  plugins: [solid(), ueParserApiPlugin()],
+  plugins: [solid()],
   server: {
     port: 5173,
+  },
+  test: {
+    environment: "node",
   },
 });

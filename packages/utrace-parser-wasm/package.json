@@ -1,0 +1,42 @@
+{
+  "name": "uasset-parser-utrace-wasm",
+  "version": "0.1.0",
+  "description": "Browser WebAssembly parser for Unreal Engine UTrace captures",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "unreal-engine",
+    "utrace",
+    "wasm",
+    "webassembly",
+    "parser",
+    "profiling"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "scripts": {
+    "build": "node ./scripts/build.mjs",
+    "check": "node ./scripts/check-package.mjs",
+    "prepack": "node ./scripts/prepack.mjs"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "npm@11.16.0"
+}

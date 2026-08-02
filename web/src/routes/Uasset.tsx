@@ -3,7 +3,8 @@ import { DropZone } from "../components/DropZone";
 import { DonutChart, HorizontalBars } from "../components/Charts";
 import { DataAssetView } from "../components/DataAssetView";
 import { DataTableView } from "../components/DataTableView";
-import { ParseRequestError, inspectUasset } from "../lib/api";
+import { ParseRequestError, formatParseTiming, type ParseTiming } from "../lib/api";
+import { parseWithWasm } from "../lib/wasm-worker-client";
 import { isDataAssetKind, isDataTableKind } from "../lib/datatable";
 import type { UassetInspect } from "../lib/types";
 
@@ -12,6 +13,7 @@ export default function UassetPage() {
   const [error, setError] = createSignal<string | null>(null);
   const [result, setResult] = createSignal<UassetInspect | null>(null);
   const [fileName, setFileName] = createSignal<string | null>(null);
+  const [timing, setTiming] = createSignal<ParseTiming | null>(null);
 
   const kindCounts = createMemo(() => {
     const assets = result()?.assets ?? [];
@@ -50,11 +52,17 @@ export default function UassetPage() {
     setBusy(true);
     setError(null);
     setFileName(file.name);
+    setTiming(null);
     try {
-      const inspect = await inspectUasset(file);
-      setResult(inspect);
+      const inspect = await parseWithWasm<UassetInspect>({
+        kind: "uasset-inspect",
+        file,
+      });
+      setResult(inspect.data);
+      setTiming(inspect.timing);
     } catch (err) {
       setResult(null);
+      setTiming(null);
       if (err instanceof ParseRequestError) {
         setError(err.body.stderr || err.message);
       } else {
@@ -71,8 +79,7 @@ export default function UassetPage() {
         <p class="eyebrow">Route /uasset</p>
         <h1>Package inspect</h1>
         <p class="lede">
-          Runs <code>uasset inspect --format json</code> on the dropped file.
-          Decoded DataTables and DataAssets open as inspectors below the drop
+          Runs package inspection in a browser worker. Decoded DataTables and DataAssets open as inspectors below the drop
           zone; package charts follow.
         </p>
       </header>
@@ -99,6 +106,13 @@ export default function UassetPage() {
               <span class={`pill status-${inspect.status}`}>{inspect.status}</span>
               <span class="mono">{fileName()}</span>
               <span class="muted">schema {inspect.schema_version}</span>
+              <Show when={timing()}>
+                {(value) => (
+                  <span class="pill timing-pill" title={formatParseTiming(value())}>
+                    {formatParseTiming(value())}
+                  </span>
+                )}
+              </Show>
             </div>
 
             <Show when={dataTables().length > 0}>

@@ -1,6 +1,8 @@
 //! Bounded aggregation for Unreal Memory trace events.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+
+use rustc_hash::FxHashMap;
 
 use crate::utrace::{
     CallstackResolution, MemoryAllocationDashboard, MemoryAllocationKind, MemoryAllocationSample,
@@ -106,7 +108,7 @@ pub(crate) struct MemoryProvider {
     bytes_allocated: u64,
     bytes_freed: u64,
     unresolved_free: u64,
-    outstanding: HashMap<u64, OutstandingAllocation>,
+    outstanding: FxHashMap<u64, OutstandingAllocation>,
     outstanding_overflow: bool,
     outstanding_dropped: u64,
     root_heaps: BTreeMap<u8, RootHeapTotals>,

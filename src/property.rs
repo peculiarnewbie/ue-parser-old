@@ -72,6 +72,12 @@ pub struct VectorValue {
     pub z: f32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntPointValue {
+    pub x: i32,
+    pub y: i32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MapEntry {
     pub key: PropertyValue,
@@ -90,6 +96,7 @@ pub enum PropertyValue {
     String(String),
     Text(TextValue),
     Vector(VectorValue),
+    IntPoint(IntPointValue),
     ObjectRef(PackageIndex),
     Guid(Guid),
     SoftObjectPath(String),

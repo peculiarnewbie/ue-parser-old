@@ -224,6 +224,7 @@ impl<'a> StatsVarintReader<'a> {
         self.cursor as u64
     }
 
+    #[inline]
     fn read_u64(&mut self) -> Result<u64, TraceError> {
         let start = self.cursor;
         let mut value = 0_u64;

@@ -172,10 +172,14 @@ gaps, in priority order:
 1. **Readable callstack depth** — module+offset and optional PDB names land on
    retained catalog stacks; still no capture-wide symbol index, DWARF backends,
    or Insights-parity UI for every dropped stack beyond the retain caps.
-2. **Capture-wide timeline queries** — support indexed arbitrary time ranges,
-   filtering, searching, zooming, and repeated frame navigation without
-   reparsing the full capture. Keep storage bounded or use a sidecar rather than
-   retaining an unbounded timeline in memory.
+2. **Capture-wide timeline queries** — **CPU first slice delivered**:
+   `utrace timeline index` writes a capped sidecar, and `utrace timeline query`
+   supports arbitrary inclusive cycle ranges, thread filtering, and
+   case-insensitive scope search without reparsing the trace. Correlated frame
+   rows now carry CPU bounds for direct indexed navigation, and the web
+   workbench caches the sidecar per uploaded capture. GPU remains aggregate-only
+   here because its timestamps are a separate clock domain; arbitrary GPU-range
+   queries and linked CPU↔GPU zoom remain open.
 3. **Task and wait causality** — TaskTrace waits and lifecycle counts decode;
    still missing subsequent-edge graphs and WaitForTasks CPU-scope overlap
    attribution on a live TaskTrace fixture.

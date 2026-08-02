@@ -1,66 +1,38 @@
-import type {
-  ParseErrorBody,
-  UassetInspect,
-  UtraceDashboard,
-  UtraceInventory,
-} from "./types";
+import type { ParseErrorBody } from "./types";
 
+/** A browser-side parse failure with the same readable shape as parser errors. */
 export class ParseRequestError extends Error {
   readonly status: number;
   readonly body: ParseErrorBody;
+  readonly timing: ParseTiming | null;
 
-  constructor(status: number, body: ParseErrorBody) {
+  constructor(status: number, body: ParseErrorBody, timing: ParseTiming | null = null) {
     super(body.stderr || body.error || `parse failed (${status})`);
     this.name = "ParseRequestError";
     this.status = status;
     this.body = body;
+    this.timing = timing;
   }
 }
 
-async function postFile<T>(
-  url: string,
-  file: File,
-  query?: Record<string, string | number | undefined>,
-): Promise<T> {
-  const params = new URLSearchParams();
-  if (query) {
-    for (const [key, value] of Object.entries(query)) {
-      if (value != null && value !== "") {
-        params.set(key, String(value));
-      }
-    }
-  }
-  const suffix = params.size > 0 ? `?${params}` : "";
-  const response = await fetch(`${url}${suffix}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/octet-stream",
-      "X-Filename": file.name,
-    },
-    body: file,
-  });
+/** Timing from the browser Worker and its Rust/WASM parser. */
+export type ParseTiming = {
+  backend: "wasm";
+  client_ms: number;
+  json_parse_ms: number;
+  input_read_ms?: number;
+  worker_startup_ms?: number;
+  wasm_copy_ms?: number;
+  parse_ms?: number;
+  worker_round_trip_ms?: number;
+};
 
-  const text = await response.text();
-  let json: unknown;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    throw new ParseRequestError(response.status, {
-      error: "non-json response from parse API",
-      stdout: text.slice(0, 2000),
-    });
-  }
-
-  if (!response.ok) {
-    throw new ParseRequestError(response.status, json as ParseErrorBody);
-  }
-
-  return json as T;
-}
-
-export function inspectUasset(file: File): Promise<UassetInspect> {
-  return postFile("/api/uasset/inspect", file);
-}
+export type TimedResult<T> = {
+  data: T;
+  timing: ParseTiming;
+  /** Identifies a retained progressive Worker session, not a file hash. */
+  sessionId?: string;
+};
 
 export type UtraceDashboardQuery = {
   max_frames?: number;
@@ -70,13 +42,30 @@ export type UtraceDashboardQuery = {
   gpu_timeline_limit?: number;
 };
 
-export function utraceDashboard(
-  file: File,
-  query?: UtraceDashboardQuery,
-): Promise<UtraceDashboard> {
-  return postFile("/api/utrace/dashboard", file, query);
+export function formatParseTiming(timing: ParseTiming): string {
+  const parts = [`browser ${formatMs(timing.client_ms)}`];
+  if (timing.input_read_ms != null && timing.input_read_ms > 1) {
+    parts.push(`read ${formatMs(timing.input_read_ms)}`);
+  }
+  if (timing.worker_startup_ms != null && timing.worker_startup_ms > 1) {
+    parts.push(`worker ${formatMs(timing.worker_startup_ms)}`);
+  }
+  if (timing.wasm_copy_ms != null && timing.wasm_copy_ms > 1) {
+    parts.push(`WASM copy ${formatMs(timing.wasm_copy_ms)}`);
+  }
+  if (timing.parse_ms != null && timing.parse_ms > 1) {
+    parts.push(`parse ${formatMs(timing.parse_ms)}`);
+  }
+  if (timing.worker_round_trip_ms != null && timing.worker_round_trip_ms > 1) {
+    parts.push(`worker round-trip ${formatMs(timing.worker_round_trip_ms)}`);
+  }
+  if (timing.json_parse_ms > 1) {
+    parts.push(`JSON ${formatMs(timing.json_parse_ms)}`);
+  }
+  return parts.join(" · ");
 }
 
-export function utraceInventory(file: File): Promise<UtraceInventory> {
-  return postFile("/api/utrace/inventory", file);
+function formatMs(value: number): string {
+  if (value < 1000) return `${Math.round(value)}ms`;
+  return `${(value / 1000).toFixed(2)}s`;
 }
