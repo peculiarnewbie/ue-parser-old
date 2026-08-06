@@ -18,7 +18,7 @@ use crate::utrace::{
     decode_new_event, decode_new_trace, decode_thread_info, decompress_lz4_into_stream,
     inventory_from_observations, parse_protocol5_normal_event, read_u32_field, read_u64_field,
 };
-use crate::utrace_dispatch::SerialDispatchPreparation;
+use crate::utrace_dispatch::{PreparedNormalEvents, SerialDispatchPreparation};
 use crate::utrace_progress::{
     DashboardBootstrap, DashboardPatch, DecodePhase, DecodeProgress, FrameTimingDashboard,
     ProgressiveFrameTiming,
@@ -97,6 +97,7 @@ pub struct ProgressiveDashboardSession {
     serial_dispatch_preparation: SerialDispatchPreparation,
     progressive_cpu_timeline: Option<ProgressiveCpuTimelineDecoder>,
     normal_scope_cycles: BTreeMap<u16, Vec<u64>>,
+    prepared_normal_events: PreparedNormalEvents,
 }
 
 impl ProgressiveDashboardSession {
@@ -140,6 +141,7 @@ impl ProgressiveDashboardSession {
             serial_dispatch_preparation: SerialDispatchPreparation::new(),
             progressive_cpu_timeline: eager_cpu_timeline.then(ProgressiveCpuTimelineDecoder::new),
             normal_scope_cycles: BTreeMap::new(),
+            prepared_normal_events: PreparedNormalEvents::default(),
         }
     }
 
@@ -378,6 +380,17 @@ impl ProgressiveDashboardSession {
                 "input ended in a partial packet",
             ));
         }
+        for (&thread_id, stream) in self.streams.iter().filter(|(thread_id, _)| **thread_id > 1) {
+            let cursor = self.normal_cursors.get(&thread_id).copied().unwrap_or(0);
+            if cursor != stream.len() {
+                return Err(TraceError::new(
+                    TraceErrorKind::MalformedData,
+                    u64::try_from(cursor).unwrap_or(u64::MAX),
+                    "Events.Data",
+                    "input ended in a partial or undeclared normal event",
+                ));
+            }
+        }
         self.summary.threads = self.threads.into_values().collect();
         self.summary.thread_count = self.summary.threads.len();
         let inventory_observations = InventoryObservations {
@@ -408,6 +421,7 @@ impl ProgressiveDashboardSession {
                 summary: self.summary,
                 streams: self.streams,
                 serial_dispatch_hint,
+                prepared_normal_events: Some(self.prepared_normal_events),
             },
             inventory_observations,
             progressive_cpu_timeline,
@@ -722,7 +736,17 @@ impl ProgressiveDashboardSession {
                 let mut data = needs_data
                     .then(|| stream[cursor + event.data_start..cursor + event.data_end].to_vec());
                 if event.has_aux {
+                    let mut aux_chain = 0_u32;
                     loop {
+                        aux_chain = aux_chain.saturating_add(1);
+                        if aux_chain > 64_000 {
+                            return Err(TraceError::new(
+                                TraceErrorKind::ResourceLimit,
+                                u64::try_from(cursor).unwrap_or(u64::MAX),
+                                "Events.Aux",
+                                "aux event chain exceeded 64000 events",
+                            ));
+                        }
                         let Ok(aux) =
                             parse_protocol5_normal_event(&mut reader, &self.bootstrap_registry)
                         else {
@@ -745,7 +769,14 @@ impl ProgressiveDashboardSession {
                                 }
                                 break;
                             }
-                            _ => {}
+                            uid => {
+                                return Err(TraceError::new(
+                                    TraceErrorKind::MalformedData,
+                                    u64::try_from(cursor + aux.offset).unwrap_or(u64::MAX),
+                                    "Events.Aux",
+                                    format!("expected AuxData/AuxDataTerminal, got uid {uid}"),
+                                ));
+                            }
                         }
                     }
                 }
@@ -793,6 +824,7 @@ impl ProgressiveDashboardSession {
             ) = parsed;
             self.normal_cursors.insert(thread_id, cursor + consumed);
             self.serial_dispatch_preparation.note(serial);
+            self.prepared_normal_events.record(thread_id, consumed)?;
             match scope_action {
                 Some(ProgressiveScopeAction::Push(cycle)) => self
                     .normal_scope_cycles
@@ -1297,6 +1329,23 @@ mod tests {
         assert_eq!(one_byte, expected);
         assert_eq!(irregular, expected);
         assert_eq!(packet_aligned, expected);
+    }
+
+    #[test]
+    fn progressive_prepared_dispatch_matches_final_stream_reparse() {
+        let bytes = trace_with_cpu_batch();
+        let options = DashboardOptions::default();
+        let mut session = ProgressiveDashboardSession::new(options);
+        for chunk in bytes.chunks(3) {
+            session.push_chunk(chunk).unwrap();
+        }
+        let (header, decoded, _, _) = session.finish_decoding().unwrap();
+        let prepared = dashboard_from_decoded(header.clone(), decoded.clone(), options).unwrap();
+        let mut reparsed_decoded = decoded;
+        reparsed_decoded.prepared_normal_events = None;
+        let reparsed = dashboard_from_decoded(header, reparsed_decoded, options).unwrap();
+
+        assert_eq!(prepared, reparsed);
     }
 
     #[test]
