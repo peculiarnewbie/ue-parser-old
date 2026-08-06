@@ -3747,6 +3747,7 @@ fn read_dashboard_events(
     let mut spec_by_id = BTreeMap::<u32, CpuScopeSpec>::new();
     let mut metadata_spec_by_id = BTreeMap::<u32, CpuMetadataSpec>::new();
     let mut metadata_by_id = FxHashMap::<u32, CpuMetadataRecord>::default();
+    let mut metadata_generation = 0_u64;
     let mut metadata_scope_totals = FxHashMap::<u32, (u64, u64)>::default();
     let mut metadata_interval_state = CpuMetadataIntervalState::default();
     let mut metadata_stack_contexts = FxHashMap::<u16, CpuMetadataStackRuntimeState>::default();
@@ -4090,6 +4091,7 @@ fn read_dashboard_events(
                     let mut record = decode_cpu_metadata_record(event, raw_event.data, 0)?;
                     enrich_cpu_metadata_record(&metadata_spec_by_id, &mut record);
                     metadata_by_id.insert(record.metadata_id, record);
+                    metadata_generation = metadata_generation.saturating_add(1);
                 }
                 DashboardEventKind::CpuProfilerEventBatchV3 => {
                     let Some(data) = read_aux_bytes(event, raw_event.data, "Data", 0)? else {
@@ -4112,6 +4114,7 @@ fn read_dashboard_events(
                         thread_id,
                         cycle_frequency,
                         known_scope_ids: known_scope_ids.as_deref(),
+                        metadata_generation,
                     };
                     decode_cpu_batch(&data, &spec_by_id, &metadata_by_id, &mut batch_state)?;
                     cpu_timeline_sink = batch_state.timeline.take();
@@ -6591,6 +6594,8 @@ struct MetadataStackState {
 struct CpuMetadataStackRuntimeState {
     active: Vec<CpuMetadataStackEntry>,
     saved_stacks: BTreeMap<u32, Vec<u32>>,
+    stack_revision: u64,
+    active_frame_cache: Option<(u64, u64, Option<u32>)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6627,7 +6632,10 @@ fn apply_metadata_stack_event_to_cpu_context(
     base_offset: u64,
 ) -> Result<(), TraceError> {
     match event.event.as_str() {
-        "ClearScope" => state.active.clear(),
+        "ClearScope" => {
+            state.active.clear();
+            state.stack_changed();
+        }
         "SaveStack" => {
             let id = read_u32_field(event, data, "Id", base_offset)?;
             state.saved_stacks.insert(
@@ -6647,6 +6655,7 @@ fn apply_metadata_stack_event_to_cpu_context(
                     restored: true,
                 })
                 .collect();
+            state.stack_changed();
         }
         _ => {}
     }
@@ -6654,11 +6663,17 @@ fn apply_metadata_stack_event_to_cpu_context(
 }
 
 impl CpuMetadataStackRuntimeState {
+    fn stack_changed(&mut self) {
+        self.stack_revision = self.stack_revision.saturating_add(1);
+        self.active_frame_cache = None;
+    }
+
     fn enter_inline(&mut self, metadata_id: u32) {
         self.active.push(CpuMetadataStackEntry {
             metadata_id,
             restored: false,
         });
+        self.stack_changed();
     }
 
     fn leave_inline(&mut self, metadata_id: u32) {
@@ -6670,6 +6685,7 @@ impl CpuMetadataStackRuntimeState {
             return;
         };
         self.active.remove(index);
+        self.stack_changed();
     }
 
     fn restored_metadata_id(&self) -> Option<u32> {
@@ -6680,13 +6696,25 @@ impl CpuMetadataStackRuntimeState {
             .map(|entry| entry.metadata_id)
     }
 
-    fn active_frame_number(&self, metadata: &FxHashMap<u32, CpuMetadataRecord>) -> Option<u32> {
-        self.active.iter().rev().find_map(|entry| {
+    fn active_frame_number(
+        &mut self,
+        metadata: &FxHashMap<u32, CpuMetadataRecord>,
+        metadata_generation: u64,
+    ) -> Option<u32> {
+        if let Some((cached_generation, cached_revision, frame_number)) = self.active_frame_cache
+            && cached_generation == metadata_generation
+            && cached_revision == self.stack_revision
+        {
+            return frame_number;
+        }
+        let frame_number = self.active.iter().rev().find_map(|entry| {
             metadata
                 .get(&entry.metadata_id)
                 .and_then(|record| record.rendered_name.as_deref())
                 .and_then(parse_rendered_frame_number)
-        })
+        });
+        self.active_frame_cache = Some((metadata_generation, self.stack_revision, frame_number));
+        frame_number
     }
 }
 
@@ -8341,6 +8369,7 @@ struct CpuBatchDecodeState<'a, 'timeline> {
     thread_id: u16,
     cycle_frequency: Option<u64>,
     known_scope_ids: Option<&'a [bool]>,
+    metadata_generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -9231,8 +9260,9 @@ fn decode_cpu_batch(
                                 state,
                             );
                             if let Some(timeline) = state.timeline.as_mut() {
-                                let active_frame =
-                                    state.metadata_stack_context.active_frame_number(metadata);
+                                let active_frame = state
+                                    .metadata_stack_context
+                                    .active_frame_number(metadata, state.metadata_generation);
                                 if timeline.note(entry.start_cycle, cycle, active_frame)
                                     == SinkAppetite::WantsRecord
                                 {
@@ -9280,8 +9310,9 @@ fn decode_cpu_batch(
                                 state.metadata_interval_state,
                             );
                             if let Some(timeline) = state.timeline.as_mut() {
-                                let active_frame =
-                                    state.metadata_stack_context.active_frame_number(metadata);
+                                let active_frame = state
+                                    .metadata_stack_context
+                                    .active_frame_number(metadata, state.metadata_generation);
                                 if timeline.note(entry.start_cycle, cycle, active_frame)
                                     == SinkAppetite::WantsRecord
                                 {
@@ -9465,7 +9496,10 @@ fn record_cpu_frame_scope(
     metadata: &FxHashMap<u32, CpuMetadataRecord>,
     state: &mut CpuBatchDecodeState<'_, '_>,
 ) {
-    let Some(frame_number) = state.metadata_stack_context.active_frame_number(metadata) else {
+    let Some(frame_number) = state
+        .metadata_stack_context
+        .active_frame_number(metadata, state.metadata_generation)
+    else {
         return;
     };
     let frame_totals = state.frame_scope_totals.entry(frame_number).or_default();
@@ -11439,6 +11473,35 @@ mod tests {
     }
 
     #[test]
+    fn active_frame_cache_tracks_stack_and_metadata_generations() {
+        let mut context = CpuMetadataStackRuntimeState::default();
+        let mut metadata = FxHashMap::default();
+        context.enter_inline(42);
+
+        assert_eq!(context.active_frame_number(&metadata, 0), None);
+        metadata.insert(
+            42,
+            CpuMetadataRecord {
+                metadata_id: 42,
+                spec_id: 7,
+                name: "Frame".to_owned(),
+                rendered_name: Some("Frame 366401".to_owned()),
+                metadata_bytes: 0,
+                decoded_metadata_bytes: 0,
+                skipped_metadata_bytes: 0,
+                decode_failed: false,
+                values: Vec::new(),
+                strings: Vec::new(),
+            },
+        );
+        assert_eq!(context.active_frame_number(&metadata, 1), Some(366401));
+        assert_eq!(context.active_frame_number(&metadata, 1), Some(366401));
+
+        context.leave_inline(42);
+        assert_eq!(context.active_frame_number(&metadata, 1), None);
+    }
+
+    #[test]
     fn restores_cpu_coroutine_scopes_across_suspend_resume() {
         let specs = [
             (
@@ -11503,6 +11566,7 @@ mod tests {
             thread_id: 0,
             cycle_frequency: None,
             known_scope_ids: None,
+            metadata_generation: 0,
         };
 
         decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
@@ -11561,6 +11625,7 @@ mod tests {
                 thread_id: 0,
                 cycle_frequency: None,
                 known_scope_ids: None,
+                metadata_generation: 0,
             };
             decode_cpu_batch(batch, &specs, &FxHashMap::default(), &mut state).unwrap();
         }
@@ -11615,6 +11680,7 @@ mod tests {
             thread_id: 0,
             cycle_frequency: None,
             known_scope_ids: None,
+            metadata_generation: 0,
         };
 
         decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
@@ -11673,6 +11739,7 @@ mod tests {
             thread_id: 0,
             cycle_frequency: Some(freq),
             known_scope_ids: None,
+            metadata_generation: 0,
         };
 
         decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
@@ -11760,6 +11827,7 @@ mod tests {
             thread_id: 0,
             cycle_frequency: Some(freq),
             known_scope_ids: None,
+            metadata_generation: 0,
         };
 
         decode_cpu_batch(&data, &specs, &metadata, &mut state).unwrap();
@@ -11838,6 +11906,7 @@ mod tests {
             thread_id: 0,
             cycle_frequency: Some(freq),
             known_scope_ids: None,
+            metadata_generation: 0,
         };
 
         decode_cpu_batch(&preamble, &specs, &FxHashMap::default(), &mut state).unwrap();
@@ -11912,6 +11981,7 @@ mod tests {
             thread_id: 0,
             cycle_frequency: None,
             known_scope_ids: None,
+            metadata_generation: 0,
         };
 
         decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
@@ -11962,6 +12032,7 @@ mod tests {
             thread_id: 0,
             cycle_frequency: None,
             known_scope_ids: None,
+            metadata_generation: 0,
         };
 
         decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
@@ -12070,6 +12141,7 @@ mod tests {
                 thread_id: 0,
                 cycle_frequency: None,
                 known_scope_ids: None,
+                metadata_generation: 0,
             };
 
             decode_cpu_batch(&data, &specs, &metadata, &mut state).unwrap();
