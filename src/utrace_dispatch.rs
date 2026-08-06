@@ -135,223 +135,6 @@ struct ThreadCursor<'a> {
     scope_cycles: Vec<u64>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct PreparedNormalEvents {
-    threads: BTreeMap<u16, PreparedThreadEvents>,
-}
-
-/// Columnar event boundaries captured by the progressive parser.
-///
-/// The retained thread stream remains the source of truth for UIDs and serials.
-/// A sequential cursor only needs each complete event's wire length to skip its
-/// payload and auxiliary chain without framing those bytes a second time.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct PreparedThreadEvents {
-    wire_lengths: Vec<u16>,
-    overflow_event_indices: Vec<u32>,
-    overflow_wire_lengths: Vec<u32>,
-}
-
-impl PreparedNormalEvents {
-    pub(crate) fn record(&mut self, thread_id: u16, wire_length: usize) -> Result<(), TraceError> {
-        let wire_length = u32::try_from(wire_length).map_err(|_| {
-            TraceError::new(
-                TraceErrorKind::ResourceLimit,
-                u64::try_from(wire_length).unwrap_or(u64::MAX),
-                "Events.Data",
-                "normal event wire length exceeds u32",
-            )
-        })?;
-        if wire_length == 0 {
-            return Err(TraceError::new(
-                TraceErrorKind::MalformedData,
-                0,
-                "Events.Data",
-                "normal event wire length is zero",
-            ));
-        }
-        let thread = self.threads.entry(thread_id).or_default();
-        let event_index = u32::try_from(thread.wire_lengths.len()).map_err(|_| {
-            TraceError::new(
-                TraceErrorKind::ResourceLimit,
-                u64::try_from(thread.wire_lengths.len()).unwrap_or(u64::MAX),
-                "Events.Data",
-                "normal event count exceeds u32",
-            )
-        })?;
-        if let Ok(wire_length) = u16::try_from(wire_length) {
-            thread.wire_lengths.push(wire_length);
-        } else {
-            thread.wire_lengths.push(0);
-            thread.overflow_event_indices.push(event_index);
-            thread.overflow_wire_lengths.push(wire_length);
-        }
-        Ok(())
-    }
-}
-
-enum DispatchThreadCursor<'a> {
-    Parsed(ThreadCursor<'a>),
-    Prepared {
-        stream: &'a [u8],
-        events: &'a PreparedThreadEvents,
-        index: usize,
-        stream_offset: u32,
-        overflow_index: usize,
-        scope_cycles: Vec<u64>,
-    },
-}
-
-impl<'a> DispatchThreadCursor<'a> {
-    fn stream(&self) -> &'a [u8] {
-        match self {
-            Self::Parsed(cursor) => cursor.stream,
-            Self::Prepared { stream, .. } => stream,
-        }
-    }
-
-    fn next_event(
-        &mut self,
-        layouts: &[Option<NormalEventLayout>],
-    ) -> Result<Option<ThreadEvent>, TraceError> {
-        match self {
-            Self::Parsed(cursor) => cursor.next_event(layouts),
-            Self::Prepared {
-                stream,
-                events,
-                index,
-                stream_offset,
-                overflow_index,
-                scope_cycles,
-            } => loop {
-                let Some(&encoded_wire_length) = events.wire_lengths.get(*index) else {
-                    if usize::try_from(*stream_offset).unwrap() != stream.len() {
-                        return Err(TraceError::new(
-                            TraceErrorKind::MalformedData,
-                            u64::from(*stream_offset),
-                            "Events.Data",
-                            "prepared normal events do not cover the thread stream",
-                        ));
-                    }
-                    return Ok(None);
-                };
-                let wire_length = match encoded_wire_length {
-                    0 => {
-                        let Some(&overflow_event_index) =
-                            events.overflow_event_indices.get(*overflow_index)
-                        else {
-                            return Err(invalid_prepared_events(*stream_offset));
-                        };
-                        if usize::try_from(overflow_event_index).unwrap() != *index {
-                            return Err(invalid_prepared_events(*stream_offset));
-                        }
-                        let Some(&wire_length) = events.overflow_wire_lengths.get(*overflow_index)
-                        else {
-                            return Err(invalid_prepared_events(*stream_offset));
-                        };
-                        *overflow_index += 1;
-                        wire_length
-                    }
-                    wire_length => u32::from(wire_length),
-                };
-                let event_start = *stream_offset;
-                let data_end = event_start.checked_add(wire_length).ok_or_else(|| {
-                    TraceError::new(
-                        TraceErrorKind::ResourceLimit,
-                        u64::from(event_start),
-                        "Events.Data",
-                        "prepared normal event end overflow",
-                    )
-                })?;
-                let event_start_usize = usize::try_from(event_start).unwrap();
-                let Some(&first) = stream.get(event_start_usize) else {
-                    return Err(invalid_prepared_events(event_start));
-                };
-                let (uid, uid_size) = if first & 1 != 0 {
-                    let Some(&second) = stream.get(event_start_usize + 1) else {
-                        return Err(invalid_prepared_events(event_start));
-                    };
-                    ((u16::from(first) | (u16::from(second) << 8)) >> 1, 2)
-                } else {
-                    (u16::from(first) >> 1, 1)
-                };
-                let synced = if uid < 16 {
-                    false
-                } else {
-                    let Some(layout) = layouts.get(usize::from(uid)).copied().flatten() else {
-                        return Err(TraceError::new(
-                            TraceErrorKind::MalformedData,
-                            u64::from(event_start),
-                            "Events.Uid",
-                            format!("unknown event uid {uid} in prepared normal stream"),
-                        ));
-                    };
-                    !layout.no_sync
-                };
-                let serial = if synced {
-                    let serial_start = event_start_usize + uid_size;
-                    let Some(bytes) = stream.get(serial_start..serial_start + 3) else {
-                        return Err(invalid_prepared_events(event_start));
-                    };
-                    Some(TraceSerial(
-                        u32::from(bytes[0])
-                            | (u32::from(bytes[1]) << 8)
-                            | (u32::from(bytes[2]) << 16),
-                    ))
-                } else {
-                    None
-                };
-                let header_size = if uid == 1 {
-                    4
-                } else {
-                    uid_size + usize::from(synced) * 3
-                };
-                let data_start = event_start
-                    .checked_add(u32::try_from(header_size).unwrap())
-                    .ok_or_else(|| invalid_prepared_events(event_start))?;
-                if data_start > data_end || usize::try_from(data_end).unwrap() > stream.len() {
-                    return Err(invalid_prepared_events(event_start));
-                }
-                let data = &stream
-                    [usize::try_from(data_start).unwrap()..usize::try_from(data_end).unwrap()];
-                match uid {
-                    6 | 8 => {
-                        if let Some(cycle) = decode_known_scope_cycle(uid, data) {
-                            scope_cycles.push(cycle);
-                        }
-                    }
-                    7 | 9 => {
-                        scope_cycles.pop();
-                    }
-                    _ => {}
-                }
-                let scope_cycle = (uid >= 16).then(|| scope_cycles.last().copied()).flatten();
-                *stream_offset = data_end;
-                *index += 1;
-                if uid == 3 {
-                    continue;
-                }
-                return Ok(Some(ThreadEvent {
-                    uid,
-                    data_start,
-                    data_end,
-                    scope_cycle,
-                    serial,
-                }));
-            },
-        }
-    }
-}
-
-fn invalid_prepared_events(offset: u32) -> TraceError {
-    TraceError::new(
-        TraceErrorKind::MalformedData,
-        u64::from(offset),
-        "Events.Data",
-        "prepared normal event columns are inconsistent",
-    )
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DispatchedNormalEventView<'a> {
     pub thread_id: u16,
@@ -532,7 +315,7 @@ pub(crate) fn dispatch_normal_events_with<'a>(
     sync_count: u64,
     visit: impl FnMut(DispatchedNormalEventView<'a>) -> Result<(), TraceError>,
 ) -> Result<SerialDispatchSummary, TraceError> {
-    dispatch_normal_events_with_hint(streams, registry, sync_count, None, None, visit)
+    dispatch_normal_events_with_hint(streams, registry, sync_count, None, visit)
 }
 
 pub(crate) fn dispatch_normal_events_with_hint<'a>(
@@ -540,7 +323,6 @@ pub(crate) fn dispatch_normal_events_with_hint<'a>(
     registry: &BTreeMap<u16, &EventTypeInfo>,
     sync_count: u64,
     preparation: Option<SerialDispatchHint>,
-    prepared: Option<&'a PreparedNormalEvents>,
     mut visit: impl FnMut(DispatchedNormalEventView<'a>) -> Result<(), TraceError>,
 ) -> Result<SerialDispatchSummary, TraceError> {
     let layouts = normal_event_layouts(registry);
@@ -558,20 +340,7 @@ pub(crate) fn dispatch_normal_events_with_hint<'a>(
             continue;
         }
         thread_ids.push(*thread_id);
-        cursors.push(
-            if let Some(events) = prepared.and_then(|prepared| prepared.threads.get(thread_id)) {
-                DispatchThreadCursor::Prepared {
-                    stream,
-                    events,
-                    index: 0,
-                    stream_offset: 0,
-                    overflow_index: 0,
-                    scope_cycles: Vec::new(),
-                }
-            } else {
-                DispatchThreadCursor::Parsed(ThreadCursor::new(stream))
-            },
-        );
+        cursors.push(ThreadCursor::new(stream));
     }
     let mut pending = cursors
         .iter_mut()
@@ -590,7 +359,7 @@ pub(crate) fn dispatch_normal_events_with_hint<'a>(
                 .take()
                 .expect("pending event was checked");
             visit_taken(
-                cursors[thread_index].stream(),
+                cursors[thread_index].stream,
                 &mut visit,
                 &mut summary,
                 thread_ids[thread_index],
@@ -640,7 +409,7 @@ pub(crate) fn dispatch_normal_events_with_hint<'a>(
                     last_observed_serial = Some(serial.raw());
                     pending[thread_index] = None;
                     visit_taken(
-                        cursors[thread_index].stream(),
+                        cursors[thread_index].stream,
                         &mut visit,
                         &mut summary,
                         thread_ids[thread_index],
@@ -653,7 +422,7 @@ pub(crate) fn dispatch_normal_events_with_hint<'a>(
                 None => {
                     pending[thread_index] = None;
                     visit_taken(
-                        cursors[thread_index].stream(),
+                        cursors[thread_index].stream,
                         &mut visit,
                         &mut summary,
                         thread_ids[thread_index],
@@ -1167,7 +936,7 @@ mod tests {
         let hint = preparation.finish().unwrap();
         let mut prepared = Vec::new();
         let prepared_summary =
-            dispatch_normal_events_with_hint(&streams, &registry, 3, Some(hint), None, |event| {
+            dispatch_normal_events_with_hint(&streams, &registry, 3, Some(hint), |event| {
                 prepared.push((
                     event.thread_id,
                     event.uid,
@@ -1191,112 +960,6 @@ mod tests {
 
         assert_eq!(prepared, offline);
         assert_eq!(prepared_summary, offline_summary);
-    }
-
-    #[test]
-    fn prepared_columns_match_parsed_dispatch_with_scopes_aux_and_skips() {
-        let events = [
-            synced_event_with_aux(70, "SyncedAux"),
-            no_sync_event(18, "ScopedNoSync"),
-        ];
-        let registry = events
-            .iter()
-            .map(|event| (event.uid, event))
-            .collect::<BTreeMap<_, _>>();
-
-        let mut stream_5 = Vec::new();
-        let scope_start = stream_5.len();
-        stream_5.extend(encode_uid(6));
-        stream_5.extend_from_slice(&1234_u64.to_le_bytes());
-        let scope_length = stream_5.len() - scope_start;
-        let unsynced_start = stream_5.len();
-        push_unsynced(&mut stream_5, 18, 0x33);
-        let unsynced_length = stream_5.len() - unsynced_start;
-        let skipped_start = stream_5.len();
-        stream_5.extend(encode_uid(3));
-        let skipped_length = stream_5.len() - skipped_start;
-        let pop_start = stream_5.len();
-        stream_5.extend(encode_uid(7));
-        stream_5.extend_from_slice(&[0; 8]);
-        let pop_length = stream_5.len() - pop_start;
-        let synced_start = stream_5.len();
-        push_synced_with_aux(&mut stream_5, 70, 9, 0x44, &[0xaa, 0xbb]);
-        let synced_length = stream_5.len() - synced_start;
-
-        let streams = [(5_u16, stream_5)].into_iter().collect::<BTreeMap<_, _>>();
-        let mut prepared_events = PreparedNormalEvents::default();
-        prepared_events.record(5, scope_length).unwrap();
-        prepared_events.record(5, unsynced_length).unwrap();
-        prepared_events.record(5, skipped_length).unwrap();
-        prepared_events.record(5, pop_length).unwrap();
-        prepared_events.record(5, synced_length).unwrap();
-        let mut preparation = SerialDispatchPreparation::new();
-        preparation.note(Some(9));
-        let hint = preparation.finish().unwrap();
-
-        let collect = |prepared: Option<&PreparedNormalEvents>| {
-            let mut dispatched = Vec::new();
-            let summary = dispatch_normal_events_with_hint(
-                &streams,
-                &registry,
-                3,
-                Some(hint),
-                prepared,
-                |event| {
-                    dispatched.push((
-                        event.thread_id,
-                        event.uid,
-                        event.data.to_vec(),
-                        event.scope_cycle,
-                        event.serial.map(TraceSerial::raw),
-                    ));
-                    Ok(())
-                },
-            )
-            .unwrap();
-            (dispatched, summary)
-        };
-        let parsed = collect(None);
-        let prepared = collect(Some(&prepared_events));
-
-        assert_eq!(prepared, parsed);
-        assert_eq!(prepared.0[1].1, 18);
-        assert_eq!(prepared.0[1].3, Some(1234));
-        assert_eq!(prepared.0.last().unwrap().1, 70);
-        assert_eq!(prepared.0.last().unwrap().2[1], 2);
-    }
-
-    #[test]
-    fn prepared_columns_support_overflow_wire_lengths() {
-        let mut event = synced_event(16, "Large");
-        event.fields[0].size = u16::MAX;
-        let registry = [(event.uid, &event)]
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
-        let mut stream = Vec::new();
-        stream.extend(encode_uid(16));
-        stream.extend_from_slice(&1_u32.to_le_bytes()[..3]);
-        stream.resize(stream.len() + usize::from(u16::MAX), 0xaa);
-        let streams = [(5_u16, stream)].into_iter().collect::<BTreeMap<_, _>>();
-        let mut prepared = PreparedNormalEvents::default();
-        prepared.record(5, streams[&5].len()).unwrap();
-        let mut preparation = SerialDispatchPreparation::new();
-        preparation.note(Some(1));
-
-        let mut lengths = Vec::new();
-        dispatch_normal_events_with_hint(
-            &streams,
-            &registry,
-            3,
-            Some(preparation.finish().unwrap()),
-            Some(&prepared),
-            |event| {
-                lengths.push(event.data.len());
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(lengths, vec![usize::from(u16::MAX)]);
     }
 
     #[test]

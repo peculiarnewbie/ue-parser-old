@@ -1780,7 +1780,6 @@ pub(super) struct DecodedStreams {
     pub(super) summary: PacketSummary,
     pub(super) streams: BTreeMap<u16, Vec<u8>>,
     pub(super) serial_dispatch_hint: Option<crate::utrace_dispatch::SerialDispatchHint>,
-    pub(super) prepared_normal_events: Option<crate::utrace_dispatch::PreparedNormalEvents>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3158,7 +3157,6 @@ fn read_packets(reader: &mut Reader<'_>) -> Result<DecodedStreams, TraceError> {
         summary,
         streams,
         serial_dispatch_hint: None,
-        prepared_normal_events: None,
     })
 }
 
@@ -3541,11 +3539,7 @@ fn dashboard_from_decoded_with_timeline_builder(
             &events,
             &decoded_importants,
             decoded.summary.sync_count,
-            DashboardDecodeOptions::full(
-                options,
-                decoded.serial_dispatch_hint,
-                decoded.prepared_normal_events.as_ref(),
-            ),
+            DashboardDecodeOptions::full(options, decoded.serial_dispatch_hint),
             DashboardTimelineSinks {
                 cpu: cpu_timeline_sink
                     .as_mut()
@@ -3679,24 +3673,21 @@ enum DashboardDecodeScope {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct DashboardDecodeOptions<'a> {
+struct DashboardDecodeOptions {
     dashboard: DashboardOptions,
     scope: DashboardDecodeScope,
     serial_dispatch_hint: Option<crate::utrace_dispatch::SerialDispatchHint>,
-    prepared_normal_events: Option<&'a crate::utrace_dispatch::PreparedNormalEvents>,
 }
 
-impl<'a> DashboardDecodeOptions<'a> {
+impl DashboardDecodeOptions {
     const fn full(
         dashboard: DashboardOptions,
         serial_dispatch_hint: Option<crate::utrace_dispatch::SerialDispatchHint>,
-        prepared_normal_events: Option<&'a crate::utrace_dispatch::PreparedNormalEvents>,
     ) -> Self {
         Self {
             dashboard,
             scope: DashboardDecodeScope::Full,
             serial_dispatch_hint,
-            prepared_normal_events,
         }
     }
 
@@ -3707,7 +3698,6 @@ impl<'a> DashboardDecodeOptions<'a> {
             dashboard: DashboardOptions::default(),
             scope: DashboardDecodeScope::CpuTimelineOnly,
             serial_dispatch_hint,
-            prepared_normal_events: None,
         }
     }
 }
@@ -3895,7 +3885,7 @@ fn read_dashboard_events(
     events: &[EventTypeInfo],
     importants: &DecodedImportantEvents,
     sync_count: u64,
-    decode_options: DashboardDecodeOptions<'_>,
+    decode_options: DashboardDecodeOptions,
     timeline_sinks: DashboardTimelineSinks<'_>,
 ) -> Result<DecodedDashboardEvents, TraceError> {
     if header.protocol < 5 {
@@ -4251,7 +4241,6 @@ fn read_dashboard_events(
         &registry,
         sync_count,
         decode_options.serial_dispatch_hint,
-        decode_options.prepared_normal_events,
         |raw_event| {
             let thread_id = raw_event.thread_id;
             let Some(event) = events_by_uid
