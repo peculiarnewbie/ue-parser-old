@@ -1,8 +1,8 @@
 #[cfg(feature = "utrace")]
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .expect("usage: utrace_memory_probe <trace> [dashboard|inventory|index|verify-inventory]");
+    let path = std::env::args().nth(1).expect(
+        "usage: utrace_memory_probe <trace> [dashboard|inventory|index|monotonic|verify-inventory]",
+    );
     let mode = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "index".to_owned());
@@ -49,6 +49,58 @@ fn main() {
             "progressive inventory changed the contract"
         );
         println!("mode=verify-inventory equal=true");
+        return;
+    }
+    if mode == "monotonic" {
+        let (dashboard, _, index, _) = session
+            .finish_with_inventory_and_monotonic_timeline_index()
+            .expect("finish dashboard with monotonic timeline index");
+        let finish_elapsed = finish_started.elapsed();
+        let decode_elapsed = decode_started.elapsed();
+        let stats = index.stats();
+        println!(
+            "mode=monotonic decode_ms={} push_ms={} finish_ms={} threads={} pages={} entries={} begins={} completed={} events={} payload_bytes={} uncompressed_payload_bytes={} allocated_bytes={} column_allocated_bytes={} page_allocated_bytes={} catalog_allocated_bytes={} bytes_per_begin={}",
+            decode_elapsed.as_millis(),
+            push_elapsed.as_millis(),
+            finish_elapsed.as_millis(),
+            stats.thread_count,
+            stats.page_count,
+            stats.entry_count,
+            stats.begin_count,
+            stats.completed_scope_count,
+            stats.event_count,
+            stats.payload_bytes,
+            stats.uncompressed_payload_bytes,
+            stats.allocated_bytes,
+            stats.column_allocated_bytes,
+            stats.page_allocated_bytes,
+            stats.catalog_allocated_bytes,
+            stats.bytes_per_begin,
+        );
+        if let Some((frame, begin_cycle, end_cycle)) = dashboard
+            .frame_correlation
+            .frames
+            .iter()
+            .find_map(|frame| Some((frame, frame.cpu_begin_cycle?, frame.cpu_end_cycle?)))
+        {
+            let query_started = std::time::Instant::now();
+            let timeline = index
+                .query(&utrace_parser::utrace::CpuTimelineQuery {
+                    start_cycle: Some(begin_cycle),
+                    end_cycle: Some(end_cycle),
+                    limit: Some(2_500),
+                    ..utrace_parser::utrace::CpuTimelineQuery::default()
+                })
+                .expect("query monotonic timeline");
+            println!(
+                "cpu_frame={} cpu_intervals={} cpu_returned={} cpu_truncated={} query_us={}",
+                frame.frame_number,
+                timeline.interval_count,
+                timeline.intervals.len(),
+                timeline.truncated,
+                query_started.elapsed().as_micros(),
+            );
+        }
         return;
     }
     assert_eq!(mode, "index", "unknown probe mode");

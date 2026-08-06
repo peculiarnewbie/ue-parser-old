@@ -20,9 +20,15 @@ use crate::utrace_memory::{
 use crate::utrace_modules::{
     ModuleProvider, decode_module_init, decode_module_load, decode_module_unload,
 };
+use crate::utrace_monotonic_timeline::{
+    CpuMonotonicEventView, CpuMonotonicTimelineBuilder, CpuMonotonicTimelineSink,
+};
+pub use crate::utrace_monotonic_timeline::{CpuMonotonicTimelineIndex, CpuMonotonicTimelineStats};
 use crate::utrace_platform_file::PlatformFileProvider;
 pub use crate::utrace_session::ProgressiveDashboardSession;
-use crate::utrace_timeline::{CpuTimelineIndexBuilder, CpuTimelineSink, SinkAppetite};
+use crate::utrace_timeline::{
+    CpuTimelineIndexBuilder, CpuTimelineIntervalView, CpuTimelineSink, SinkAppetite,
+};
 pub use crate::utrace_timeline::{
     CpuTimelineIndexInfo, CpuTimelineMemoryIndex, CpuTimelineQuery, CpuTimelineQueryResult,
     DEFAULT_MAX_INDEXED_INTERVALS, SourceFingerprint, SourceIdentity, TimelineIndexBuild,
@@ -1773,6 +1779,7 @@ pub enum FieldFamily {
 pub(super) struct DecodedStreams {
     pub(super) summary: PacketSummary,
     pub(super) streams: BTreeMap<u16, Vec<u8>>,
+    pub(super) serial_dispatch_hint: Option<crate::utrace_dispatch::SerialDispatchHint>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3146,7 +3153,11 @@ fn read_packets(reader: &mut Reader<'_>) -> Result<DecodedStreams, TraceError> {
 
     summary.threads = threads.into_values().collect();
     summary.thread_count = summary.threads.len();
-    Ok(DecodedStreams { summary, streams })
+    Ok(DecodedStreams {
+        summary,
+        streams,
+        serial_dispatch_hint: None,
+    })
 }
 
 fn read_event_registry(
@@ -3381,6 +3392,7 @@ pub(super) fn dashboard_from_decoded_with_timeline_index(
         options,
         timeline_index_builder.take(),
         None,
+        None,
     )?;
     let timeline_index = timeline_index_request.map(|(request, source)| TimelineIndexBuild {
         output: request.output.clone(),
@@ -3421,12 +3433,14 @@ pub(super) fn dashboard_from_decoded_with_memory_timeline_index(
         cpu_index_builder: builder,
         gpu_index_builder: gpu_builder,
         cycle_frequency,
+        ..
     } = dashboard_from_decoded_with_timeline_builder(
         header,
         decoded,
         options,
         Some(builder),
         Some(gpu_builder),
+        None,
     )?;
     let index = builder
         .ok_or_else(|| {
@@ -3445,10 +3459,49 @@ pub(super) fn dashboard_from_decoded_with_memory_timeline_index(
     Ok((dashboard, index, gpu_index))
 }
 
+pub(super) fn dashboard_from_decoded_with_monotonic_timeline_index(
+    header: TraceHeader,
+    decoded: DecodedStreams,
+    options: DashboardOptions,
+    source: SourceIdentity,
+) -> Result<
+    (
+        TraceDashboard,
+        CpuMonotonicTimelineIndex,
+        GpuTimelineMemoryIndex,
+    ),
+    TraceError,
+> {
+    let builder = CpuMonotonicTimelineBuilder::new();
+    let gpu_builder = GpuTimelineIndexBuilder::new(DEFAULT_MAX_GPU_INDEXED_INTERVALS);
+    let DashboardTimelineBuild {
+        dashboard,
+        monotonic_timeline_builder,
+        gpu_index_builder,
+        cycle_frequency,
+        ..
+    } = dashboard_from_decoded_with_timeline_builder(
+        header,
+        decoded,
+        options,
+        None,
+        Some(gpu_builder),
+        Some(builder),
+    )?;
+    let index = monotonic_timeline_builder
+        .expect("monotonic timeline builder was supplied")
+        .finish(source, cycle_frequency);
+    let gpu_index = gpu_index_builder
+        .expect("GPU memory timeline builder was supplied")
+        .finish();
+    Ok((dashboard, index, gpu_index))
+}
+
 struct DashboardTimelineBuild {
     dashboard: TraceDashboard,
     cpu_index_builder: Option<CpuTimelineIndexBuilder>,
     gpu_index_builder: Option<GpuTimelineIndexBuilder>,
+    monotonic_timeline_builder: Option<CpuMonotonicTimelineBuilder>,
     cycle_frequency: Option<u64>,
 }
 
@@ -3458,6 +3511,7 @@ fn dashboard_from_decoded_with_timeline_builder(
     options: DashboardOptions,
     mut timeline_index_builder: Option<CpuTimelineIndexBuilder>,
     mut gpu_timeline_index_builder: Option<GpuTimelineIndexBuilder>,
+    mut monotonic_timeline_builder: Option<CpuMonotonicTimelineBuilder>,
 ) -> Result<DashboardTimelineBuild, TraceError> {
     let events = read_event_registry(&header, &decoded.streams)?;
     let decoded_importants = read_known_important_events(&header, &decoded.streams, &events)?;
@@ -3485,7 +3539,7 @@ fn dashboard_from_decoded_with_timeline_builder(
             &events,
             &decoded_importants,
             decoded.summary.sync_count,
-            DashboardDecodeOptions::full(options),
+            DashboardDecodeOptions::full(options, decoded.serial_dispatch_hint),
             DashboardTimelineSinks {
                 cpu: cpu_timeline_sink
                     .as_mut()
@@ -3493,6 +3547,9 @@ fn dashboard_from_decoded_with_timeline_builder(
                 gpu: gpu_timeline_index_builder
                     .as_mut()
                     .map(|sink| sink as &mut dyn GpuTimelineSink),
+                monotonic_cpu: monotonic_timeline_builder
+                    .as_mut()
+                    .map(|sink| sink as &mut dyn CpuMonotonicTimelineSink),
             },
         )?
     };
@@ -3533,6 +3590,7 @@ fn dashboard_from_decoded_with_timeline_builder(
         dashboard,
         cpu_index_builder: timeline_index_builder,
         gpu_index_builder: gpu_timeline_index_builder,
+        monotonic_timeline_builder,
         cycle_frequency,
     })
 }
@@ -3592,10 +3650,11 @@ pub fn build_cpu_timeline_index_with_source_identity(
         &events,
         &decoded_importants,
         decoded.summary.sync_count,
-        DashboardDecodeOptions::cpu_timeline_only(),
+        DashboardDecodeOptions::cpu_timeline_only(decoded.serial_dispatch_hint),
         DashboardTimelineSinks {
             cpu: Some(&mut index),
             gpu: None,
+            monotonic_cpu: None,
         },
     )
     .map_err(trace_error_to_timeline_index_error)?;
@@ -3615,20 +3674,28 @@ enum DashboardDecodeScope {
 struct DashboardDecodeOptions {
     dashboard: DashboardOptions,
     scope: DashboardDecodeScope,
+    serial_dispatch_hint: Option<crate::utrace_dispatch::SerialDispatchHint>,
 }
 
 impl DashboardDecodeOptions {
-    const fn full(dashboard: DashboardOptions) -> Self {
+    const fn full(
+        dashboard: DashboardOptions,
+        serial_dispatch_hint: Option<crate::utrace_dispatch::SerialDispatchHint>,
+    ) -> Self {
         Self {
             dashboard,
             scope: DashboardDecodeScope::Full,
+            serial_dispatch_hint,
         }
     }
 
-    fn cpu_timeline_only() -> Self {
+    fn cpu_timeline_only(
+        serial_dispatch_hint: Option<crate::utrace_dispatch::SerialDispatchHint>,
+    ) -> Self {
         Self {
             dashboard: DashboardOptions::default(),
             scope: DashboardDecodeScope::CpuTimelineOnly,
+            serial_dispatch_hint,
         }
     }
 }
@@ -3806,6 +3873,7 @@ fn dashboard_event_kinds(events: &[EventTypeInfo]) -> Vec<DashboardEventKind> {
 struct DashboardTimelineSinks<'a> {
     cpu: Option<&'a mut dyn CpuTimelineSink>,
     gpu: Option<&'a mut dyn GpuTimelineSink>,
+    monotonic_cpu: Option<&'a mut dyn CpuMonotonicTimelineSink>,
 }
 
 fn read_dashboard_events(
@@ -3825,6 +3893,7 @@ fn read_dashboard_events(
     let DashboardTimelineSinks {
         cpu: mut cpu_timeline_sink,
         gpu: gpu_timeline_index_sink,
+        monotonic_cpu: mut monotonic_cpu_timeline_sink,
     } = timeline_sinks;
 
     let registry = events
@@ -4160,10 +4229,11 @@ fn read_dashboard_events(
         (None, Some(index)) => Some(GpuTimelineSinks::Index(index)),
         (None, None) => None,
     };
-    let dispatch_summary = crate::utrace_dispatch::dispatch_normal_events_with(
+    let dispatch_summary = crate::utrace_dispatch::dispatch_normal_events_with_hint(
         streams,
         &registry,
         sync_count,
+        decode_options.serial_dispatch_hint,
         |raw_event| {
             let thread_id = raw_event.thread_id;
             let Some(event) = events_by_uid
@@ -4213,6 +4283,7 @@ fn read_dashboard_events(
                         frame_cycle_bounds: &mut frame_cycle_bounds,
                         thread_scope_totals: thread_scope_totals.entry(thread_id).or_default(),
                         timeline: cpu_timeline_sink.take(),
+                        monotonic_timeline: monotonic_cpu_timeline_sink.take(),
                         thread_id,
                         cycle_frequency,
                         known_scope_ids: known_scope_ids.as_deref(),
@@ -4220,6 +4291,7 @@ fn read_dashboard_events(
                     };
                     decode_cpu_batch(&data, &spec_by_id, &metadata_by_id, &mut batch_state)?;
                     cpu_timeline_sink = batch_state.timeline.take();
+                    monotonic_cpu_timeline_sink = batch_state.monotonic_timeline.take();
                 }
                 DashboardEventKind::MiscBeginFrame => {
                     decoded.frames.push(decode_frame_marker(
@@ -8249,6 +8321,7 @@ pub(super) struct ParsedNormalEvent {
     pub(super) data_start: usize,
     pub(super) data_end: usize,
     pub(super) has_aux: bool,
+    pub(super) serial: Option<u32>,
 }
 
 fn read_protocol5_normal_events(
@@ -8353,7 +8426,7 @@ pub(super) fn parse_protocol5_normal_event(
     };
     let uid = raw_uid >> 1;
 
-    let (event_size, has_aux) = if uid < USER_UID {
+    let (event_size, has_aux, serial) = if uid < USER_UID {
         let size = match uid {
             1 => {
                 if reader.remaining() < 3 {
@@ -8375,7 +8448,7 @@ pub(super) fn parse_protocol5_normal_event(
             8 | 9 => 7,
             _ => 0,
         };
-        (size, false)
+        (size, false, None)
     } else {
         let Some(event) = registry.lookup(uid) else {
             return Err(TraceError::new(
@@ -8385,10 +8458,15 @@ pub(super) fn parse_protocol5_normal_event(
                 format!("unknown event uid {uid} in normal stream"),
             ));
         };
-        if !event.flags.no_sync {
-            reader.skip(3, "Events.Serial")?;
-        }
-        (event_data_size(event), event.flags.maybe_has_aux)
+        let serial = if event.flags.no_sync {
+            None
+        } else {
+            let b0 = u32::from(reader.read_u8("Events.Serial[0]")?);
+            let b1 = u32::from(reader.read_u8("Events.Serial[1]")?);
+            let b2 = u32::from(reader.read_u8("Events.Serial[2]")?);
+            Some(b0 | (b1 << 8) | (b2 << 16))
+        };
+        (event_data_size(event), event.flags.maybe_has_aux, serial)
     };
 
     let data_start = usize::try_from(reader.tell()).unwrap();
@@ -8401,6 +8479,7 @@ pub(super) fn parse_protocol5_normal_event(
         data_start,
         data_end,
         has_aux,
+        serial,
     })
 }
 
@@ -8504,6 +8583,7 @@ struct CpuBatchDecodeState<'a, 'timeline> {
     frame_cycle_bounds: &'a mut FxHashMap<u32, (u64, u64)>,
     thread_scope_totals: &'a mut FxHashMap<u32, (u64, u64)>,
     timeline: Option<&'timeline mut dyn CpuTimelineSink>,
+    monotonic_timeline: Option<&'timeline mut dyn CpuMonotonicTimelineSink>,
     thread_id: u16,
     cycle_frequency: Option<u64>,
     known_scope_ids: Option<&'a [bool]>,
@@ -8725,9 +8805,9 @@ impl CpuTimelineSink for CpuTimelineCollector {
         }
     }
 
-    fn record(&mut self, interval: CpuTimelineInterval, active_frame: Option<u32>) {
+    fn record(&mut self, interval: CpuTimelineIntervalView<'_>, active_frame: Option<u32>) {
         debug_assert_eq!(active_frame, Some(self.frame_number));
-        self.intervals.push(interval);
+        self.intervals.push(interval.into_owned());
     }
 }
 
@@ -8770,10 +8850,10 @@ impl CpuTimelineSink for CpuTimelineFanout<'_> {
         }
     }
 
-    fn record(&mut self, interval: CpuTimelineInterval, active_frame: Option<u32>) {
+    fn record(&mut self, interval: CpuTimelineIntervalView<'_>, active_frame: Option<u32>) {
         match (self.collector_wants_record, self.index_wants_record) {
             (true, true) => {
-                self.collector.record(interval.clone(), active_frame);
+                self.collector.record(interval, active_frame);
                 self.index.record(interval, active_frame);
             }
             (true, false) => self.collector.record(interval, active_frame),
@@ -8803,7 +8883,7 @@ impl CpuTimelineSink for CpuTimelineSinks<'_> {
         }
     }
 
-    fn record(&mut self, interval: CpuTimelineInterval, active_frame: Option<u32>) {
+    fn record(&mut self, interval: CpuTimelineIntervalView<'_>, active_frame: Option<u32>) {
         match self {
             Self::Collector(collector) => collector.record(interval, active_frame),
             Self::Index(index) => index.record(interval, active_frame),
@@ -9417,6 +9497,21 @@ fn decode_cpu_batch(
             && cycle.saturating_sub(state.thread_state.last_cycle) > preamble_slack
         {
             let shift = cycle.saturating_sub(state.thread_state.last_cycle);
+            if let Some(timeline) = state.monotonic_timeline.as_mut() {
+                for _ in (0..state.thread_state.stack.len()).rev() {
+                    timeline.append_end(state.thread_id, state.thread_state.last_cycle);
+                }
+                for entry in &state.thread_state.stack {
+                    append_cpu_monotonic_begin(
+                        *timeline,
+                        state.thread_id,
+                        cycle,
+                        entry.kind,
+                        specs,
+                        metadata,
+                    );
+                }
+            }
             rebase_cpu_stack_starts(&mut state.thread_state.stack, shift);
             for suspended in state.thread_state.coroutine_stacks.values_mut() {
                 rebase_cpu_stack_starts(suspended, shift);
@@ -9427,6 +9522,9 @@ fn decode_cpu_batch(
         match first & 0b11 {
             0b00 => {
                 if let Some(entry) = state.thread_state.stack.pop() {
+                    if let Some(timeline) = state.monotonic_timeline.as_mut() {
+                        timeline.append_end(state.thread_id, cycle);
+                    }
                     let mut duration = entry
                         .accumulated_cycles
                         .saturating_add(cycle.saturating_sub(entry.start_cycle));
@@ -9481,13 +9579,13 @@ fn decode_cpu_batch(
                                 {
                                     let name = specs
                                         .get(&spec_id)
-                                        .map(|spec| spec.name.clone())
-                                        .unwrap_or_else(|| format!("#{spec_id}"));
+                                        .map(|spec| Cow::Borrowed(spec.name.as_str()))
+                                        .unwrap_or_else(|| Cow::Owned(format!("#{spec_id}")));
                                     timeline.record(
-                                        CpuTimelineInterval {
+                                        CpuTimelineIntervalView {
                                             thread_id: state.thread_id,
                                             spec_id,
-                                            name,
+                                            name: name.as_ref(),
                                             start_cycle: entry.start_cycle,
                                             end_cycle: cycle,
                                             duration,
@@ -9531,16 +9629,16 @@ fn decode_cpu_batch(
                                 {
                                     let name = specs
                                         .get(&spec_id)
-                                        .map(|spec| spec.name.clone())
-                                        .unwrap_or_else(|| format!("#{spec_id}"));
+                                        .map(|spec| Cow::Borrowed(spec.name.as_str()))
+                                        .unwrap_or_else(|| Cow::Owned(format!("#{spec_id}")));
                                     let rendered = metadata
                                         .get(&metadata_id)
-                                        .and_then(|record| record.rendered_name.clone());
+                                        .and_then(|record| record.rendered_name.as_deref());
                                     timeline.record(
-                                        CpuTimelineInterval {
+                                        CpuTimelineIntervalView {
                                             thread_id: state.thread_id,
                                             spec_id,
-                                            name,
+                                            name: name.as_ref(),
                                             start_cycle: entry.start_cycle,
                                             end_cycle: cycle,
                                             duration,
@@ -9582,14 +9680,25 @@ fn decode_cpu_batch(
                     })?;
                     let spec_id = metadata.get(&metadata_id).map(|record| record.spec_id);
                     state.metadata_stack_context.enter_inline(metadata_id);
+                    let kind = CpuStackEntryKind::Metadata {
+                        metadata_id,
+                        spec_id,
+                    };
                     state.thread_state.stack.push(CpuStackEntry {
-                        kind: CpuStackEntryKind::Metadata {
-                            metadata_id,
-                            spec_id,
-                        },
+                        kind,
                         start_cycle: cycle,
                         accumulated_cycles: 0,
                     });
+                    if let Some(timeline) = state.monotonic_timeline.as_mut() {
+                        append_cpu_monotonic_begin(
+                            *timeline,
+                            state.thread_id,
+                            cycle,
+                            kind,
+                            specs,
+                            metadata,
+                        );
+                    }
                 } else {
                     let spec_id = u32::try_from(payload >> 1).map_err(|_| {
                         TraceError::new(
@@ -9607,19 +9716,36 @@ fn decode_cpu_batch(
                     if !known_spec {
                         state.batches.unresolved_specs += 1;
                     }
+                    let kind = CpuStackEntryKind::PlainSpec(spec_id);
                     state.thread_state.stack.push(CpuStackEntry {
-                        kind: CpuStackEntryKind::PlainSpec(spec_id),
+                        kind,
                         start_cycle: cycle,
                         accumulated_cycles: 0,
                     });
+                    if let Some(timeline) = state.monotonic_timeline.as_mut() {
+                        append_cpu_monotonic_begin(
+                            *timeline,
+                            state.thread_id,
+                            cycle,
+                            kind,
+                            specs,
+                            metadata,
+                        );
+                    }
                 }
             }
             0b10 => {
                 let depth = reader.read_u64()?;
                 state.batches.coroutine_records += 1;
+                let depth = coroutine_stack_depth(depth);
+                if let Some(timeline) = state.monotonic_timeline.as_mut() {
+                    for _ in depth..state.thread_state.stack.len() {
+                        timeline.append_end(state.thread_id, cycle);
+                    }
+                }
                 suspend_cpu_coroutine_stack(
                     &mut state.thread_state.stack,
-                    coroutine_stack_depth(depth),
+                    depth,
                     cycle,
                     state.thread_state.active_coroutine_id,
                     &mut state.thread_state.coroutine_stacks,
@@ -9631,6 +9757,11 @@ fn decode_cpu_batch(
                 let depth = reader.read_u64()?;
                 state.batches.coroutine_records += 1;
                 let depth = coroutine_stack_depth(depth);
+                if let Some(timeline) = state.monotonic_timeline.as_mut() {
+                    for _ in depth..state.thread_state.stack.len() {
+                        timeline.append_end(state.thread_id, cycle);
+                    }
+                }
                 suspend_cpu_coroutine_stack(
                     &mut state.thread_state.stack,
                     depth,
@@ -9644,6 +9775,18 @@ fn decode_cpu_batch(
                     for entry in &mut restored {
                         entry.start_cycle = cycle;
                     }
+                    if let Some(timeline) = state.monotonic_timeline.as_mut() {
+                        for entry in &restored {
+                            append_cpu_monotonic_begin(
+                                *timeline,
+                                state.thread_id,
+                                cycle,
+                                entry.kind,
+                                specs,
+                                metadata,
+                            );
+                        }
+                    }
                     state.thread_state.stack.extend(restored);
                 }
                 state.thread_state.active_coroutine_id = Some(coroutine_id);
@@ -9654,6 +9797,40 @@ fn decode_cpu_batch(
     }
 
     Ok(())
+}
+
+fn append_cpu_monotonic_begin(
+    timeline: &mut dyn CpuMonotonicTimelineSink,
+    thread_id: u16,
+    cycle: u64,
+    kind: CpuStackEntryKind,
+    specs: &BTreeMap<u32, CpuScopeSpec>,
+    metadata: &FxHashMap<u32, CpuMetadataRecord>,
+) {
+    let (spec_id, metadata_id) = match kind {
+        CpuStackEntryKind::PlainSpec(spec_id) => (spec_id, None),
+        CpuStackEntryKind::Metadata {
+            metadata_id,
+            spec_id,
+        } => (spec_id.unwrap_or(u32::MAX), Some(metadata_id)),
+    };
+    let name = specs
+        .get(&spec_id)
+        .map(|spec| Cow::Borrowed(spec.name.as_str()))
+        .unwrap_or_else(|| Cow::Owned(format!("#{spec_id}")));
+    let rendered_name = metadata_id
+        .and_then(|metadata_id| metadata.get(&metadata_id))
+        .and_then(|record| record.rendered_name.as_deref());
+    timeline.append_begin(
+        thread_id,
+        cycle,
+        CpuMonotonicEventView {
+            spec_id,
+            name: name.as_ref(),
+            metadata_id,
+            rendered_name,
+        },
+    );
 }
 
 fn cpu_batch_thread_state_unterminated_scopes(state: &CpuBatchThreadState) -> u64 {
@@ -11780,6 +11957,7 @@ mod tests {
             frame_cycle_bounds: &mut frame_cycle_bounds,
             thread_scope_totals: &mut thread_scope_totals,
             timeline: None,
+            monotonic_timeline: None,
             thread_id: 0,
             cycle_frequency: None,
             known_scope_ids: None,
@@ -11839,6 +12017,7 @@ mod tests {
                 frame_cycle_bounds: &mut frame_cycle_bounds,
                 thread_scope_totals: &mut thread_scope_totals,
                 timeline: None,
+                monotonic_timeline: None,
                 thread_id: 0,
                 cycle_frequency: None,
                 known_scope_ids: None,
@@ -11894,6 +12073,7 @@ mod tests {
             frame_cycle_bounds: &mut frame_cycle_bounds,
             thread_scope_totals: &mut thread_scope_totals,
             timeline: None,
+            monotonic_timeline: None,
             thread_id: 0,
             cycle_frequency: None,
             known_scope_ids: None,
@@ -11953,6 +12133,7 @@ mod tests {
             frame_cycle_bounds: &mut frame_cycle_bounds,
             thread_scope_totals: &mut thread_scope_totals,
             timeline: None,
+            monotonic_timeline: None,
             thread_id: 0,
             cycle_frequency: Some(freq),
             known_scope_ids: None,
@@ -12041,6 +12222,7 @@ mod tests {
             frame_cycle_bounds: &mut frame_cycle_bounds,
             thread_scope_totals: &mut thread_scope_totals,
             timeline: None,
+            monotonic_timeline: None,
             thread_id: 0,
             cycle_frequency: Some(freq),
             known_scope_ids: None,
@@ -12120,6 +12302,7 @@ mod tests {
             frame_cycle_bounds: &mut frame_cycle_bounds,
             thread_scope_totals: &mut thread_scope_totals,
             timeline: None,
+            monotonic_timeline: None,
             thread_id: 0,
             cycle_frequency: Some(freq),
             known_scope_ids: None,
@@ -12195,6 +12378,7 @@ mod tests {
             frame_cycle_bounds: &mut frame_cycle_bounds,
             thread_scope_totals: &mut thread_scope_totals,
             timeline: None,
+            monotonic_timeline: None,
             thread_id: 0,
             cycle_frequency: None,
             known_scope_ids: None,
@@ -12246,6 +12430,7 @@ mod tests {
             frame_cycle_bounds: &mut frame_cycle_bounds,
             thread_scope_totals: &mut thread_scope_totals,
             timeline: None,
+            monotonic_timeline: None,
             thread_id: 0,
             cycle_frequency: None,
             known_scope_ids: None,
@@ -12355,6 +12540,7 @@ mod tests {
                 frame_cycle_bounds: &mut frame_cycle_bounds,
                 thread_scope_totals: &mut thread_scope_totals,
                 timeline: None,
+                monotonic_timeline: None,
                 thread_id: 0,
                 cycle_frequency: None,
                 known_scope_ids: None,

@@ -293,7 +293,7 @@ pub struct ProgressiveUtraceSession {
     chunk_count: u64,
     bootstrap_emitted: bool,
     last_frame_revision: u64,
-    timeline_index: Option<crate::utrace::CpuTimelineMemoryIndex>,
+    timeline_index: Option<crate::utrace::CpuMonotonicTimelineIndex>,
     gpu_timeline_index: Option<crate::utrace::GpuTimelineMemoryIndex>,
 }
 
@@ -380,7 +380,7 @@ impl ProgressiveUtraceSession {
             .ok_or_else(|| JsValue::from_str("session already finished"))?;
         let progress = session.complete_progress(Some(self.total_bytes));
         let (dashboard, inventory, timeline_index, gpu_timeline_index) = session
-            .finish_with_inventory_and_memory_timeline_index()
+            .finish_with_inventory_and_monotonic_timeline_index()
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let timeline_index_info = timeline_index.info().clone();
         self.timeline_index = Some(timeline_index);

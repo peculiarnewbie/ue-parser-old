@@ -12,10 +12,12 @@ use crate::utrace::{
     SourceFingerprint, ThreadPacketSummary, TimelineIndexBuild, TimelineIndexRequest,
     TraceDashboard, TraceError, TraceErrorKind, TraceHeader, TraceInventory, TracePrologue,
     TraceThreadInfo, dashboard_from_decoded, dashboard_from_decoded_with_memory_timeline_index,
+    dashboard_from_decoded_with_monotonic_timeline_index,
     dashboard_from_decoded_with_timeline_index, decode_frame_marker, decode_new_event,
     decode_new_trace, decode_thread_info, decompress_lz4_into_stream, inventory_from_observations,
     parse_protocol5_normal_event, read_u32_field, read_u64_field,
 };
+use crate::utrace_dispatch::SerialDispatchPreparation;
 use crate::utrace_progress::{
     DashboardBootstrap, DashboardPatch, DecodePhase, DecodeProgress, FrameTimingDashboard,
     ProgressiveFrameTiming,
@@ -85,6 +87,7 @@ pub struct ProgressiveDashboardSession {
     progressive_gpu_open_work: BTreeMap<u32, VecDeque<ProgressiveGpuOpenWork>>,
     pending_progressive_gpu_work: VecDeque<ProgressiveGpuCompletedWork>,
     source_fingerprint: SourceFingerprint,
+    serial_dispatch_preparation: SerialDispatchPreparation,
 }
 
 impl ProgressiveDashboardSession {
@@ -116,6 +119,7 @@ impl ProgressiveDashboardSession {
             progressive_gpu_open_work: BTreeMap::new(),
             pending_progressive_gpu_work: VecDeque::new(),
             source_fingerprint: SourceFingerprint::new(),
+            serial_dispatch_preparation: SerialDispatchPreparation::new(),
         }
     }
 
@@ -200,6 +204,33 @@ impl ProgressiveDashboardSession {
         let inventory = inventory_from_observations(header.clone(), inventory_observations)?;
         let (mut dashboard, timeline_index, gpu_timeline_index) =
             dashboard_from_decoded_with_memory_timeline_index(
+                header,
+                decoded,
+                options,
+                source_identity,
+            )?;
+        dashboard.frame_timing = Some(frame_timing);
+        Ok((dashboard, inventory, timeline_index, gpu_timeline_index))
+    }
+
+    pub fn finish_with_inventory_and_monotonic_timeline_index(
+        self,
+    ) -> Result<
+        (
+            TraceDashboard,
+            TraceInventory,
+            crate::utrace::CpuMonotonicTimelineIndex,
+            GpuTimelineMemoryIndex,
+        ),
+        TraceError,
+    > {
+        let options = self.options;
+        let source_identity = self.source_fingerprint.finish();
+        let frame_timing = self.frame_timing_dashboard();
+        let (header, decoded, inventory_observations) = self.finish_decoding()?;
+        let inventory = inventory_from_observations(header.clone(), inventory_observations)?;
+        let (mut dashboard, timeline_index, gpu_timeline_index) =
+            dashboard_from_decoded_with_monotonic_timeline_index(
                 header,
                 decoded,
                 options,
@@ -330,11 +361,13 @@ impl ProgressiveDashboardSession {
                 })
                 .collect(),
         };
+        let serial_dispatch_hint = Some(self.serial_dispatch_preparation.finish()?);
         Ok((
             header,
             DecodedStreams {
                 summary: self.summary,
                 streams: self.streams,
+                serial_dispatch_hint,
             },
             inventory_observations,
         ))
@@ -679,11 +712,21 @@ impl ProgressiveDashboardSession {
                     event_info.is_some(),
                     needs_inventory_sample,
                     sample_offset,
+                    event.serial,
                 )
             };
-            let (event, data, consumed, uid, is_declared, needs_inventory_sample, sample_offset) =
-                parsed;
+            let (
+                event,
+                data,
+                consumed,
+                uid,
+                is_declared,
+                needs_inventory_sample,
+                sample_offset,
+                serial,
+            ) = parsed;
             self.normal_cursors.insert(thread_id, cursor + consumed);
+            self.serial_dispatch_preparation.note(serial);
             if is_declared {
                 *self.inventory_observed.entry(uid).or_default() += 1;
                 if needs_inventory_sample {

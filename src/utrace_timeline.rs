@@ -1,12 +1,12 @@
 //! Bounded, disk-backed CPU timeline indexes for repeated UTrace queries.
 
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 
 use crate::utrace::CpuTimelineInterval;
@@ -174,6 +174,51 @@ pub(crate) enum SinkAppetite {
     Full,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CpuTimelineIntervalView<'a> {
+    pub(crate) thread_id: u16,
+    pub(crate) spec_id: u32,
+    pub(crate) name: &'a str,
+    pub(crate) start_cycle: u64,
+    pub(crate) end_cycle: u64,
+    pub(crate) duration: u64,
+    pub(crate) duration_seconds: Option<f64>,
+    pub(crate) metadata_id: Option<u32>,
+    pub(crate) rendered_name: Option<&'a str>,
+}
+
+impl CpuTimelineIntervalView<'_> {
+    pub(crate) fn into_owned(self) -> CpuTimelineInterval {
+        CpuTimelineInterval {
+            thread_id: self.thread_id,
+            spec_id: self.spec_id,
+            name: self.name.to_owned(),
+            start_cycle: self.start_cycle,
+            end_cycle: self.end_cycle,
+            duration: self.duration,
+            duration_seconds: self.duration_seconds,
+            metadata_id: self.metadata_id,
+            rendered_name: self.rendered_name.map(str::to_owned),
+        }
+    }
+}
+
+impl<'a> From<&'a CpuTimelineInterval> for CpuTimelineIntervalView<'a> {
+    fn from(interval: &'a CpuTimelineInterval) -> Self {
+        Self {
+            thread_id: interval.thread_id,
+            spec_id: interval.spec_id,
+            name: &interval.name,
+            start_cycle: interval.start_cycle,
+            end_cycle: interval.end_cycle,
+            duration: interval.duration,
+            duration_seconds: interval.duration_seconds,
+            metadata_id: interval.metadata_id,
+            rendered_name: interval.rendered_name.as_deref(),
+        }
+    }
+}
+
 pub(crate) trait CpuTimelineSink {
     /// Performs scalar accounting and decides whether constructing this interval
     /// would be useful. This must stay allocation-free: it is called for every
@@ -183,7 +228,7 @@ pub(crate) trait CpuTimelineSink {
 
     /// Receives an interval only after [`Self::note`] returned
     /// [`SinkAppetite::WantsRecord`].
-    fn record(&mut self, interval: CpuTimelineInterval, active_frame: Option<u32>);
+    fn record(&mut self, interval: CpuTimelineIntervalView<'_>, active_frame: Option<u32>);
 }
 
 /// Stable identity of a trace source, embedded in a `.utix` header.
@@ -274,20 +319,6 @@ struct StoredRecord {
 }
 
 impl StoredRecord {
-    fn from_interval(interval: CpuTimelineInterval, name_id: u32, rendered_name_id: u32) -> Self {
-        Self {
-            start_cycle: interval.start_cycle,
-            end_cycle: interval.end_cycle,
-            prefix_end_cycle: interval.end_cycle,
-            duration: interval.duration,
-            thread_id: u32::from(interval.thread_id),
-            spec_id: interval.spec_id,
-            metadata_id: interval.metadata_id.unwrap_or(NONE_STRING_ID),
-            name_id,
-            rendered_name_id,
-        }
-    }
-
     fn into_interval(
         self,
         strings: &[String],
@@ -329,7 +360,7 @@ pub(crate) struct CpuTimelineIndexBuilder {
     begin_cycle: Option<u64>,
     end_cycle: Option<u64>,
     strings: Vec<String>,
-    string_ids: BTreeMap<String, u32>,
+    string_ids: FxHashMap<String, u32>,
     records: Vec<StoredRecord>,
 }
 
@@ -381,7 +412,7 @@ impl CpuTimelineIndexBuilder {
             begin_cycle: None,
             end_cycle: None,
             strings: Vec::new(),
-            string_ids: BTreeMap::new(),
+            string_ids: FxHashMap::default(),
             records: Vec::new(),
         })
     }
@@ -493,13 +524,13 @@ impl CpuTimelineIndexBuilder {
         })
     }
 
-    fn intern(&mut self, value: String) -> u32 {
-        if let Some(&id) = self.string_ids.get(&value) {
+    fn intern(&mut self, value: &str) -> u32 {
+        if let Some(&id) = self.string_ids.get(value) {
             return id;
         }
         let id = u32::try_from(self.strings.len()).unwrap_or(u32::MAX);
-        self.strings.push(value.clone());
-        self.string_ids.insert(value, id);
+        self.strings.push(value.to_owned());
+        self.string_ids.insert(value.to_owned(), id);
         id
     }
 }
@@ -543,14 +574,33 @@ impl CpuTimelineSink for CpuTimelineIndexBuilder {
         }
     }
 
-    fn record(&mut self, interval: CpuTimelineInterval, _active_frame: Option<u32>) {
-        let name_id = self.intern(interval.name.clone());
-        let rendered_name_id = interval
-            .rendered_name
-            .as_ref()
-            .map(|value| self.intern(value.clone()))
+    fn record(&mut self, interval: CpuTimelineIntervalView<'_>, _active_frame: Option<u32>) {
+        let CpuTimelineIntervalView {
+            thread_id,
+            spec_id,
+            name,
+            start_cycle,
+            end_cycle,
+            duration,
+            duration_seconds: _,
+            metadata_id,
+            rendered_name,
+        } = interval;
+        let name_id = self.intern(name);
+        let rendered_name_id = rendered_name
+            .map(|value| self.intern(value))
             .unwrap_or(NONE_STRING_ID);
-        let record = StoredRecord::from_interval(interval, name_id, rendered_name_id);
+        let record = StoredRecord {
+            start_cycle,
+            end_cycle,
+            prefix_end_cycle: end_cycle,
+            duration,
+            thread_id: u32::from(thread_id),
+            spec_id,
+            metadata_id: metadata_id.unwrap_or(NONE_STRING_ID),
+            name_id,
+            rendered_name_id,
+        };
         if let IndexRetention::ReservoirSample {
             replacement_slot, ..
         } = &mut self.retention
@@ -907,7 +957,7 @@ mod tests {
     fn record(builder: &mut CpuTimelineIndexBuilder, interval: CpuTimelineInterval) {
         if builder.note(interval.start_cycle, interval.end_cycle, None) == SinkAppetite::WantsRecord
         {
-            builder.record(interval, None);
+            builder.record((&interval).into(), None);
         }
     }
 

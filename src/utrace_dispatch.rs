@@ -22,6 +22,7 @@ const SERIAL_BITS: u32 = 24;
 const SERIAL_MASK: u32 = (1 << SERIAL_BITS) - 1;
 const SERIAL_RANGE: u32 = 1 << SERIAL_BITS;
 const SERIAL_HALF: u32 = SERIAL_RANGE / 2;
+const SERIAL_BITMAP_WORDS: usize = (SERIAL_RANGE / 64) as usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub struct TraceSerial(u32);
@@ -38,6 +39,46 @@ impl TraceSerial {
 
     fn distance_from(self, origin: Self) -> u32 {
         self.raw().wrapping_sub(origin.raw()) & SERIAL_MASK
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SerialDispatchHint {
+    origin: Option<TraceSerial>,
+    synced_events: usize,
+}
+
+/// Incrementally prepares the only capture-wide fact required before serial
+/// dispatch. Progressive sessions already frame every normal event, so keeping
+/// this fixed 2 MiB bitmap avoids framing the complete capture again at finish.
+pub(crate) struct SerialDispatchPreparation {
+    serial_bits: Vec<u64>,
+    synced_events: usize,
+}
+
+impl SerialDispatchPreparation {
+    pub(crate) fn new() -> Self {
+        Self {
+            serial_bits: vec![0_u64; SERIAL_BITMAP_WORDS],
+            synced_events: 0,
+        }
+    }
+
+    pub(crate) fn note(&mut self, raw_serial: Option<u32>) {
+        let Some(raw_serial) = raw_serial else {
+            return;
+        };
+        let raw = usize::try_from(raw_serial & SERIAL_MASK).unwrap();
+        self.serial_bits[raw / 64] |= 1_u64 << (raw % 64);
+        self.synced_events = self.synced_events.saturating_add(1);
+    }
+
+    pub(crate) fn finish(self) -> Result<SerialDispatchHint, TraceError> {
+        ensure_single_serial_epoch(self.synced_events)?;
+        Ok(SerialDispatchHint {
+            origin: circular_run_start_bitmap(&self.serial_bits).map(TraceSerial),
+            synced_events: self.synced_events,
+        })
     }
 }
 
@@ -272,10 +313,26 @@ pub(crate) fn dispatch_normal_events_with<'a>(
     streams: &'a BTreeMap<u16, Vec<u8>>,
     registry: &BTreeMap<u16, &EventTypeInfo>,
     sync_count: u64,
+    visit: impl FnMut(DispatchedNormalEventView<'a>) -> Result<(), TraceError>,
+) -> Result<SerialDispatchSummary, TraceError> {
+    dispatch_normal_events_with_hint(streams, registry, sync_count, None, visit)
+}
+
+pub(crate) fn dispatch_normal_events_with_hint<'a>(
+    streams: &'a BTreeMap<u16, Vec<u8>>,
+    registry: &BTreeMap<u16, &EventTypeInfo>,
+    sync_count: u64,
+    preparation: Option<SerialDispatchHint>,
     mut visit: impl FnMut(DispatchedNormalEventView<'a>) -> Result<(), TraceError>,
 ) -> Result<SerialDispatchSummary, TraceError> {
     let layouts = normal_event_layouts(registry);
-    let next_serial = serial_origin_from_streams(streams, &layouts)?;
+    let next_serial = match preparation {
+        Some(preparation) => {
+            ensure_single_serial_epoch(preparation.synced_events)?;
+            preparation.origin
+        }
+        None => serial_origin_from_streams(streams, &layouts)?,
+    };
     let mut thread_ids = Vec::new();
     let mut cursors = Vec::new();
     for (thread_id, stream) in streams {
@@ -846,6 +903,63 @@ mod tests {
         assert!(summary.serial_ordered);
         assert_eq!(summary.gap_count, 0);
         assert_eq!(summary.synced_event_count, 3);
+    }
+
+    #[test]
+    fn prepared_serial_origin_matches_offline_origin_scan() {
+        let events = [
+            synced_event(16, "A"),
+            synced_event_with_aux(17, "B"),
+            no_sync_event(18, "C"),
+        ];
+        let registry = events
+            .iter()
+            .map(|event| (event.uid, event))
+            .collect::<BTreeMap<_, _>>();
+        let mut stream_5 = Vec::new();
+        push_synced_with_aux(&mut stream_5, 17, SERIAL_MASK, 0x22, &[0xaa, 0xbb]);
+        push_synced(&mut stream_5, 16, 2, 0x44);
+        let mut stream_10 = Vec::new();
+        push_synced(&mut stream_10, 16, SERIAL_MASK - 1, 0x11);
+        push_unsynced(&mut stream_10, 18, 0x33);
+        push_synced(&mut stream_10, 16, 0, 0x55);
+        let streams = [(5_u16, stream_5), (10_u16, stream_10)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        let mut preparation = SerialDispatchPreparation::new();
+        preparation.note(Some(SERIAL_MASK));
+        preparation.note(Some(2));
+        preparation.note(Some(SERIAL_MASK - 1));
+        preparation.note(None);
+        preparation.note(Some(0));
+        let hint = preparation.finish().unwrap();
+        let mut prepared = Vec::new();
+        let prepared_summary =
+            dispatch_normal_events_with_hint(&streams, &registry, 3, Some(hint), |event| {
+                prepared.push((
+                    event.thread_id,
+                    event.uid,
+                    event.serial.map(TraceSerial::raw),
+                    event.data.to_vec(),
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let mut offline = Vec::new();
+        let offline_summary = dispatch_normal_events_with(&streams, &registry, 3, |event| {
+            offline.push((
+                event.thread_id,
+                event.uid,
+                event.serial.map(TraceSerial::raw),
+                event.data.to_vec(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(prepared, offline);
+        assert_eq!(prepared_summary, offline_summary);
     }
 
     #[test]
