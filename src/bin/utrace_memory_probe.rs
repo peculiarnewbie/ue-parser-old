@@ -8,9 +8,12 @@ fn main() {
         .unwrap_or_else(|| "index".to_owned());
     let bytes = std::fs::read(&path).expect("read trace");
     let decode_started = std::time::Instant::now();
-    let mut session = utrace_parser::utrace::ProgressiveDashboardSession::new(
-        utrace_parser::utrace::DashboardOptions::default(),
-    );
+    let options = utrace_parser::utrace::DashboardOptions::default();
+    let mut session = if mode == "monotonic" {
+        utrace_parser::utrace::ProgressiveDashboardSession::new_with_eager_cpu_timeline(options)
+    } else {
+        utrace_parser::utrace::ProgressiveDashboardSession::new(options)
+    };
     for chunk in bytes.chunks(1024 * 1024) {
         session.push_chunk(chunk).expect("stream trace chunk");
     }

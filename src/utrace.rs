@@ -21,7 +21,7 @@ use crate::utrace_modules::{
     ModuleProvider, decode_module_init, decode_module_load, decode_module_unload,
 };
 use crate::utrace_monotonic_timeline::{
-    CpuMonotonicEventView, CpuMonotonicTimelineBuilder, CpuMonotonicTimelineSink,
+    CpuMonotonicTimelineBuilder, CpuMonotonicTimelineSink, CpuTimelineCatalogSink, CpuTimerRef,
 };
 pub use crate::utrace_monotonic_timeline::{CpuMonotonicTimelineIndex, CpuMonotonicTimelineStats};
 use crate::utrace_platform_file::PlatformFileProvider;
@@ -3464,6 +3464,7 @@ pub(super) fn dashboard_from_decoded_with_monotonic_timeline_index(
     decoded: DecodedStreams,
     options: DashboardOptions,
     source: SourceIdentity,
+    builder: CpuMonotonicTimelineBuilder,
 ) -> Result<
     (
         TraceDashboard,
@@ -3472,7 +3473,6 @@ pub(super) fn dashboard_from_decoded_with_monotonic_timeline_index(
     ),
     TraceError,
 > {
-    let builder = CpuMonotonicTimelineBuilder::new();
     let gpu_builder = GpuTimelineIndexBuilder::new(DEFAULT_MAX_GPU_INDEXED_INTERVALS);
     let DashboardTimelineBuild {
         dashboard,
@@ -3549,7 +3549,8 @@ fn dashboard_from_decoded_with_timeline_builder(
                     .map(|sink| sink as &mut dyn GpuTimelineSink),
                 monotonic_cpu: monotonic_timeline_builder
                     .as_mut()
-                    .map(|sink| sink as &mut dyn CpuMonotonicTimelineSink),
+                    .map(|sink| sink as &mut dyn CpuTimelineCatalogSink),
+                monotonic_events: None,
             },
         )?
     };
@@ -3655,6 +3656,7 @@ pub fn build_cpu_timeline_index_with_source_identity(
             cpu: Some(&mut index),
             gpu: None,
             monotonic_cpu: None,
+            monotonic_events: None,
         },
     )
     .map_err(trace_error_to_timeline_index_error)?;
@@ -3873,7 +3875,8 @@ fn dashboard_event_kinds(events: &[EventTypeInfo]) -> Vec<DashboardEventKind> {
 struct DashboardTimelineSinks<'a> {
     cpu: Option<&'a mut dyn CpuTimelineSink>,
     gpu: Option<&'a mut dyn GpuTimelineSink>,
-    monotonic_cpu: Option<&'a mut dyn CpuMonotonicTimelineSink>,
+    monotonic_cpu: Option<&'a mut dyn CpuTimelineCatalogSink>,
+    monotonic_events: Option<&'a mut dyn CpuMonotonicTimelineSink>,
 }
 
 fn read_dashboard_events(
@@ -3893,7 +3896,8 @@ fn read_dashboard_events(
     let DashboardTimelineSinks {
         cpu: mut cpu_timeline_sink,
         gpu: gpu_timeline_index_sink,
-        monotonic_cpu: mut monotonic_cpu_timeline_sink,
+        monotonic_cpu: mut monotonic_cpu_catalog_sink,
+        monotonic_events: mut monotonic_cpu_timeline_sink,
     } = timeline_sinks;
 
     let registry = events
@@ -3989,6 +3993,9 @@ fn read_dashboard_events(
             match (event.logger.as_str(), event.event.as_str()) {
                 ("CpuProfiler", "EventSpec") => {
                     let spec = decode_cpu_event_spec(event, raw_event.data, raw_event.offset + 4)?;
+                    if let Some(timeline) = monotonic_cpu_catalog_sink.as_mut() {
+                        timeline.register_spec(spec.id, &spec.name);
+                    }
                     spec_by_id.insert(spec.id, spec);
                 }
                 ("CpuProfiler", "MetadataSpec") => {
@@ -4262,6 +4269,13 @@ fn read_dashboard_events(
                 DashboardEventKind::CpuProfilerMetadata => {
                     let mut record = decode_cpu_metadata_record(event, raw_event.data, 0)?;
                     enrich_cpu_metadata_record(&metadata_spec_by_id, &mut record);
+                    if let Some(timeline) = monotonic_cpu_catalog_sink.as_mut() {
+                        timeline.register_metadata(
+                            record.metadata_id,
+                            record.spec_id,
+                            record.rendered_name.as_deref(),
+                        );
+                    }
                     metadata_by_id.insert(record.metadata_id, record);
                     metadata_generation = metadata_generation.saturating_add(1);
                 }
@@ -4289,7 +4303,12 @@ fn read_dashboard_events(
                         known_scope_ids: known_scope_ids.as_deref(),
                         metadata_generation,
                     };
-                    decode_cpu_batch(&data, &spec_by_id, &metadata_by_id, &mut batch_state)?;
+                    decode_cpu_batch::<false>(
+                        &data,
+                        &spec_by_id,
+                        &metadata_by_id,
+                        &mut batch_state,
+                    )?;
                     cpu_timeline_sink = batch_state.timeline.take();
                     monotonic_cpu_timeline_sink = batch_state.monotonic_timeline.take();
                 }
@@ -8590,6 +8609,69 @@ struct CpuBatchDecodeState<'a, 'timeline> {
     metadata_generation: u64,
 }
 
+/// Eager, timeline-only CPU batch Adapter used by progressive sessions.
+/// Dashboard aggregation remains a separate Adapter over the same decoder.
+pub(super) struct ProgressiveCpuTimelineDecoder {
+    builder: CpuMonotonicTimelineBuilder,
+    batches: CpuBatchSummary,
+    thread_states: FxHashMap<u16, CpuBatchThreadState>,
+}
+
+impl ProgressiveCpuTimelineDecoder {
+    pub(super) fn new() -> Self {
+        Self {
+            builder: CpuMonotonicTimelineBuilder::new(),
+            batches: CpuBatchSummary::default(),
+            thread_states: FxHashMap::default(),
+        }
+    }
+
+    pub(super) fn record_event_batch(
+        &mut self,
+        event: &EventTypeInfo,
+        data: &[u8],
+        thread_id: u16,
+        batch_base_cycle: Option<u64>,
+        cycle_frequency: Option<u64>,
+    ) -> Result<(), TraceError> {
+        let Some(data) = read_aux_bytes(event, data, "Data", 0)? else {
+            return Ok(());
+        };
+        let mut scope_totals = FxHashMap::default();
+        let mut metadata_scope_totals = FxHashMap::default();
+        let mut metadata_interval_state = CpuMetadataIntervalState::default();
+        let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
+        let mut frame_scope_totals = FxHashMap::default();
+        let mut frame_cycle_bounds = FxHashMap::default();
+        let mut thread_scope_totals = FxHashMap::default();
+        let specs = BTreeMap::new();
+        let metadata = FxHashMap::default();
+        let mut state = CpuBatchDecodeState {
+            batches: &mut self.batches,
+            scope_totals: &mut scope_totals,
+            metadata_scope_totals: &mut metadata_scope_totals,
+            metadata_interval_state: &mut metadata_interval_state,
+            metadata_stack_context: &mut metadata_stack_context,
+            thread_state: self.thread_states.entry(thread_id).or_default(),
+            batch_base_cycle,
+            frame_scope_totals: &mut frame_scope_totals,
+            frame_cycle_bounds: &mut frame_cycle_bounds,
+            thread_scope_totals: &mut thread_scope_totals,
+            timeline: None,
+            monotonic_timeline: Some(&mut self.builder),
+            thread_id,
+            cycle_frequency,
+            known_scope_ids: None,
+            metadata_generation: 0,
+        };
+        decode_cpu_batch::<true>(&data, &specs, &metadata, &mut state)
+    }
+
+    pub(super) fn finish(self) -> CpuMonotonicTimelineBuilder {
+        self.builder
+    }
+}
+
 #[derive(Clone, Debug)]
 struct GpuTimelineCollector {
     frame_number: u32,
@@ -9455,7 +9537,7 @@ pub(super) fn decode_frame_marker(
     })
 }
 
-fn decode_cpu_batch(
+fn decode_cpu_batch<const TIMELINE_ONLY: bool>(
     data: &[u8],
     specs: &BTreeMap<u32, CpuScopeSpec>,
     metadata: &FxHashMap<u32, CpuMetadataRecord>,
@@ -9502,14 +9584,7 @@ fn decode_cpu_batch(
                     timeline.append_end(state.thread_id, state.thread_state.last_cycle);
                 }
                 for entry in &state.thread_state.stack {
-                    append_cpu_monotonic_begin(
-                        *timeline,
-                        state.thread_id,
-                        cycle,
-                        entry.kind,
-                        specs,
-                        metadata,
-                    );
+                    append_cpu_monotonic_begin(*timeline, state.thread_id, cycle, entry.kind);
                 }
             }
             rebase_cpu_stack_starts(&mut state.thread_state.stack, shift);
@@ -9541,124 +9616,126 @@ fn decode_cpu_batch(
                             .saturating_add(duration);
                         duration = implausible_limit;
                     }
-                    match entry.kind {
-                        CpuStackEntryKind::PlainSpec(spec_id) => {
-                            let total = state.scope_totals.entry(spec_id).or_insert((0, 0));
-                            total.0 += 1;
-                            total.1 = total.1.saturating_add(duration);
-                            let thread_entry =
-                                state.thread_scope_totals.entry(spec_id).or_insert((0, 0));
-                            thread_entry.0 += 1;
-                            thread_entry.1 = thread_entry.1.saturating_add(duration);
-                            if let Some(metadata_id) =
-                                state.metadata_stack_context.restored_metadata_id()
-                            {
-                                record_restored_cpu_metadata_scope(
-                                    metadata_id,
+                    if !TIMELINE_ONLY {
+                        match entry.kind {
+                            CpuStackEntryKind::PlainSpec(spec_id) => {
+                                let total = state.scope_totals.entry(spec_id).or_insert((0, 0));
+                                total.0 += 1;
+                                total.1 = total.1.saturating_add(duration);
+                                let thread_entry =
+                                    state.thread_scope_totals.entry(spec_id).or_insert((0, 0));
+                                thread_entry.0 += 1;
+                                thread_entry.1 = thread_entry.1.saturating_add(duration);
+                                if let Some(metadata_id) =
+                                    state.metadata_stack_context.restored_metadata_id()
+                                {
+                                    record_restored_cpu_metadata_scope(
+                                        metadata_id,
+                                        entry.start_cycle,
+                                        cycle,
+                                        duration,
+                                        metadata,
+                                        state,
+                                    );
+                                }
+                                record_cpu_frame_scope(
+                                    spec_id,
                                     entry.start_cycle,
                                     cycle,
                                     duration,
                                     metadata,
                                     state,
                                 );
-                            }
-                            record_cpu_frame_scope(
-                                spec_id,
-                                entry.start_cycle,
-                                cycle,
-                                duration,
-                                metadata,
-                                state,
-                            );
-                            if let Some(timeline) = state.timeline.as_mut() {
-                                let active_frame = state
-                                    .metadata_stack_context
-                                    .active_frame_number(metadata, state.metadata_generation);
-                                if timeline.note(entry.start_cycle, cycle, active_frame)
-                                    == SinkAppetite::WantsRecord
-                                {
-                                    let name = specs
-                                        .get(&spec_id)
-                                        .map(|spec| Cow::Borrowed(spec.name.as_str()))
-                                        .unwrap_or_else(|| Cow::Owned(format!("#{spec_id}")));
-                                    timeline.record(
-                                        CpuTimelineIntervalView {
-                                            thread_id: state.thread_id,
-                                            spec_id,
-                                            name: name.as_ref(),
-                                            start_cycle: entry.start_cycle,
-                                            end_cycle: cycle,
-                                            duration,
-                                            duration_seconds: state.cycle_frequency.map(
-                                                |frequency| duration as f64 / frequency as f64,
-                                            ),
-                                            metadata_id: None,
-                                            rendered_name: None,
-                                        },
-                                        active_frame,
-                                    );
+                                if let Some(timeline) = state.timeline.as_mut() {
+                                    let active_frame = state
+                                        .metadata_stack_context
+                                        .active_frame_number(metadata, state.metadata_generation);
+                                    if timeline.note(entry.start_cycle, cycle, active_frame)
+                                        == SinkAppetite::WantsRecord
+                                    {
+                                        let name = specs
+                                            .get(&spec_id)
+                                            .map(|spec| Cow::Borrowed(spec.name.as_str()))
+                                            .unwrap_or_else(|| Cow::Owned(format!("#{spec_id}")));
+                                        timeline.record(
+                                            CpuTimelineIntervalView {
+                                                thread_id: state.thread_id,
+                                                spec_id,
+                                                name: name.as_ref(),
+                                                start_cycle: entry.start_cycle,
+                                                end_cycle: cycle,
+                                                duration,
+                                                duration_seconds: state.cycle_frequency.map(
+                                                    |frequency| duration as f64 / frequency as f64,
+                                                ),
+                                                metadata_id: None,
+                                                rendered_name: None,
+                                            },
+                                            active_frame,
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        CpuStackEntryKind::Metadata {
-                            metadata_id,
-                            spec_id: Some(spec_id),
-                        } => {
-                            let total =
-                                state.metadata_scope_totals.entry(spec_id).or_insert((0, 0));
-                            total.0 += 1;
-                            total.1 = total.1.saturating_add(duration);
-                            record_cpu_metadata_interval(
-                                CpuMetadataIntervalRecord {
-                                    metadata_id,
-                                    spec_id,
-                                    start_cycle: entry.start_cycle,
-                                    end_cycle: cycle,
-                                    duration,
-                                    attribution: CpuMetadataAttribution::Inline,
-                                },
-                                metadata,
-                                state.metadata_interval_state,
-                            );
-                            if let Some(timeline) = state.timeline.as_mut() {
-                                let active_frame = state
-                                    .metadata_stack_context
-                                    .active_frame_number(metadata, state.metadata_generation);
-                                if timeline.note(entry.start_cycle, cycle, active_frame)
-                                    == SinkAppetite::WantsRecord
-                                {
-                                    let name = specs
-                                        .get(&spec_id)
-                                        .map(|spec| Cow::Borrowed(spec.name.as_str()))
-                                        .unwrap_or_else(|| Cow::Owned(format!("#{spec_id}")));
-                                    let rendered = metadata
-                                        .get(&metadata_id)
-                                        .and_then(|record| record.rendered_name.as_deref());
-                                    timeline.record(
-                                        CpuTimelineIntervalView {
-                                            thread_id: state.thread_id,
-                                            spec_id,
-                                            name: name.as_ref(),
-                                            start_cycle: entry.start_cycle,
-                                            end_cycle: cycle,
-                                            duration,
-                                            duration_seconds: state.cycle_frequency.map(
-                                                |frequency| duration as f64 / frequency as f64,
-                                            ),
-                                            metadata_id: Some(metadata_id),
-                                            rendered_name: rendered,
-                                        },
-                                        active_frame,
-                                    );
+                            CpuStackEntryKind::Metadata {
+                                metadata_id,
+                                spec_id: Some(spec_id),
+                            } => {
+                                let total =
+                                    state.metadata_scope_totals.entry(spec_id).or_insert((0, 0));
+                                total.0 += 1;
+                                total.1 = total.1.saturating_add(duration);
+                                record_cpu_metadata_interval(
+                                    CpuMetadataIntervalRecord {
+                                        metadata_id,
+                                        spec_id,
+                                        start_cycle: entry.start_cycle,
+                                        end_cycle: cycle,
+                                        duration,
+                                        attribution: CpuMetadataAttribution::Inline,
+                                    },
+                                    metadata,
+                                    state.metadata_interval_state,
+                                );
+                                if let Some(timeline) = state.timeline.as_mut() {
+                                    let active_frame = state
+                                        .metadata_stack_context
+                                        .active_frame_number(metadata, state.metadata_generation);
+                                    if timeline.note(entry.start_cycle, cycle, active_frame)
+                                        == SinkAppetite::WantsRecord
+                                    {
+                                        let name = specs
+                                            .get(&spec_id)
+                                            .map(|spec| Cow::Borrowed(spec.name.as_str()))
+                                            .unwrap_or_else(|| Cow::Owned(format!("#{spec_id}")));
+                                        let rendered = metadata
+                                            .get(&metadata_id)
+                                            .and_then(|record| record.rendered_name.as_deref());
+                                        timeline.record(
+                                            CpuTimelineIntervalView {
+                                                thread_id: state.thread_id,
+                                                spec_id,
+                                                name: name.as_ref(),
+                                                start_cycle: entry.start_cycle,
+                                                end_cycle: cycle,
+                                                duration,
+                                                duration_seconds: state.cycle_frequency.map(
+                                                    |frequency| duration as f64 / frequency as f64,
+                                                ),
+                                                metadata_id: Some(metadata_id),
+                                                rendered_name: rendered,
+                                            },
+                                            active_frame,
+                                        );
+                                    }
                                 }
+                                state.metadata_stack_context.leave_inline(metadata_id);
                             }
-                            state.metadata_stack_context.leave_inline(metadata_id);
-                        }
-                        CpuStackEntryKind::Metadata {
-                            metadata_id,
-                            spec_id: None,
-                        } => {
-                            state.metadata_stack_context.leave_inline(metadata_id);
+                            CpuStackEntryKind::Metadata {
+                                metadata_id,
+                                spec_id: None,
+                            } => {
+                                state.metadata_stack_context.leave_inline(metadata_id);
+                            }
                         }
                     }
                     state.batches.intervals += 1;
@@ -9678,8 +9755,12 @@ fn decode_cpu_batch(
                             "metadata id does not fit in u32",
                         )
                     })?;
-                    let spec_id = metadata.get(&metadata_id).map(|record| record.spec_id);
-                    state.metadata_stack_context.enter_inline(metadata_id);
+                    let spec_id = (!TIMELINE_ONLY)
+                        .then(|| metadata.get(&metadata_id).map(|record| record.spec_id))
+                        .flatten();
+                    if !TIMELINE_ONLY {
+                        state.metadata_stack_context.enter_inline(metadata_id);
+                    }
                     let kind = CpuStackEntryKind::Metadata {
                         metadata_id,
                         spec_id,
@@ -9690,14 +9771,7 @@ fn decode_cpu_batch(
                         accumulated_cycles: 0,
                     });
                     if let Some(timeline) = state.monotonic_timeline.as_mut() {
-                        append_cpu_monotonic_begin(
-                            *timeline,
-                            state.thread_id,
-                            cycle,
-                            kind,
-                            specs,
-                            metadata,
-                        );
+                        append_cpu_monotonic_begin(*timeline, state.thread_id, cycle, kind);
                     }
                 } else {
                     let spec_id = u32::try_from(payload >> 1).map_err(|_| {
@@ -9708,13 +9782,17 @@ fn decode_cpu_batch(
                             "scope spec id does not fit in u32",
                         )
                     })?;
-                    let known_spec = state
-                        .known_scope_ids
-                        .and_then(|known| known.get(usize::try_from(spec_id).unwrap_or(usize::MAX)))
-                        .copied()
-                        .unwrap_or_else(|| specs.contains_key(&spec_id));
-                    if !known_spec {
-                        state.batches.unresolved_specs += 1;
+                    if !TIMELINE_ONLY {
+                        let known_spec = state
+                            .known_scope_ids
+                            .and_then(|known| {
+                                known.get(usize::try_from(spec_id).unwrap_or(usize::MAX))
+                            })
+                            .copied()
+                            .unwrap_or_else(|| specs.contains_key(&spec_id));
+                        if !known_spec {
+                            state.batches.unresolved_specs += 1;
+                        }
                     }
                     let kind = CpuStackEntryKind::PlainSpec(spec_id);
                     state.thread_state.stack.push(CpuStackEntry {
@@ -9723,14 +9801,7 @@ fn decode_cpu_batch(
                         accumulated_cycles: 0,
                     });
                     if let Some(timeline) = state.monotonic_timeline.as_mut() {
-                        append_cpu_monotonic_begin(
-                            *timeline,
-                            state.thread_id,
-                            cycle,
-                            kind,
-                            specs,
-                            metadata,
-                        );
+                        append_cpu_monotonic_begin(*timeline, state.thread_id, cycle, kind);
                     }
                 }
             }
@@ -9782,8 +9853,6 @@ fn decode_cpu_batch(
                                 state.thread_id,
                                 cycle,
                                 entry.kind,
-                                specs,
-                                metadata,
                             );
                         }
                     }
@@ -9804,33 +9873,12 @@ fn append_cpu_monotonic_begin(
     thread_id: u16,
     cycle: u64,
     kind: CpuStackEntryKind,
-    specs: &BTreeMap<u32, CpuScopeSpec>,
-    metadata: &FxHashMap<u32, CpuMetadataRecord>,
 ) {
-    let (spec_id, metadata_id) = match kind {
-        CpuStackEntryKind::PlainSpec(spec_id) => (spec_id, None),
-        CpuStackEntryKind::Metadata {
-            metadata_id,
-            spec_id,
-        } => (spec_id.unwrap_or(u32::MAX), Some(metadata_id)),
+    let timer = match kind {
+        CpuStackEntryKind::PlainSpec(spec_id) => CpuTimerRef::Spec(spec_id),
+        CpuStackEntryKind::Metadata { metadata_id, .. } => CpuTimerRef::Metadata(metadata_id),
     };
-    let name = specs
-        .get(&spec_id)
-        .map(|spec| Cow::Borrowed(spec.name.as_str()))
-        .unwrap_or_else(|| Cow::Owned(format!("#{spec_id}")));
-    let rendered_name = metadata_id
-        .and_then(|metadata_id| metadata.get(&metadata_id))
-        .and_then(|record| record.rendered_name.as_deref());
-    timeline.append_begin(
-        thread_id,
-        cycle,
-        CpuMonotonicEventView {
-            spec_id,
-            name: name.as_ref(),
-            metadata_id,
-            rendered_name,
-        },
-    );
+    timeline.append_begin(thread_id, cycle, timer);
 }
 
 fn cpu_batch_thread_state_unterminated_scopes(state: &CpuBatchThreadState) -> u64 {
@@ -11964,7 +12012,7 @@ mod tests {
             metadata_generation: 0,
         };
 
-        decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
+        decode_cpu_batch::<false>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(batches.coroutine_records, 3);
         assert_eq!(batches.intervals, 2);
@@ -12023,7 +12071,7 @@ mod tests {
                 known_scope_ids: None,
                 metadata_generation: 0,
             };
-            decode_cpu_batch(batch, &specs, &FxHashMap::default(), &mut state).unwrap();
+            decode_cpu_batch::<false>(batch, &specs, &FxHashMap::default(), &mut state).unwrap();
         }
 
         assert_eq!(batches.count, 2);
@@ -12080,7 +12128,7 @@ mod tests {
             metadata_generation: 0,
         };
 
-        decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
+        decode_cpu_batch::<false>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(batches.intervals, 1);
         // Relative deltas 25 then 15 against base 1000 → absolute 1025..1040.
@@ -12140,7 +12188,7 @@ mod tests {
             metadata_generation: 0,
         };
 
-        decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
+        decode_cpu_batch::<false>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(batches.preamble_timeline_rebases, 0);
         assert_eq!(scope_totals[&1], (1, 5 * freq));
@@ -12229,7 +12277,7 @@ mod tests {
             metadata_generation: 0,
         };
 
-        decode_cpu_batch(&data, &specs, &metadata, &mut state).unwrap();
+        decode_cpu_batch::<false>(&data, &specs, &metadata, &mut state).unwrap();
 
         assert_eq!(batches.preamble_timeline_rebases, 1);
         assert_eq!(scope_totals[&1], (1, 20));
@@ -12309,8 +12357,9 @@ mod tests {
             metadata_generation: 0,
         };
 
-        decode_cpu_batch(&preamble, &specs, &FxHashMap::default(), &mut state).unwrap();
-        decode_cpu_batch(&flush_aligned, &specs, &FxHashMap::default(), &mut state).unwrap();
+        decode_cpu_batch::<false>(&preamble, &specs, &FxHashMap::default(), &mut state).unwrap();
+        decode_cpu_batch::<false>(&flush_aligned, &specs, &FxHashMap::default(), &mut state)
+            .unwrap();
 
         assert_eq!(batches.count, 2);
         assert_eq!(batches.preamble_timeline_rebases, 1);
@@ -12385,7 +12434,7 @@ mod tests {
             metadata_generation: 0,
         };
 
-        decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
+        decode_cpu_batch::<false>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(scope_totals[&2], (1, 30));
         assert_eq!(scope_totals[&1], (1, 100));
@@ -12437,7 +12486,7 @@ mod tests {
             metadata_generation: 0,
         };
 
-        decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
+        decode_cpu_batch::<false>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(batches.unmatched_ends, 1);
         assert!(scope_totals.is_empty());
@@ -12547,7 +12596,7 @@ mod tests {
                 metadata_generation: 0,
             };
 
-            decode_cpu_batch(&data, &specs, &metadata, &mut state).unwrap();
+            decode_cpu_batch::<false>(&data, &specs, &metadata, &mut state).unwrap();
         }
 
         assert_eq!(batches.metadata_scopes, 0);

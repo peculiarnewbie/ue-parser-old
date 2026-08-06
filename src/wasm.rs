@@ -315,7 +315,9 @@ impl ProgressiveUtraceSession {
         }
         let options = dashboard_options(options_json)?;
         Ok(Self {
-            inner: Some(crate::utrace::ProgressiveDashboardSession::new(options)),
+            inner: Some(
+                crate::utrace::ProgressiveDashboardSession::new_with_eager_cpu_timeline(options),
+            ),
             filename,
             total_bytes: total_bytes as u64,
             sequence: 0,

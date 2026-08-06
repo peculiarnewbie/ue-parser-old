@@ -3,6 +3,7 @@
 //! Each thread owns append-only, page-addressable columns. Cycles and begin
 //! bits are parallel columns; timer identities are stored only for begins.
 
+use std::borrow::Cow;
 use std::collections::BinaryHeap;
 use std::mem::size_of;
 
@@ -13,18 +14,19 @@ use crate::utrace::{CpuTimelineInterval, CpuTimelineQuery, CpuTimelineQueryResul
 use crate::utrace_timeline::{CpuTimelineIndexInfo, SourceIdentity, TimelineIndexError};
 
 const PAGE_ENTRIES: usize = 65_536;
-const NONE_METADATA_ID: u32 = u32::MAX;
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum CpuTimerRef {
+    Spec(u32),
+    Metadata(u32),
+}
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct CpuMonotonicEventView<'a> {
-    pub(crate) spec_id: u32,
-    pub(crate) name: &'a str,
-    pub(crate) metadata_id: Option<u32>,
-    pub(crate) rendered_name: Option<&'a str>,
+pub(crate) trait CpuTimelineCatalogSink {
+    fn register_spec(&mut self, spec_id: u32, name: &str);
+    fn register_metadata(&mut self, metadata_id: u32, spec_id: u32, rendered_name: Option<&str>);
 }
 
 pub(crate) trait CpuMonotonicTimelineSink {
-    fn append_begin(&mut self, thread_id: u16, cycle: u64, event: CpuMonotonicEventView<'_>);
+    fn append_begin(&mut self, thread_id: u16, cycle: u64, timer: CpuTimerRef);
     fn append_end(&mut self, thread_id: u16, cycle: u64);
 }
 
@@ -49,7 +51,8 @@ pub struct CpuMonotonicTimelineStats {
 pub struct CpuMonotonicTimelineIndex {
     info: CpuTimelineIndexInfo,
     stats: CpuMonotonicTimelineStats,
-    events: Vec<OwnedEvent>,
+    specs: Vec<SpecCatalogRecord>,
+    metadata: Vec<MetadataCatalogRecord>,
     strings: Vec<u8>,
     threads: FxHashMap<u16, ThreadTimeline>,
 }
@@ -87,12 +90,12 @@ impl CpuMonotonicTimelineIndex {
             if query.thread_id.is_some_and(|wanted| wanted != thread_id) {
                 continue;
             }
-            timeline.enumerate(start_cycle, end_cycle, |event_id, begin, end| {
-                let Some(event) = self.events.get(event_id as usize) else {
+            timeline.enumerate(start_cycle, end_cycle, |timer_ref, begin, end| {
+                let Some(timer) = self.resolve_timer(timer_ref) else {
                     return;
                 };
-                let name = text_at(&self.strings, event.name).unwrap_or("<invalid name>");
-                let rendered_name = event
+                let name = self.timer_name(timer);
+                let rendered_name = timer
                     .rendered_name
                     .and_then(|reference| text_at(&self.strings, reference));
                 if needle.as_deref().is_some_and(|needle| {
@@ -106,7 +109,7 @@ impl CpuMonotonicTimelineIndex {
                     start_cycle: begin,
                     end_cycle: end,
                     thread_id,
-                    event_id,
+                    timer: timer.timer,
                 };
                 if hits.len() < limit {
                     hits.push(hit);
@@ -120,13 +123,13 @@ impl CpuMonotonicTimelineIndex {
             .into_sorted_vec()
             .into_iter()
             .filter_map(|hit| {
-                let event = self.events.get(hit.event_id as usize)?;
-                let name = text_at(&self.strings, event.name).unwrap_or("<invalid name>");
+                let timer = self.resolve_timer(hit.timer)?;
+                let name = self.timer_name(timer);
                 let duration = hit.end_cycle.saturating_sub(hit.start_cycle);
                 Some(CpuTimelineInterval {
                     thread_id: hit.thread_id,
-                    spec_id: event.spec_id,
-                    name: name.to_owned(),
+                    spec_id: timer.spec_id,
+                    name: name.into_owned(),
                     start_cycle: hit.start_cycle,
                     end_cycle: hit.end_cycle,
                     duration,
@@ -134,9 +137,8 @@ impl CpuMonotonicTimelineIndex {
                         .info
                         .cycle_frequency
                         .map(|frequency| duration as f64 / frequency as f64),
-                    metadata_id: (event.metadata_id != NONE_METADATA_ID)
-                        .then_some(event.metadata_id),
-                    rendered_name: event
+                    metadata_id: timer.metadata_id,
+                    rendered_name: timer
                         .rendered_name
                         .and_then(|reference| text_at(&self.strings, reference))
                         .map(str::to_owned),
@@ -156,6 +158,52 @@ impl CpuMonotonicTimelineIndex {
             intervals,
         })
     }
+
+    fn resolve_timer(&self, timer: CpuTimerRef) -> Option<ResolvedTimer> {
+        match timer {
+            CpuTimerRef::Spec(spec_id) => Some(ResolvedTimer {
+                timer,
+                spec_id,
+                name: self.spec(spec_id).map(|spec| spec.name),
+                metadata_id: None,
+                rendered_name: None,
+            }),
+            CpuTimerRef::Metadata(metadata_id) => {
+                let metadata = self.metadata(metadata_id);
+                Some(ResolvedTimer {
+                    timer,
+                    spec_id: metadata.map_or(u32::MAX, |metadata| metadata.spec_id),
+                    name: metadata
+                        .and_then(|metadata| self.spec(metadata.spec_id))
+                        .map(|spec| spec.name),
+                    metadata_id: Some(metadata_id),
+                    rendered_name: metadata.and_then(|metadata| metadata.rendered_name),
+                })
+            }
+        }
+    }
+
+    fn timer_name<'a>(&'a self, timer: ResolvedTimer) -> Cow<'a, str> {
+        timer
+            .name
+            .and_then(|reference| text_at(&self.strings, reference))
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| Cow::Owned(format!("#{}", timer.spec_id)))
+    }
+
+    fn spec(&self, id: u32) -> Option<&SpecCatalogRecord> {
+        self.specs
+            .binary_search_by_key(&id, |spec| spec.id)
+            .ok()
+            .map(|index| &self.specs[index])
+    }
+
+    fn metadata(&self, id: u32) -> Option<&MetadataCatalogRecord> {
+        self.metadata
+            .binary_search_by_key(&id, |metadata| metadata.id)
+            .ok()
+            .map(|index| &self.metadata[index])
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -163,20 +211,28 @@ struct QueryHit {
     start_cycle: u64,
     end_cycle: u64,
     thread_id: u16,
-    event_id: u32,
+    timer: CpuTimerRef,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct EventKey {
+#[derive(Clone, Copy, Debug)]
+struct ResolvedTimer {
+    timer: CpuTimerRef,
     spec_id: u32,
-    metadata_id: u32,
+    name: Option<StringRef>,
+    metadata_id: Option<u32>,
+    rendered_name: Option<StringRef>,
 }
 
-#[derive(Clone, Debug)]
-struct OwnedEvent {
-    spec_id: u32,
-    metadata_id: u32,
+#[derive(Clone, Copy, Debug)]
+struct SpecCatalogRecord {
+    id: u32,
     name: StringRef,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MetadataCatalogRecord {
+    id: u32,
+    spec_id: u32,
     rendered_name: Option<StringRef>,
 }
 
@@ -189,7 +245,7 @@ struct StringRef {
 #[derive(Clone, Copy, Debug)]
 struct OpenScope {
     start_cycle: u64,
-    event_id: u32,
+    timer: CpuTimerRef,
 }
 
 #[derive(Clone, Debug)]
@@ -198,6 +254,7 @@ struct Page {
     end_cycle: u64,
     initial_stack: Vec<OpenScope>,
     begin_bits: Vec<u64>,
+    metadata_bits: Vec<u64>,
     columns: PageColumns,
 }
 
@@ -205,12 +262,12 @@ struct Page {
 enum PageColumns {
     Open {
         cycles: Vec<u64>,
-        event_ids: Vec<u32>,
+        timer_ids: Vec<u32>,
     },
     Encoded {
         entry_count: usize,
         cycles: Vec<u8>,
-        event_ids: Vec<u8>,
+        timer_ids: Vec<u8>,
     },
 }
 
@@ -221,9 +278,10 @@ impl Page {
             end_cycle: cycle,
             initial_stack: initial_stack.to_vec(),
             begin_bits: Vec::with_capacity(PAGE_ENTRIES / 64),
+            metadata_bits: Vec::with_capacity(PAGE_ENTRIES / 128),
             columns: PageColumns::Open {
                 cycles: Vec::with_capacity(PAGE_ENTRIES),
-                event_ids: Vec::with_capacity(PAGE_ENTRIES / 2),
+                timer_ids: Vec::with_capacity(PAGE_ENTRIES / 2),
             },
         }
     }
@@ -248,14 +306,25 @@ impl Page {
         self.entry_count() == PAGE_ENTRIES
     }
 
-    fn append_begin(&mut self, cycle: u64, event_id: u32) {
+    fn append_begin(&mut self, cycle: u64, timer: CpuTimerRef) {
         let entry_index = self.start_entry(cycle);
         self.begin_bits[entry_index / 64] |= 1_u64 << (entry_index % 64);
-        let PageColumns::Open { cycles, event_ids } = &mut self.columns else {
+        let PageColumns::Open { cycles, timer_ids } = &mut self.columns else {
             unreachable!("encoded pages are immutable");
         };
+        let timer_index = timer_ids.len();
+        if timer_index % 64 == 0 {
+            self.metadata_bits.push(0);
+        }
+        let timer_id = match timer {
+            CpuTimerRef::Spec(id) => id,
+            CpuTimerRef::Metadata(id) => {
+                self.metadata_bits[timer_index / 64] |= 1_u64 << (timer_index % 64);
+                id
+            }
+        };
         cycles.push(cycle);
-        event_ids.push(event_id);
+        timer_ids.push(timer_id);
     }
 
     fn append_end(&mut self, cycle: u64) {
@@ -270,12 +339,12 @@ impl Page {
         if matches!(self.columns, PageColumns::Encoded { .. }) {
             return;
         }
-        let PageColumns::Open { cycles, event_ids } = std::mem::replace(
+        let PageColumns::Open { cycles, timer_ids } = std::mem::replace(
             &mut self.columns,
             PageColumns::Encoded {
                 entry_count: 0,
                 cycles: Vec::new(),
-                event_ids: Vec::new(),
+                timer_ids: Vec::new(),
             },
         ) else {
             return;
@@ -287,21 +356,21 @@ impl Page {
             append_varint(&mut encoded_cycles, zigzag_delta(cycle, previous_cycle));
             previous_cycle = cycle;
         }
-        let mut encoded_event_ids = Vec::with_capacity(event_ids.len().saturating_mul(3));
+        let mut encoded_timer_ids = Vec::with_capacity(timer_ids.len().saturating_mul(3));
         let mut previous_id = 0_u32;
-        for event_id in event_ids {
+        for timer_id in timer_ids {
             append_varint(
-                &mut encoded_event_ids,
-                zigzag_delta(u64::from(event_id), u64::from(previous_id)),
+                &mut encoded_timer_ids,
+                zigzag_delta(u64::from(timer_id), u64::from(previous_id)),
             );
-            previous_id = event_id;
+            previous_id = timer_id;
         }
         encoded_cycles.shrink_to_fit();
-        encoded_event_ids.shrink_to_fit();
+        encoded_timer_ids.shrink_to_fit();
         self.columns = PageColumns::Encoded {
             entry_count,
             cycles: encoded_cycles,
-            event_ids: encoded_event_ids,
+            timer_ids: encoded_timer_ids,
         };
     }
 
@@ -311,17 +380,30 @@ impl Page {
             .is_some_and(|word| (word & (1_u64 << (index % 64))) != 0)
     }
 
-    fn for_each_entry(&self, mut visit: impl FnMut(usize, u64, Option<u32>) -> bool) {
+    fn timer_ref(&self, timer_index: usize, id: u32) -> CpuTimerRef {
+        if self
+            .metadata_bits
+            .get(timer_index / 64)
+            .is_some_and(|word| (word & (1_u64 << (timer_index % 64))) != 0)
+        {
+            CpuTimerRef::Metadata(id)
+        } else {
+            CpuTimerRef::Spec(id)
+        }
+    }
+
+    fn for_each_entry(&self, mut visit: impl FnMut(usize, u64, Option<CpuTimerRef>) -> bool) {
         match &self.columns {
-            PageColumns::Open { cycles, event_ids } => {
-                let mut event_index = 0;
+            PageColumns::Open { cycles, timer_ids } => {
+                let mut timer_index = 0;
                 for (entry_index, &cycle) in cycles.iter().enumerate() {
-                    let event_id = self.is_begin(entry_index).then(|| {
-                        let id = event_ids[event_index];
-                        event_index += 1;
-                        id
+                    let timer = self.is_begin(entry_index).then(|| {
+                        let id = timer_ids[timer_index];
+                        let timer = self.timer_ref(timer_index, id);
+                        timer_index += 1;
+                        timer
                     });
-                    if !visit(entry_index, cycle, event_id) {
+                    if !visit(entry_index, cycle, timer) {
                         break;
                     }
                 }
@@ -329,27 +411,31 @@ impl Page {
             PageColumns::Encoded {
                 entry_count,
                 cycles,
-                event_ids,
+                timer_ids,
             } => {
                 let mut cycle_cursor = 0;
-                let mut event_cursor = 0;
+                let mut timer_cursor = 0;
                 let mut cycle = 0_u64;
-                let mut event_id = 0_u64;
+                let mut timer_id = 0_u64;
+                let mut timer_index = 0;
                 for entry_index in 0..*entry_count {
                     let Some(delta) = read_varint(cycles, &mut cycle_cursor) else {
                         break;
                     };
                     cycle = apply_zigzag_delta(cycle, delta);
-                    let decoded_event_id = if self.is_begin(entry_index) {
-                        let Some(delta) = read_varint(event_ids, &mut event_cursor) else {
+                    let decoded_timer = if self.is_begin(entry_index) {
+                        let Some(delta) = read_varint(timer_ids, &mut timer_cursor) else {
                             break;
                         };
-                        event_id = apply_zigzag_delta(event_id, delta);
-                        Some(u32::try_from(event_id).unwrap_or(u32::MAX))
+                        timer_id = apply_zigzag_delta(timer_id, delta);
+                        let timer = self
+                            .timer_ref(timer_index, u32::try_from(timer_id).unwrap_or(u32::MAX));
+                        timer_index += 1;
+                        Some(timer)
                     } else {
                         None
                     };
-                    if !visit(entry_index, cycle, decoded_event_id) {
+                    if !visit(entry_index, cycle, decoded_timer) {
                         break;
                     }
                 }
@@ -376,12 +462,12 @@ impl ThreadTimeline {
         self.pages.last_mut().expect("timeline page was appended")
     }
 
-    fn append_begin(&mut self, cycle: u64, event_id: u32) {
+    fn append_begin(&mut self, cycle: u64, timer: CpuTimerRef) {
         let page = self.page_for_append(cycle);
-        page.append_begin(cycle, event_id);
+        page.append_begin(cycle, timer);
         self.stack.push(OpenScope {
             start_cycle: cycle,
-            event_id,
+            timer,
         });
     }
 
@@ -395,7 +481,12 @@ impl ThreadTimeline {
         self.completed_scope_count = self.completed_scope_count.saturating_add(1);
     }
 
-    fn enumerate(&self, start_cycle: u64, end_cycle: u64, mut emit: impl FnMut(u32, u64, u64)) {
+    fn enumerate(
+        &self,
+        start_cycle: u64,
+        end_cycle: u64,
+        mut emit: impl FnMut(CpuTimerRef, u64, u64),
+    ) {
         let Some(_) = self.pages.first() else {
             return;
         };
@@ -406,21 +497,21 @@ impl ThreadTimeline {
         let mut stack = self.pages[page_index]
             .initial_stack
             .iter()
-            .map(|open| (open.event_id, open.start_cycle))
+            .map(|open| (open.timer, open.start_cycle))
             .collect::<Vec<_>>();
         'pages: for page in &self.pages[page_index..] {
             let mut continue_page = true;
-            page.for_each_entry(|_entry_index, cycle, event_id| {
+            page.for_each_entry(|_entry_index, cycle, timer| {
                 if cycle > end_cycle {
                     continue_page = false;
                     return false;
                 }
-                if let Some(event_id) = event_id {
-                    stack.push((event_id, cycle));
-                } else if let Some((event_id, begin_cycle)) = stack.pop()
+                if let Some(timer) = timer {
+                    stack.push((timer, cycle));
+                } else if let Some((timer, begin_cycle)) = stack.pop()
                     && cycle >= start_cycle
                 {
-                    emit(event_id, begin_cycle, cycle);
+                    emit(timer, begin_cycle, cycle);
                 }
                 true
             });
@@ -428,9 +519,9 @@ impl ThreadTimeline {
                 break 'pages;
             }
         }
-        for (event_id, begin_cycle) in stack {
+        for (timer, begin_cycle) in stack {
             if begin_cycle <= end_cycle {
-                emit(event_id, begin_cycle, end_cycle);
+                emit(timer, begin_cycle, end_cycle);
             }
         }
     }
@@ -440,9 +531,8 @@ pub(crate) struct CpuMonotonicTimelineBuilder {
     begin_count: u64,
     begin_cycle: Option<u64>,
     end_cycle: Option<u64>,
-    event_ids: FxHashMap<EventKey, u32>,
-    spec_names: FxHashMap<u32, StringRef>,
-    events: Vec<OwnedEvent>,
+    specs: FxHashMap<u32, SpecCatalogRecord>,
+    metadata: FxHashMap<u32, MetadataCatalogRecord>,
     strings: Vec<u8>,
     threads: FxHashMap<u16, ThreadTimeline>,
 }
@@ -453,9 +543,8 @@ impl CpuMonotonicTimelineBuilder {
             begin_count: 0,
             begin_cycle: None,
             end_cycle: None,
-            event_ids: FxHashMap::default(),
-            spec_names: FxHashMap::default(),
-            events: Vec::new(),
+            specs: FxHashMap::default(),
+            metadata: FxHashMap::default(),
             strings: Vec::new(),
             threads: FxHashMap::default(),
         }
@@ -495,7 +584,10 @@ impl CpuMonotonicTimelineBuilder {
                 self.threads
                     .values()
                     .flat_map(|timeline| &timeline.pages)
-                    .map(|page| (page.begin_bits.len() * size_of::<u64>()) as u64)
+                    .map(|page| {
+                        ((page.begin_bits.len() + page.metadata_bits.len()) * size_of::<u64>())
+                            as u64
+                    })
                     .sum::<u64>(),
             );
         let column_allocated_bytes = self
@@ -508,8 +600,16 @@ impl CpuMonotonicTimelineBuilder {
             .values()
             .map(thread_page_allocated_bytes)
             .sum::<u64>();
-        let catalog_allocated_bytes =
-            (self.events.capacity() * size_of::<OwnedEvent>() + self.strings.capacity()) as u64;
+        let mut specs = self.specs.into_values().collect::<Vec<_>>();
+        specs.sort_unstable_by_key(|spec| spec.id);
+        specs.shrink_to_fit();
+        let mut metadata = self.metadata.into_values().collect::<Vec<_>>();
+        metadata.sort_unstable_by_key(|metadata| metadata.id);
+        metadata.shrink_to_fit();
+        self.strings.shrink_to_fit();
+        let catalog_allocated_bytes = (specs.capacity() * size_of::<SpecCatalogRecord>()
+            + metadata.capacity() * size_of::<MetadataCatalogRecord>()
+            + self.strings.capacity()) as u64;
         let allocated_bytes = column_allocated_bytes
             .saturating_add(page_allocated_bytes)
             .saturating_add(catalog_allocated_bytes);
@@ -519,7 +619,7 @@ impl CpuMonotonicTimelineBuilder {
             entry_count,
             begin_count: self.begin_count,
             completed_scope_count,
-            event_count: self.events.len() as u64,
+            event_count: specs.len().saturating_add(metadata.len()) as u64,
             payload_bytes,
             uncompressed_payload_bytes,
             allocated_bytes,
@@ -543,49 +643,46 @@ impl CpuMonotonicTimelineBuilder {
                 end_cycle: self.end_cycle,
             },
             stats,
-            events: self.events,
+            specs,
+            metadata,
             strings: self.strings,
             threads: self.threads,
         }
     }
+}
 
-    fn intern(&mut self, event: CpuMonotonicEventView<'_>) -> u32 {
-        let key = EventKey {
-            spec_id: event.spec_id,
-            metadata_id: event.metadata_id.unwrap_or(NONE_METADATA_ID),
-        };
-        if let Some(&id) = self.event_ids.get(&key) {
-            return id;
+impl CpuTimelineCatalogSink for CpuMonotonicTimelineBuilder {
+    fn register_spec(&mut self, spec_id: u32, name: &str) {
+        if self.specs.contains_key(&spec_id) {
+            return;
         }
-        let id = u32::try_from(self.events.len()).unwrap_or(u32::MAX);
-        let name = if let Some(&name) = self.spec_names.get(&event.spec_id) {
-            name
-        } else {
-            let name = append_text(&mut self.strings, event.name);
-            self.spec_names.insert(event.spec_id, name);
-            name
-        };
-        let rendered_name = event
-            .rendered_name
-            .map(|value| append_text(&mut self.strings, value));
-        self.events.push(OwnedEvent {
-            spec_id: event.spec_id,
-            metadata_id: key.metadata_id,
-            name,
-            rendered_name,
-        });
-        self.event_ids.insert(key, id);
-        id
+        let name = append_text(&mut self.strings, name);
+        self.specs
+            .insert(spec_id, SpecCatalogRecord { id: spec_id, name });
+    }
+
+    fn register_metadata(&mut self, metadata_id: u32, spec_id: u32, rendered_name: Option<&str>) {
+        if self.metadata.contains_key(&metadata_id) {
+            return;
+        }
+        let rendered_name = rendered_name.map(|name| append_text(&mut self.strings, name));
+        self.metadata.insert(
+            metadata_id,
+            MetadataCatalogRecord {
+                id: metadata_id,
+                spec_id,
+                rendered_name,
+            },
+        );
     }
 }
 
 impl CpuMonotonicTimelineSink for CpuMonotonicTimelineBuilder {
-    fn append_begin(&mut self, thread_id: u16, cycle: u64, event: CpuMonotonicEventView<'_>) {
-        let event_id = self.intern(event);
+    fn append_begin(&mut self, thread_id: u16, cycle: u64, timer: CpuTimerRef) {
         self.threads
             .entry(thread_id)
             .or_default()
-            .append_begin(cycle, event_id);
+            .append_begin(cycle, timer);
         self.begin_count = self.begin_count.saturating_add(1);
         self.begin_cycle = Some(self.begin_cycle.map_or(cycle, |begin| begin.min(cycle)));
         self.end_cycle = Some(self.end_cycle.map_or(cycle, |end| end.max(cycle)));
@@ -603,14 +700,16 @@ fn thread_payload_bytes(timeline: &ThreadTimeline) -> u64 {
         .iter()
         .map(|page| {
             let columns = match &page.columns {
-                PageColumns::Open { cycles, event_ids } => {
-                    cycles.len() * size_of::<u64>() + event_ids.len() * size_of::<u32>()
+                PageColumns::Open { cycles, timer_ids } => {
+                    cycles.len() * size_of::<u64>() + timer_ids.len() * size_of::<u32>()
                 }
                 PageColumns::Encoded {
-                    cycles, event_ids, ..
-                } => cycles.len() + event_ids.len(),
+                    cycles, timer_ids, ..
+                } => cycles.len() + timer_ids.len(),
             };
-            (columns + page.begin_bits.len() * size_of::<u64>()) as u64
+            (columns
+                + page.begin_bits.len() * size_of::<u64>()
+                + page.metadata_bits.len() * size_of::<u64>()) as u64
         })
         .sum()
 }
@@ -621,14 +720,16 @@ fn thread_column_allocated_bytes(timeline: &ThreadTimeline) -> u64 {
         .iter()
         .map(|page| {
             let columns = match &page.columns {
-                PageColumns::Open { cycles, event_ids } => {
-                    cycles.capacity() * size_of::<u64>() + event_ids.capacity() * size_of::<u32>()
+                PageColumns::Open { cycles, timer_ids } => {
+                    cycles.capacity() * size_of::<u64>() + timer_ids.capacity() * size_of::<u32>()
                 }
                 PageColumns::Encoded {
-                    cycles, event_ids, ..
-                } => cycles.capacity() + event_ids.capacity(),
+                    cycles, timer_ids, ..
+                } => cycles.capacity() + timer_ids.capacity(),
             };
-            (columns + page.begin_bits.capacity() * size_of::<u64>()) as u64
+            (columns
+                + page.begin_bits.capacity() * size_of::<u64>()
+                + page.metadata_bits.capacity() * size_of::<u64>()) as u64
         })
         .sum()
 }
@@ -702,20 +803,13 @@ fn apply_zigzag_delta(previous: u64, encoded: u64) -> u64 {
 mod tests {
     use super::*;
 
-    fn event(spec_id: u32, name: &str) -> CpuMonotonicEventView<'_> {
-        CpuMonotonicEventView {
-            spec_id,
-            name,
-            metadata_id: None,
-            rendered_name: None,
-        }
-    }
-
     #[test]
     fn nested_scopes_query_from_parallel_columns() {
         let mut builder = CpuMonotonicTimelineBuilder::new();
-        builder.append_begin(2, 10, event(1, "outer"));
-        builder.append_begin(2, 20, event(2, "inner"));
+        builder.register_spec(1, "outer");
+        builder.register_spec(2, "inner");
+        builder.append_begin(2, 10, CpuTimerRef::Spec(1));
+        builder.append_begin(2, 20, CpuTimerRef::Spec(2));
         builder.append_end(2, 30);
         builder.append_end(2, 40);
         let index = builder.finish(SourceIdentity::from_bytes(b"trace"), Some(10));
@@ -731,16 +825,17 @@ mod tests {
         assert_eq!(result.intervals[0].end_cycle, 35);
         assert_eq!(result.intervals[1].name, "inner");
         assert_eq!(result.intervals[1].end_cycle, 30);
-        assert_eq!(index.stats().payload_bytes, 14);
-        assert_eq!(index.stats().uncompressed_payload_bytes, 48);
+        assert_eq!(index.stats().payload_bytes, 22);
+        assert_eq!(index.stats().uncompressed_payload_bytes, 56);
     }
 
     #[test]
     fn completed_pages_remain_queryable_after_finish() {
         let mut builder = CpuMonotonicTimelineBuilder::new();
+        builder.register_spec(1, "scope");
         for scope in 0..=(PAGE_ENTRIES / 2) {
             let begin = (scope * 2) as u64;
-            builder.append_begin(7, begin, event(1, "scope"));
+            builder.append_begin(7, begin, CpuTimerRef::Spec(1));
             builder.append_end(7, begin + 1);
         }
         let index = builder.finish(SourceIdentity::from_bytes(b"trace"), None);
@@ -769,9 +864,11 @@ mod tests {
     #[test]
     fn bounded_query_keeps_earliest_scope_across_threads() {
         let mut builder = CpuMonotonicTimelineBuilder::new();
-        builder.append_begin(10, 100, event(1, "late"));
+        builder.register_spec(1, "late");
+        builder.register_spec(2, "early");
+        builder.append_begin(10, 100, CpuTimerRef::Spec(1));
         builder.append_end(10, 110);
-        builder.append_begin(2, 10, event(2, "early"));
+        builder.append_begin(2, 10, CpuTimerRef::Spec(2));
         builder.append_end(2, 20);
         let index = builder.finish(SourceIdentity::from_bytes(b"trace"), None);
         let result = index
