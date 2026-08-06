@@ -8,13 +8,13 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::Reader;
 use crate::utrace::{
     CpuTimelineMemoryIndex, DashboardOptions, DecodedStreams, EventTypeInfo, FrameMarkerKind,
-    PacketSummary, SourceFingerprint, ThreadPacketSummary, TimelineIndexBuild,
-    TimelineIndexRequest, TraceDashboard, TraceError, TraceErrorKind, TraceHeader, TraceInventory,
-    TracePrologue, TraceThreadInfo, dashboard_from_decoded,
-    dashboard_from_decoded_with_memory_timeline_index, dashboard_from_decoded_with_timeline_index,
-    decode_frame_marker, decode_new_event, decode_new_trace, decode_thread_info,
-    decompress_lz4_into_stream, inventory_from_decoded, parse_protocol5_normal_event,
-    read_u32_field, read_u64_field,
+    GpuTimelineMemoryIndex, InventoryObservations, InventorySample, PacketSummary,
+    SourceFingerprint, ThreadPacketSummary, TimelineIndexBuild, TimelineIndexRequest,
+    TraceDashboard, TraceError, TraceErrorKind, TraceHeader, TraceInventory, TracePrologue,
+    TraceThreadInfo, dashboard_from_decoded, dashboard_from_decoded_with_memory_timeline_index,
+    dashboard_from_decoded_with_timeline_index, decode_frame_marker, decode_new_event,
+    decode_new_trace, decode_thread_info, decompress_lz4_into_stream, inventory_from_observations,
+    parse_protocol5_normal_event, read_u32_field, read_u64_field,
 };
 use crate::utrace_progress::{
     DashboardBootstrap, DashboardPatch, DecodePhase, DecodeProgress, FrameTimingDashboard,
@@ -42,6 +42,13 @@ struct ProgressiveGpuCompletedWork {
 }
 
 #[derive(Clone, Debug)]
+struct ProgressiveInventorySample {
+    thread_id: u16,
+    stream_offset: usize,
+    data: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
 struct ProgressiveFrameSlot {
     begin_cycle: u64,
     end_cycle: Option<u64>,
@@ -65,6 +72,9 @@ pub struct ProgressiveDashboardSession {
     bootstrap_prologue: Option<TracePrologue>,
     bootstrap_threads: Vec<TraceThreadInfo>,
     bootstrap_threads_truncated: bool,
+    inventory_observed: BTreeMap<u16, u64>,
+    inventory_known_observed: BTreeMap<u16, u64>,
+    inventory_samples: BTreeMap<u16, ProgressiveInventorySample>,
     /// Insights `FFrameProvider` parity: each `BeginFrame` pushes a slot; each
     /// `EndFrame` updates the latest slot for that `FrameType` (and may extend an
     /// already-closed frame). See TraceServices `Frames.cpp`.
@@ -96,6 +106,9 @@ impl ProgressiveDashboardSession {
             bootstrap_prologue: None,
             bootstrap_threads: Vec::new(),
             bootstrap_threads_truncated: false,
+            inventory_observed: BTreeMap::new(),
+            inventory_known_observed: BTreeMap::new(),
+            inventory_samples: BTreeMap::new(),
             frames_by_type: BTreeMap::new(),
             progressive_frames: Vec::new(),
             progressive_frame_count: 0,
@@ -134,7 +147,7 @@ impl ProgressiveDashboardSession {
     pub fn finish(self) -> Result<TraceDashboard, TraceError> {
         let options = self.options;
         let frame_timing = self.frame_timing_dashboard();
-        let (header, decoded) = self.finish_decoding()?;
+        let (header, decoded, _) = self.finish_decoding()?;
         let mut dashboard = dashboard_from_decoded(header, decoded, options)?;
         dashboard.frame_timing = Some(frame_timing);
         Ok(dashboard)
@@ -143,8 +156,8 @@ impl ProgressiveDashboardSession {
     pub fn finish_with_inventory(self) -> Result<(TraceDashboard, TraceInventory), TraceError> {
         let options = self.options;
         let frame_timing = self.frame_timing_dashboard();
-        let (header, decoded) = self.finish_decoding()?;
-        let inventory = inventory_from_decoded(header.clone(), &decoded)?;
+        let (header, decoded, inventory_observations) = self.finish_decoding()?;
+        let inventory = inventory_from_observations(header.clone(), inventory_observations)?;
         let mut dashboard = dashboard_from_decoded(header, decoded, options)?;
         dashboard.frame_timing = Some(frame_timing);
         Ok((dashboard, inventory))
@@ -157,8 +170,8 @@ impl ProgressiveDashboardSession {
         let options = self.options;
         let source_identity = self.source_fingerprint.finish();
         let frame_timing = self.frame_timing_dashboard();
-        let (header, decoded) = self.finish_decoding()?;
-        let inventory = inventory_from_decoded(header.clone(), &decoded)?;
+        let (header, decoded, inventory_observations) = self.finish_decoding()?;
+        let inventory = inventory_from_observations(header.clone(), inventory_observations)?;
         let (mut dashboard, timeline_index) = dashboard_from_decoded_with_timeline_index(
             header,
             decoded,
@@ -171,20 +184,29 @@ impl ProgressiveDashboardSession {
 
     pub fn finish_with_inventory_and_memory_timeline_index(
         self,
-    ) -> Result<(TraceDashboard, TraceInventory, CpuTimelineMemoryIndex), TraceError> {
+    ) -> Result<
+        (
+            TraceDashboard,
+            TraceInventory,
+            CpuTimelineMemoryIndex,
+            GpuTimelineMemoryIndex,
+        ),
+        TraceError,
+    > {
         let options = self.options;
         let source_identity = self.source_fingerprint.finish();
         let frame_timing = self.frame_timing_dashboard();
-        let (header, decoded) = self.finish_decoding()?;
-        let inventory = inventory_from_decoded(header.clone(), &decoded)?;
-        let (mut dashboard, timeline_index) = dashboard_from_decoded_with_memory_timeline_index(
-            header,
-            decoded,
-            options,
-            source_identity,
-        )?;
+        let (header, decoded, inventory_observations) = self.finish_decoding()?;
+        let inventory = inventory_from_observations(header.clone(), inventory_observations)?;
+        let (mut dashboard, timeline_index, gpu_timeline_index) =
+            dashboard_from_decoded_with_memory_timeline_index(
+                header,
+                decoded,
+                options,
+                source_identity,
+            )?;
         dashboard.frame_timing = Some(frame_timing);
-        Ok((dashboard, inventory, timeline_index))
+        Ok((dashboard, inventory, timeline_index, gpu_timeline_index))
     }
 
     #[must_use]
@@ -261,7 +283,9 @@ impl ProgressiveDashboardSession {
         }
     }
 
-    fn finish_decoding(mut self) -> Result<(TraceHeader, DecodedStreams), TraceError> {
+    fn finish_decoding(
+        mut self,
+    ) -> Result<(TraceHeader, DecodedStreams, InventoryObservations), TraceError> {
         self.finished = true;
         self.decode_available()?;
         let header = self.header.ok_or_else(|| {
@@ -288,12 +312,31 @@ impl ProgressiveDashboardSession {
         }
         self.summary.threads = self.threads.into_values().collect();
         self.summary.thread_count = self.summary.threads.len();
+        let inventory_observations = InventoryObservations {
+            events: self.bootstrap_registry.into_values().collect(),
+            observed: self.inventory_observed,
+            known_observed: self.inventory_known_observed,
+            samples_by_uid: self
+                .inventory_samples
+                .into_iter()
+                .map(|(uid, sample)| {
+                    (
+                        uid,
+                        InventorySample {
+                            thread_id: sample.thread_id,
+                            data: sample.data,
+                        },
+                    )
+                })
+                .collect(),
+        };
         Ok((
             header,
             DecodedStreams {
                 summary: self.summary,
                 streams: self.streams,
             },
+            inventory_observations,
         ))
     }
 
@@ -308,30 +351,37 @@ impl ProgressiveDashboardSession {
             self.consume(header_len)?;
         }
 
+        let mut consumed = 0_usize;
         loop {
-            if self.pending.len() < 4 {
-                return Ok(());
+            let remaining = &self.pending[consumed..];
+            if remaining.len() < 4 {
+                break;
             }
-            let packet_size = usize::from(u16::from_le_bytes([self.pending[0], self.pending[1]]));
+            let packet_size = usize::from(u16::from_le_bytes([remaining[0], remaining[1]]));
             if packet_size < 4 {
                 return Err(TraceError::new(
                     TraceErrorKind::MalformedData,
-                    self.pending_offset,
+                    self.pending_offset + u64::try_from(consumed).unwrap(),
                     "Packet.PacketSize",
                     format!("packet size {packet_size} is smaller than FTidPacketBase"),
                 ));
             }
-            if self.pending.len() < packet_size {
-                return Ok(());
+            if remaining.len() < packet_size {
+                break;
             }
-            self.decode_packet(packet_size)?;
-            self.consume(packet_size)?;
+            self.decode_packet(consumed, packet_size)?;
+            consumed += packet_size;
         }
+        self.consume(consumed)
     }
 
-    fn decode_packet(&mut self, packet_size: usize) -> Result<(), TraceError> {
-        let packet_offset = self.pending_offset;
-        let thread_word = u16::from_le_bytes([self.pending[2], self.pending[3]]);
+    fn decode_packet(&mut self, packet_start: usize, packet_size: usize) -> Result<(), TraceError> {
+        let packet_end = packet_start
+            .checked_add(packet_size)
+            .expect("packet end fits because the pending slice contains it");
+        let packet = &self.pending[packet_start..packet_end];
+        let packet_offset = self.pending_offset + u64::try_from(packet_start).unwrap();
+        let thread_word = u16::from_le_bytes([packet[2], packet[3]]);
         let thread_id = thread_word & 0x3fff;
         let encoded = (thread_word & 0x8000) != 0;
         self.summary.count += 1;
@@ -359,7 +409,7 @@ impl ProgressiveDashboardSession {
                     format!("encoded packet size {packet_size} is smaller than FTidPacketEncoded"),
                 ));
             }
-            let decoded_size = usize::from(u16::from_le_bytes([self.pending[4], self.pending[5]]));
+            let decoded_size = usize::from(u16::from_le_bytes([packet[4], packet[5]]));
             let compressed_size = packet_size - 6;
             self.summary.compressed_payload_bytes += u64::try_from(compressed_size).unwrap();
             self.summary.compressed_decoded_bytes += u64::try_from(decoded_size).unwrap();
@@ -411,7 +461,7 @@ impl ProgressiveDashboardSession {
         if encoded {
             decompress_lz4_into_stream(
                 self.streams.entry(thread_id).or_default(),
-                &self.pending[6..packet_size],
+                &packet[6..],
                 decoded_len,
                 packet_offset,
             )?;
@@ -419,7 +469,7 @@ impl ProgressiveDashboardSession {
             self.streams
                 .entry(thread_id)
                 .or_default()
-                .extend_from_slice(&self.pending[4..packet_size]);
+                .extend_from_slice(&packet[4..]);
         }
         if thread_id <= 1 {
             let registry_len = self.bootstrap_registry.len();
@@ -531,6 +581,24 @@ impl ProgressiveDashboardSession {
                     _ => {}
                 }
             }
+            if self.bootstrap_registry.contains_key(&uid) {
+                *self.inventory_observed.entry(uid).or_default() += 1;
+                let should_replace = self.inventory_samples.get(&uid).is_none_or(|sample| {
+                    (thread_id, event_offset) < (sample.thread_id, sample.stream_offset)
+                });
+                if should_replace {
+                    self.inventory_samples.insert(
+                        uid,
+                        ProgressiveInventorySample {
+                            thread_id,
+                            stream_offset: event_offset,
+                            data: data.to_vec(),
+                        },
+                    );
+                }
+            } else {
+                *self.inventory_known_observed.entry(uid).or_default() += 1;
+            }
             cursor = event_end;
         }
         self.important_cursors.insert(thread_id, cursor);
@@ -561,7 +629,20 @@ impl ProgressiveDashboardSession {
                         Err(_) => return Ok(()),
                     };
                 let mut total_end = event.total_end;
-                let mut data = stream[cursor + event.data_start..cursor + event.data_end].to_vec();
+                let event_info = self.bootstrap_registry.get(&event.uid);
+                let needs_provider_data = event_info.is_some_and(|event| {
+                    (event.logger == "Misc"
+                        && matches!(event.event.as_str(), "BeginFrame" | "EndFrame"))
+                        || event.logger == "GpuProfiler"
+                });
+                let sample_offset = cursor + event.offset;
+                let needs_inventory_sample = event_info.is_some()
+                    && self.inventory_samples.get(&event.uid).is_none_or(|sample| {
+                        (thread_id, sample_offset) < (sample.thread_id, sample.stream_offset)
+                    });
+                let needs_data = needs_provider_data || needs_inventory_sample;
+                let mut data = needs_data
+                    .then(|| stream[cursor + event.data_start..cursor + event.data_end].to_vec());
                 if event.has_aux {
                     loop {
                         let Ok(aux) =
@@ -572,13 +653,18 @@ impl ProgressiveDashboardSession {
                         total_end = aux.total_end;
                         match aux.uid {
                             1 => {
-                                let mut raw =
-                                    stream[cursor + aux.offset..cursor + aux.total_end].to_vec();
-                                raw[0] = 1;
-                                data.extend_from_slice(&raw);
+                                if let Some(data) = data.as_mut() {
+                                    let mut raw = stream
+                                        [cursor + aux.offset..cursor + aux.total_end]
+                                        .to_vec();
+                                    raw[0] = 1;
+                                    data.extend_from_slice(&raw);
+                                }
                             }
                             3 => {
-                                data.push(3);
+                                if let Some(data) = data.as_mut() {
+                                    data.push(3);
+                                }
                                 break;
                             }
                             _ => {}
@@ -586,14 +672,34 @@ impl ProgressiveDashboardSession {
                     }
                 }
                 (
-                    self.bootstrap_registry.get(&event.uid).cloned(),
+                    needs_provider_data.then(|| event_info.expect("checked above").clone()),
                     data,
                     total_end,
+                    event.uid,
+                    event_info.is_some(),
+                    needs_inventory_sample,
+                    sample_offset,
                 )
             };
-            let (event, data, consumed) = parsed;
+            let (event, data, consumed, uid, is_declared, needs_inventory_sample, sample_offset) =
+                parsed;
             self.normal_cursors.insert(thread_id, cursor + consumed);
-            let Some(event) = event else {
+            if is_declared {
+                *self.inventory_observed.entry(uid).or_default() += 1;
+                if needs_inventory_sample {
+                    self.inventory_samples.insert(
+                        uid,
+                        ProgressiveInventorySample {
+                            thread_id,
+                            stream_offset: sample_offset,
+                            data: data.as_ref().expect("sample data was requested").clone(),
+                        },
+                    );
+                }
+            } else {
+                *self.inventory_known_observed.entry(uid).or_default() += 1;
+            }
+            let (Some(event), Some(data)) = (event, data) else {
                 continue;
             };
             if event.logger == "Misc" && matches!(event.event.as_str(), "BeginFrame" | "EndFrame") {
@@ -956,6 +1062,19 @@ mod tests {
         assert_eq!(one_byte, expected);
         assert_eq!(irregular, expected);
         assert_eq!(packet_aligned, expected);
+    }
+
+    #[test]
+    fn progressive_inventory_matches_standalone_inventory() {
+        let bytes = trace_with_normal_frame();
+        let expected = crate::utrace::inventory(&bytes).unwrap();
+        let mut session = ProgressiveDashboardSession::new(DashboardOptions::default());
+        for chunk in bytes.chunks(3) {
+            session.push_chunk(chunk).unwrap();
+        }
+        let (_, actual) = session.finish_with_inventory().unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -1,6 +1,11 @@
 import { ParseRequestError, type TimedResult } from "./api";
 import type { WorkerTiming } from "./wasm-worker";
-import type { UtraceDashboard, UtraceProgressEvent, UtraceTimelineQuery } from "./types";
+import type {
+  UtraceDashboard,
+  UtraceGpuTimelineQuery,
+  UtraceProgressEvent,
+  UtraceTimelineQuery,
+} from "./types";
 import type { UtraceDashboardQuery } from "./api";
 
 type WasmOperation = "uasset-inspect" | "utrace-inventory" | "utrace-dashboard" | "utrace-dashboard-bundle";
@@ -196,5 +201,35 @@ export async function queryUtraceTimelineWithWasm(
     };
   } catch {
     throw new ParseRequestError(422, { error: "WASM timeline query returned non-JSON output" });
+  }
+}
+
+export async function queryUtraceGpuTimelineWithWasm(
+  sessionId: string,
+  options: { frame_number: number; limit?: number },
+): Promise<TimedResult<UtraceGpuTimelineQuery>> {
+  const parsedSessionId = Number(sessionId);
+  if (!Number.isSafeInteger(parsedSessionId) || parsedSessionId < 0) {
+    throw new ParseRequestError(422, { error: "invalid browser timeline session" });
+  }
+  const started = performance.now();
+  const result = await workerCall({
+    kind: "utrace-progress-gpu-query",
+    session_id: parsedSessionId,
+    options,
+  });
+  try {
+    return {
+      data: JSON.parse(result.json) as UtraceGpuTimelineQuery,
+      timing: {
+        backend: "wasm",
+        client_ms: performance.now() - started,
+        json_parse_ms: 0,
+        ...result.timing,
+      },
+      sessionId,
+    };
+  } catch {
+    throw new ParseRequestError(422, { error: "WASM GPU timeline query returned non-JSON output" });
   }
 }

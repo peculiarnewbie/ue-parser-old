@@ -186,6 +186,13 @@ export type GpuTimelineDashboard = {
   intervals: GpuTimelineInterval[];
 };
 
+export type UtraceGpuTimelineQuery = {
+  schema_version: number;
+  status: InspectStatus;
+  path: string;
+  timeline: GpuTimelineDashboard;
+};
+
 export type SampleValue =
   | number
   | string

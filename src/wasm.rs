@@ -147,6 +147,12 @@ fn dashboard_options(options_json: &str) -> Result<crate::utrace::DashboardOptio
     })
 }
 
+#[derive(serde::Deserialize)]
+struct GpuTimelineQueryInput {
+    frame_number: u32,
+    limit: Option<usize>,
+}
+
 fn bounded_utrace(bytes: &[u8]) -> Result<(), JsValue> {
     if bytes.len() > MAX_INPUT_BYTES {
         return Err(JsValue::from_str(&format!(
@@ -288,6 +294,7 @@ pub struct ProgressiveUtraceSession {
     bootstrap_emitted: bool,
     last_frame_revision: u64,
     timeline_index: Option<crate::utrace::CpuTimelineMemoryIndex>,
+    gpu_timeline_index: Option<crate::utrace::GpuTimelineMemoryIndex>,
 }
 
 #[wasm_bindgen]
@@ -316,6 +323,7 @@ impl ProgressiveUtraceSession {
             bootstrap_emitted: false,
             last_frame_revision: 0,
             timeline_index: None,
+            gpu_timeline_index: None,
         })
     }
 
@@ -371,11 +379,12 @@ impl ProgressiveUtraceSession {
             .take()
             .ok_or_else(|| JsValue::from_str("session already finished"))?;
         let progress = session.complete_progress(Some(self.total_bytes));
-        let (dashboard, inventory, timeline_index) = session
+        let (dashboard, inventory, timeline_index, gpu_timeline_index) = session
             .finish_with_inventory_and_memory_timeline_index()
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let timeline_index_info = timeline_index.info().clone();
         self.timeline_index = Some(timeline_index);
+        self.gpu_timeline_index = Some(gpu_timeline_index);
         let event = WasmProgressEvent::Complete {
             protocol_version: PROGRESS_PROTOCOL_VERSION,
             sequence: self.sequence,
@@ -428,6 +437,22 @@ impl ProgressiveUtraceSession {
                 limit: input.limit,
             })
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        json(&UtraceOutput {
+            schema_version: UTRACE_SCHEMA_VERSION,
+            status: "ok",
+            path: self.filename.clone(),
+            body: TimelineBody { timeline },
+        })
+    }
+
+    pub fn query_gpu_timeline(&self, options_json: &str) -> Result<String, JsValue> {
+        let input: GpuTimelineQueryInput = serde_json::from_str(options_json)
+            .map_err(|error| JsValue::from_str(&format!("invalid GPU timeline query: {error}")))?;
+        let timeline = self
+            .gpu_timeline_index
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("GPU timeline index is not ready"))?
+            .query(input.frame_number, input.limit);
         json(&UtraceOutput {
             schema_version: UTRACE_SCHEMA_VERSION,
             status: "ok",

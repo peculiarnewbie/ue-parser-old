@@ -9,6 +9,10 @@ use serde::Serialize;
 
 use crate::utrace_callstacks::{CallstackId, CallstackProvider, decode_callstack_spec};
 use crate::utrace_format_args::{format_arg_display_strings, render_format_message};
+pub use crate::utrace_gpu_timeline::{
+    DEFAULT_MAX_GPU_INDEXED_INTERVALS, GpuTimelineMemoryIndex, MAX_GPU_QUERY_INTERVALS,
+};
+use crate::utrace_gpu_timeline::{GpuTimelineIndexBuilder, GpuTimelineSink};
 use crate::utrace_memory::{
     LlmTag, LlmTagSet, LlmTracker, MemoryAllocation, MemoryFree, MemoryInit, MemoryProvider,
     MemoryTag,
@@ -1881,41 +1885,76 @@ pub(super) fn inventory_from_decoded(
         .iter()
         .map(|event| (event.uid, event))
         .collect::<BTreeMap<_, _>>();
-    let mut observed = BTreeMap::<u16, u64>::new();
-    let mut known_observed = BTreeMap::<u16, u64>::new();
-    let mut samples_by_uid = BTreeMap::<u16, RawSample>::new();
+    let mut observations = InventoryObservations::default();
 
     for (thread_id, stream) in &decoded.streams {
         if *thread_id <= 1 {
             for raw_event in read_protocol5_important_events(stream)? {
                 if registry.contains_key(&raw_event.uid) {
-                    *observed.entry(raw_event.uid).or_default() += 1;
-                    samples_by_uid
+                    *observations.observed.entry(raw_event.uid).or_default() += 1;
+                    observations
+                        .samples_by_uid
                         .entry(raw_event.uid)
-                        .or_insert_with(|| RawSample {
+                        .or_insert_with(|| InventorySample {
                             thread_id: *thread_id,
                             data: raw_event.data.to_vec(),
                         });
                 } else {
-                    *known_observed.entry(raw_event.uid).or_default() += 1;
+                    *observations
+                        .known_observed
+                        .entry(raw_event.uid)
+                        .or_default() += 1;
                 }
             }
         } else {
             for raw_event in read_protocol5_normal_events(stream, &registry)? {
                 if registry.contains_key(&raw_event.uid) {
-                    *observed.entry(raw_event.uid).or_default() += 1;
-                    samples_by_uid
+                    *observations.observed.entry(raw_event.uid).or_default() += 1;
+                    observations
+                        .samples_by_uid
                         .entry(raw_event.uid)
-                        .or_insert_with(|| RawSample {
+                        .or_insert_with(|| InventorySample {
                             thread_id: *thread_id,
                             data: raw_event.data.clone(),
                         });
                 } else {
-                    *known_observed.entry(raw_event.uid).or_default() += 1;
+                    *observations
+                        .known_observed
+                        .entry(raw_event.uid)
+                        .or_default() += 1;
                 }
             }
         }
     }
+
+    observations.events = events;
+    inventory_from_observations(header, observations)
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct InventoryObservations {
+    pub(super) events: Vec<EventTypeInfo>,
+    pub(super) observed: BTreeMap<u16, u64>,
+    pub(super) known_observed: BTreeMap<u16, u64>,
+    pub(super) samples_by_uid: BTreeMap<u16, InventorySample>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct InventorySample {
+    pub(super) thread_id: u16,
+    pub(super) data: Vec<u8>,
+}
+
+pub(super) fn inventory_from_observations(
+    header: TraceHeader,
+    observations: InventoryObservations,
+) -> Result<TraceInventory, TraceError> {
+    let InventoryObservations {
+        events,
+        observed,
+        known_observed,
+        samples_by_uid,
+    } = observations;
 
     let mut inventory_events = events
         .into_iter()
@@ -1923,7 +1962,7 @@ pub(super) fn inventory_from_decoded(
             let observed_count = observed.get(&event.uid).copied().unwrap_or(0);
             let samples = samples_by_uid
                 .get(&event.uid)
-                .map(|sample| decode_event_sample(&event, sample))
+                .map(|sample| decode_event_sample_bytes(&event, sample.thread_id, &sample.data))
                 .transpose()?
                 .into_iter()
                 .collect();
@@ -2798,7 +2837,15 @@ fn decode_event_sample(
     event: &EventTypeInfo,
     sample: &RawSample,
 ) -> Result<EventSample, TraceError> {
-    let aux = parse_protocol5_aux(&sample.data, event_data_size(event), 0).unwrap_or_default();
+    decode_event_sample_bytes(event, sample.thread_id, &sample.data)
+}
+
+fn decode_event_sample_bytes(
+    event: &EventTypeInfo,
+    thread_id: u16,
+    data: &[u8],
+) -> Result<EventSample, TraceError> {
+    let aux = parse_protocol5_aux(data, event_data_size(event), 0).unwrap_or_default();
     let mut fields = BTreeMap::new();
     for (index, field) in event.fields.iter().enumerate() {
         let value = if field.size == 0 {
@@ -2807,14 +2854,11 @@ fn decode_event_sample(
                 .transpose()?
                 .unwrap_or_else(|| raw_value("missing_aux", &[]))
         } else {
-            decode_fixed_sample_field(field, &sample.data)
+            decode_fixed_sample_field(field, data)
         };
         fields.insert(field.name.clone(), value);
     }
-    Ok(EventSample {
-        thread_id: sample.thread_id,
-        fields,
-    })
+    Ok(EventSample { thread_id, fields })
 }
 
 fn decode_fixed_sample_field(field: &FieldInfo, data: &[u8]) -> SampleValue {
@@ -3326,13 +3370,18 @@ pub(super) fn dashboard_from_decoded_with_timeline_index(
             },
             None => (None, None),
         };
-    let (dashboard, timeline_index_builder, cycle_frequency) =
-        dashboard_from_decoded_with_timeline_builder(
-            header,
-            decoded,
-            options,
-            timeline_index_builder.take(),
-        )?;
+    let DashboardTimelineBuild {
+        dashboard,
+        cpu_index_builder: timeline_index_builder,
+        cycle_frequency,
+        ..
+    } = dashboard_from_decoded_with_timeline_builder(
+        header,
+        decoded,
+        options,
+        timeline_index_builder.take(),
+        None,
+    )?;
     let timeline_index = timeline_index_request.map(|(request, source)| TimelineIndexBuild {
         output: request.output.clone(),
         result: match (timeline_index_builder, timeline_index_initialization_error) {
@@ -3356,6 +3405,7 @@ pub(super) fn dashboard_from_decoded_with_memory_timeline_index(
     (
         TraceDashboard,
         crate::utrace_timeline::CpuTimelineMemoryIndex,
+        GpuTimelineMemoryIndex,
     ),
     TraceError,
 > {
@@ -3365,8 +3415,19 @@ pub(super) fn dashboard_from_decoded_with_memory_timeline_index(
     // capture instead of failing after its frame markers have already streamed.
     let builder = CpuTimelineIndexBuilder::new_reservoir_sample(DEFAULT_MAX_INDEXED_INTERVALS)
         .map_err(trace_error_from_timeline_index_error)?;
-    let (dashboard, builder, cycle_frequency) =
-        dashboard_from_decoded_with_timeline_builder(header, decoded, options, Some(builder))?;
+    let gpu_builder = GpuTimelineIndexBuilder::new(DEFAULT_MAX_GPU_INDEXED_INTERVALS);
+    let DashboardTimelineBuild {
+        dashboard,
+        cpu_index_builder: builder,
+        gpu_index_builder: gpu_builder,
+        cycle_frequency,
+    } = dashboard_from_decoded_with_timeline_builder(
+        header,
+        decoded,
+        options,
+        Some(builder),
+        Some(gpu_builder),
+    )?;
     let index = builder
         .ok_or_else(|| {
             TraceError::new(
@@ -3378,7 +3439,17 @@ pub(super) fn dashboard_from_decoded_with_memory_timeline_index(
         })?
         .finish_in_memory(source, cycle_frequency)
         .map_err(trace_error_from_timeline_index_error)?;
-    Ok((dashboard, index))
+    let gpu_index = gpu_builder
+        .expect("GPU memory timeline builder was supplied")
+        .finish();
+    Ok((dashboard, index, gpu_index))
+}
+
+struct DashboardTimelineBuild {
+    dashboard: TraceDashboard,
+    cpu_index_builder: Option<CpuTimelineIndexBuilder>,
+    gpu_index_builder: Option<GpuTimelineIndexBuilder>,
+    cycle_frequency: Option<u64>,
 }
 
 fn dashboard_from_decoded_with_timeline_builder(
@@ -3386,7 +3457,8 @@ fn dashboard_from_decoded_with_timeline_builder(
     decoded: DecodedStreams,
     options: DashboardOptions,
     mut timeline_index_builder: Option<CpuTimelineIndexBuilder>,
-) -> Result<(TraceDashboard, Option<CpuTimelineIndexBuilder>, Option<u64>), TraceError> {
+    mut gpu_timeline_index_builder: Option<GpuTimelineIndexBuilder>,
+) -> Result<DashboardTimelineBuild, TraceError> {
     let events = read_event_registry(&header, &decoded.streams)?;
     let decoded_importants = read_known_important_events(&header, &decoded.streams, &events)?;
     let cycle_frequency = decoded_importants
@@ -3414,9 +3486,14 @@ fn dashboard_from_decoded_with_timeline_builder(
             &decoded_importants,
             decoded.summary.sync_count,
             DashboardDecodeOptions::full(options),
-            cpu_timeline_sink
-                .as_mut()
-                .map(|sink| sink as &mut dyn CpuTimelineSink),
+            DashboardTimelineSinks {
+                cpu: cpu_timeline_sink
+                    .as_mut()
+                    .map(|sink| sink as &mut dyn CpuTimelineSink),
+                gpu: gpu_timeline_index_builder
+                    .as_mut()
+                    .map(|sink| sink as &mut dyn GpuTimelineSink),
+            },
         )?
     };
     if let Some(collector) = timeline_collector {
@@ -3452,7 +3529,12 @@ fn dashboard_from_decoded_with_timeline_builder(
         dispatch: dashboard.dispatch,
         session: dashboard.session,
     };
-    Ok((dashboard, timeline_index_builder, cycle_frequency))
+    Ok(DashboardTimelineBuild {
+        dashboard,
+        cpu_index_builder: timeline_index_builder,
+        gpu_index_builder: gpu_timeline_index_builder,
+        cycle_frequency,
+    })
 }
 
 fn trace_error_from_timeline_index_error(error: TimelineIndexError) -> TraceError {
@@ -3511,7 +3593,10 @@ pub fn build_cpu_timeline_index_with_source_identity(
         &decoded_importants,
         decoded.summary.sync_count,
         DashboardDecodeOptions::cpu_timeline_only(),
-        Some(&mut index),
+        DashboardTimelineSinks {
+            cpu: Some(&mut index),
+            gpu: None,
+        },
     )
     .map_err(trace_error_to_timeline_index_error)?;
     index.finish(output, source_identity, cycle_frequency)
@@ -3718,6 +3803,11 @@ fn dashboard_event_kinds(events: &[EventTypeInfo]) -> Vec<DashboardEventKind> {
     kinds
 }
 
+struct DashboardTimelineSinks<'a> {
+    cpu: Option<&'a mut dyn CpuTimelineSink>,
+    gpu: Option<&'a mut dyn GpuTimelineSink>,
+}
+
 fn read_dashboard_events(
     header: &TraceHeader,
     streams: &BTreeMap<u16, Vec<u8>>,
@@ -3725,13 +3815,17 @@ fn read_dashboard_events(
     importants: &DecodedImportantEvents,
     sync_count: u64,
     decode_options: DashboardDecodeOptions,
-    mut cpu_timeline_sink: Option<&mut dyn CpuTimelineSink>,
+    timeline_sinks: DashboardTimelineSinks<'_>,
 ) -> Result<DecodedDashboardEvents, TraceError> {
     if header.protocol < 5 {
         return Ok(DecodedDashboardEvents::default());
     }
     let options = decode_options.dashboard;
     let decode_scope = decode_options.scope;
+    let DashboardTimelineSinks {
+        cpu: mut cpu_timeline_sink,
+        gpu: gpu_timeline_index_sink,
+    } = timeline_sinks;
 
     let registry = events
         .iter()
@@ -4058,6 +4152,14 @@ fn read_dashboard_events(
     }
 
     let known_scope_ids = dense_cpu_scope_ids(&spec_by_id);
+    let mut gpu_timeline_sink = match (gpu_timeline_collector.as_mut(), gpu_timeline_index_sink) {
+        (Some(collector), Some(index)) => Some(GpuTimelineSinks::Both(GpuTimelineFanout::new(
+            collector, index,
+        ))),
+        (Some(collector), None) => Some(GpuTimelineSinks::Collector(collector)),
+        (None, Some(index)) => Some(GpuTimelineSinks::Index(index)),
+        (None, None) => None,
+    };
     let dispatch_summary = crate::utrace_dispatch::dispatch_normal_events_with(
         streams,
         &registry,
@@ -4149,7 +4251,9 @@ fn read_dashboard_events(
                         queues: &mut gpu_queues,
                         breadcrumb_totals: &mut gpu_breadcrumb_totals,
                         submission_latency_samples: &mut submission_latency_samples,
-                        timeline: gpu_timeline_collector.as_mut(),
+                        timeline: gpu_timeline_sink
+                            .as_mut()
+                            .map(|sink| sink as &mut dyn GpuTimelineSink),
                     };
                     decode_gpu_normal_event(event, raw_event.data, &mut gpu_state, 0)?;
                 }
@@ -4584,7 +4688,7 @@ struct GpuNormalEventState<'a> {
     queues: &'a mut BTreeMap<u32, GpuQueueState>,
     breadcrumb_totals: &'a mut BTreeMap<u32, GpuBreadcrumbTotal>,
     submission_latency_samples: &'a mut Vec<GpuSubmissionLatencySample>,
-    timeline: Option<&'a mut GpuTimelineCollector>,
+    timeline: Option<&'a mut dyn GpuTimelineSink>,
 }
 
 fn decode_gpu_normal_event(
@@ -4691,21 +4795,23 @@ fn decode_gpu_normal_event(
                     duration,
                     begin.rendered_name.as_deref(),
                 );
-                if let Some(timeline) = timeline.as_mut() {
-                    let name = begin
-                        .rendered_name
-                        .clone()
-                        .or_else(|| specs.get(&begin.spec_id).map(|spec| spec.name.clone()))
-                        .unwrap_or_else(|| format!("#{}", begin.spec_id));
-                    timeline.record(
+                if let Some(timeline) = timeline.as_deref_mut() {
+                    record_gpu_timeline_interval(
+                        timeline,
                         queue.current_frame,
                         queue_id,
                         GpuTimelineIntervalKind::Breadcrumb,
                         Some(begin.spec_id),
-                        name,
                         begin.gpu_timestamp_top,
                         gpu_timestamp_bop,
                         duration,
+                        || {
+                            begin
+                                .rendered_name
+                                .clone()
+                                .or_else(|| specs.get(&begin.spec_id).map(|spec| spec.name.clone()))
+                                .unwrap_or_else(|| format!("#{}", begin.spec_id))
+                        },
                     );
                 }
                 let total = breadcrumb_totals.entry(begin.spec_id).or_default();
@@ -4728,21 +4834,23 @@ fn decode_gpu_normal_event(
                 duration,
                 begin.rendered_name.as_deref(),
             );
-            if let Some(timeline) = timeline.as_mut() {
-                let name = begin
-                    .rendered_name
-                    .clone()
-                    .or_else(|| specs.get(&begin.spec_id).map(|spec| spec.name.clone()))
-                    .unwrap_or_else(|| format!("#{}", begin.spec_id));
-                timeline.record(
+            if let Some(timeline) = timeline {
+                record_gpu_timeline_interval(
+                    timeline,
                     queue.current_frame,
                     queue_id,
                     GpuTimelineIntervalKind::Breadcrumb,
                     Some(begin.spec_id),
-                    name,
                     begin.gpu_timestamp_top,
                     gpu_timestamp_bop,
                     duration,
+                    || {
+                        begin
+                            .rendered_name
+                            .clone()
+                            .or_else(|| specs.get(&begin.spec_id).map(|spec| spec.name.clone()))
+                            .unwrap_or_else(|| format!("#{}", begin.spec_id))
+                    },
                 );
             }
             if begin.metadata_bytes > 0 {
@@ -4853,16 +4961,17 @@ fn decode_gpu_normal_event(
             let duration = gpu_timestamp_bop - begin.gpu_timestamp_top;
             queue.work_total_cycles = queue.work_total_cycles.saturating_add(duration);
             record_gpu_frame_work(queue, begin.gpu_timestamp_top, gpu_timestamp_bop, duration);
-            if let Some(timeline) = timeline.as_mut() {
-                timeline.record(
+            if let Some(timeline) = timeline {
+                record_gpu_timeline_interval(
+                    timeline,
                     queue.current_frame,
                     queue_id,
                     GpuTimelineIntervalKind::Work,
                     None,
-                    "Work".to_owned(),
                     begin.gpu_timestamp_top,
                     gpu_timestamp_bop,
                     duration,
+                    || "Work".to_owned(),
                 );
             }
         }
@@ -4925,6 +5034,35 @@ fn decode_gpu_normal_event(
         _ => {}
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_gpu_timeline_interval(
+    timeline: &mut dyn GpuTimelineSink,
+    active_frame: Option<u32>,
+    queue_id: u32,
+    kind: GpuTimelineIntervalKind,
+    spec_id: Option<u32>,
+    start_timestamp: u64,
+    end_timestamp: u64,
+    duration: u64,
+    name: impl FnOnce() -> String,
+) {
+    if timeline.note(active_frame, start_timestamp, end_timestamp) != SinkAppetite::WantsRecord {
+        return;
+    }
+    timeline.record(
+        GpuTimelineInterval {
+            queue_id,
+            kind,
+            spec_id,
+            name: name(),
+            start_timestamp,
+            end_timestamp,
+            duration,
+        },
+        active_frame,
+    );
 }
 
 fn current_gpu_frame(queue: &mut GpuQueueState) -> Option<&mut GpuFrameState> {
@@ -8396,20 +8534,28 @@ impl GpuTimelineCollector {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn record(
+    fn into_dashboard(self) -> GpuTimelineDashboard {
+        let begin_timestamp = self.begin_timestamp.unwrap_or(0);
+        GpuTimelineDashboard {
+            frame_number: self.frame_number,
+            begin_timestamp,
+            end_timestamp: self.end_timestamp.unwrap_or(begin_timestamp),
+            interval_count: self.interval_count,
+            truncated: self.truncated,
+            intervals: self.intervals,
+        }
+    }
+}
+
+impl GpuTimelineSink for GpuTimelineCollector {
+    fn note(
         &mut self,
         active_frame: Option<u32>,
-        queue_id: u32,
-        kind: GpuTimelineIntervalKind,
-        spec_id: Option<u32>,
-        name: String,
         start_timestamp: u64,
         end_timestamp: u64,
-        duration: u64,
-    ) {
+    ) -> SinkAppetite {
         if active_frame != Some(self.frame_number) {
-            return;
+            return SinkAppetite::Full;
         }
         self.begin_timestamp = Some(
             self.begin_timestamp
@@ -8422,28 +8568,95 @@ impl GpuTimelineCollector {
         self.interval_count = self.interval_count.saturating_add(1);
         if self.intervals.len() >= self.limit {
             self.truncated = true;
-            return;
+            return SinkAppetite::Full;
         }
-        self.intervals.push(GpuTimelineInterval {
-            queue_id,
-            kind,
-            spec_id,
-            name,
-            start_timestamp,
-            end_timestamp,
-            duration,
-        });
+        SinkAppetite::WantsRecord
     }
 
-    fn into_dashboard(self) -> GpuTimelineDashboard {
-        let begin_timestamp = self.begin_timestamp.unwrap_or(0);
-        GpuTimelineDashboard {
-            frame_number: self.frame_number,
-            begin_timestamp,
-            end_timestamp: self.end_timestamp.unwrap_or(begin_timestamp),
-            interval_count: self.interval_count,
-            truncated: self.truncated,
-            intervals: self.intervals,
+    fn record(&mut self, interval: GpuTimelineInterval, active_frame: Option<u32>) {
+        debug_assert_eq!(active_frame, Some(self.frame_number));
+        self.intervals.push(interval);
+    }
+}
+
+struct GpuTimelineFanout<'a> {
+    collector: &'a mut GpuTimelineCollector,
+    index: &'a mut dyn GpuTimelineSink,
+    collector_wants_record: bool,
+    index_wants_record: bool,
+}
+
+impl<'a> GpuTimelineFanout<'a> {
+    fn new(collector: &'a mut GpuTimelineCollector, index: &'a mut dyn GpuTimelineSink) -> Self {
+        Self {
+            collector,
+            index,
+            collector_wants_record: false,
+            index_wants_record: false,
+        }
+    }
+}
+
+impl GpuTimelineSink for GpuTimelineFanout<'_> {
+    fn note(
+        &mut self,
+        active_frame: Option<u32>,
+        start_timestamp: u64,
+        end_timestamp: u64,
+    ) -> SinkAppetite {
+        self.collector_wants_record =
+            self.collector
+                .note(active_frame, start_timestamp, end_timestamp)
+                == SinkAppetite::WantsRecord;
+        self.index_wants_record = self
+            .index
+            .note(active_frame, start_timestamp, end_timestamp)
+            == SinkAppetite::WantsRecord;
+        if self.collector_wants_record || self.index_wants_record {
+            SinkAppetite::WantsRecord
+        } else {
+            SinkAppetite::Full
+        }
+    }
+
+    fn record(&mut self, interval: GpuTimelineInterval, active_frame: Option<u32>) {
+        match (self.collector_wants_record, self.index_wants_record) {
+            (true, true) => {
+                self.collector.record(interval.clone(), active_frame);
+                self.index.record(interval, active_frame);
+            }
+            (true, false) => self.collector.record(interval, active_frame),
+            (false, true) => self.index.record(interval, active_frame),
+            (false, false) => debug_assert!(false, "record called without a GPU sink appetite"),
+        }
+    }
+}
+
+enum GpuTimelineSinks<'a> {
+    Collector(&'a mut GpuTimelineCollector),
+    Index(&'a mut dyn GpuTimelineSink),
+    Both(GpuTimelineFanout<'a>),
+}
+
+impl GpuTimelineSink for GpuTimelineSinks<'_> {
+    fn note(
+        &mut self,
+        active_frame: Option<u32>,
+        start_timestamp: u64,
+        end_timestamp: u64,
+    ) -> SinkAppetite {
+        match self {
+            Self::Collector(sink) => sink.note(active_frame, start_timestamp, end_timestamp),
+            Self::Index(sink) => sink.note(active_frame, start_timestamp, end_timestamp),
+            Self::Both(sink) => sink.note(active_frame, start_timestamp, end_timestamp),
+        }
+    }
+
+    fn record(&mut self, interval: GpuTimelineInterval, active_frame: Option<u32>) {
+        match self {
+            Self::Collector(sink) => sink.record(interval, active_frame),
+            Self::Index(sink) => sink.record(interval, active_frame),
+            Self::Both(sink) => sink.record(interval, active_frame),
         }
     }
 }
@@ -11043,45 +11256,49 @@ mod tests {
     #[test]
     fn gpu_timeline_retains_paired_intervals_with_a_bound() {
         let mut timeline = GpuTimelineCollector::new(17, 2);
-        timeline.record(
+        record_gpu_timeline_interval(
+            &mut timeline,
             Some(17),
             3,
             GpuTimelineIntervalKind::Work,
             None,
-            "Work".to_owned(),
             100,
             120,
             20,
+            || "Work".to_owned(),
         );
-        timeline.record(
+        record_gpu_timeline_interval(
+            &mut timeline,
             Some(17),
             3,
             GpuTimelineIntervalKind::Breadcrumb,
             Some(9),
-            "RenderPass".to_owned(),
             125,
             140,
             15,
+            || "RenderPass".to_owned(),
         );
-        timeline.record(
+        record_gpu_timeline_interval(
+            &mut timeline,
             Some(17),
             3,
             GpuTimelineIntervalKind::Work,
             None,
-            "Work".to_owned(),
             145,
             170,
             25,
+            || "Work".to_owned(),
         );
-        timeline.record(
+        record_gpu_timeline_interval(
+            &mut timeline,
             Some(18),
             3,
             GpuTimelineIntervalKind::Work,
             None,
-            "OtherFrame".to_owned(),
             200,
             220,
             20,
+            || "OtherFrame".to_owned(),
         );
 
         let dashboard = timeline.into_dashboard();

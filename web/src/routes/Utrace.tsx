@@ -45,7 +45,7 @@ import {
 import {
   cancelWasmParsing,
   parseUtraceProgressWithWasm,
-  parseWithWasm,
+  queryUtraceGpuTimelineWithWasm,
   queryUtraceTimelineWithWasm,
 } from "../lib/wasm-worker-client";
 import {
@@ -516,24 +516,21 @@ export default function UtracePage() {
     }
   };
 
-  const loadGpuFrameTimeline = async (source: File, frameNumber: number) => {
+  const loadGpuFrameTimeline = async (frameNumber: number) => {
     const request = ++gpuRequest;
     setGpuBusy(true);
     setError(null);
     try {
-      const detail = await parseWithWasm<UtraceDashboard>({
-        kind: "utrace-dashboard",
-        file: source,
-        options: {
-          max_frames: BROWSER_ALL_FRAMES,
-          gpu_frame: frameNumber,
-          gpu_timeline_limit: 2500,
-        },
+      const sessionId = timelineSessionId();
+      if (!sessionId) throw new Error("GPU timeline index is not ready");
+      const detail = await queryUtraceGpuTimelineWithWasm(sessionId, {
+        frame_number: frameNumber,
+        limit: 2500,
       });
       if (request !== gpuRequest) return;
-      setGpuTimeline(detail.data.dashboard.gpu.timeline ?? null);
+      setGpuTimeline(detail.data.timeline);
       setGpuTiming(detail.timing);
-      if (!detail.data.dashboard.gpu.timeline) {
+      if (detail.data.timeline.interval_count === 0) {
         setError(`No GPU timeline retained for frame ${frameNumber}.`);
       }
     } catch (err) {
@@ -1162,13 +1159,7 @@ export default function UtracePage() {
                                     class="btn ghost compact"
                                     disabled={gpuBusy()}
                                     onClick={() => {
-                                      const source = file();
-                                      if (source) {
-                                        void loadGpuFrameTimeline(
-                                          source,
-                                          summary().frame_number,
-                                        );
-                                      }
+                                      void loadGpuFrameTimeline(summary().frame_number);
                                     }}
                                   >
                                     Load GPU timeline
@@ -1207,8 +1198,7 @@ export default function UtracePage() {
                 gpuTimeline={gpuTimeline}
                 gpuBusy={gpuBusy}
                 onLoadGpuFrame={(frameNumber) => {
-                  const source = file();
-                  if (source) void loadGpuFrameTimeline(source, frameNumber);
+                  void loadGpuFrameTimeline(frameNumber);
                 }}
               />
             </Show>

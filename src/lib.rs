@@ -14,6 +14,8 @@ pub mod utrace_dispatch;
 #[cfg(feature = "utrace")]
 pub(crate) mod utrace_format_args;
 #[cfg(feature = "utrace")]
+pub(crate) mod utrace_gpu_timeline;
+#[cfg(feature = "utrace")]
 pub(crate) mod utrace_memory;
 #[cfg(feature = "utrace")]
 pub(crate) mod utrace_modules;

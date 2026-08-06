@@ -14,6 +14,7 @@ type WasmProgressRequest =
   | { id: number; kind: "utrace-progress-analyzing"; session_id: number }
   | { id: number; kind: "utrace-progress-finish"; session_id: number }
   | { id: number; kind: "utrace-progress-query"; session_id: number; options: Record<string, number | string | undefined> }
+  | { id: number; kind: "utrace-progress-gpu-query"; session_id: number; options: Record<string, number | undefined> }
   | { id: number; kind: "utrace-progress-cancel"; session_id: number };
 
 type WasmRequest = WasmParseRequest | WasmProgressRequest;
@@ -42,6 +43,7 @@ type WasmModule = {
     analyzing: () => string;
     finish: () => string;
     query_timeline: (options: string) => string;
+    query_gpu_timeline: (options: string) => string;
     free: () => void;
   };
 };
@@ -104,6 +106,14 @@ self.onmessage = async (event: MessageEvent<WasmRequest>) => {
       if (!session) throw new Error("unknown progressive WASM session");
       const beforeParse = performance.now();
       const json = session.query_timeline(JSON.stringify(request.options));
+      self.postMessage({ id: request.id, ok: true, json, timing: { wasm_copy_ms: 0, parse_ms: performance.now() - beforeParse }, sent_at: performance.now() } satisfies WasmResponse);
+      return;
+    }
+    if (request.kind === "utrace-progress-gpu-query") {
+      const session = progressiveSessions.get(request.session_id);
+      if (!session) throw new Error("unknown progressive WASM session");
+      const beforeParse = performance.now();
+      const json = session.query_gpu_timeline(JSON.stringify(request.options));
       self.postMessage({ id: request.id, ok: true, json, timing: { wasm_copy_ms: 0, parse_ms: performance.now() - beforeParse }, sent_at: performance.now() } satisfies WasmResponse);
       return;
     }
