@@ -20,16 +20,22 @@ path = "src/bin/uasset.rs"
 lz4_flex = { version = "0.11", default-features = false }
 pdb-addr2line = { version = "0.12", optional = true }
 rustc-hash = "2"
+rayon = { version = "1.11", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uasset-parser = { git = "https://github.com/ue-shed/ue-shed.git", rev = "ee0eddbbe2fbdb9a191441da6811a64b9fef16fa", package = "uasset-parser" }
 wasm-bindgen = { version = "0.2", optional = true }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-rayon = { version = "1.3", optional = true }
+
 [features]
 default = ["utrace"]
 utrace = []
+utrace-parallel = ["utrace", "dep:rayon"]
 utrace-symbols = ["utrace", "dep:pdb-addr2line"]
 utrace-wasm = ["utrace", "dep:wasm-bindgen"]
+utrace-wasm-threads = ["utrace-wasm", "utrace-parallel", "dep:wasm-bindgen-rayon"]
 wasm-uasset = []
 wasm = ["utrace-wasm", "wasm-uasset"]
 

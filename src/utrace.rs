@@ -36,6 +36,9 @@ pub use crate::utrace_timeline::{
 };
 use crate::{ArchiveError, ArchiveErrorKind, Reader};
 
+#[cfg(feature = "utrace-parallel")]
+mod cpu_parallel;
+
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
@@ -4236,6 +4239,18 @@ fn read_dashboard_events(
         (None, Some(index)) => Some(GpuTimelineSinks::Index(index)),
         (None, None) => None,
     };
+    #[cfg(feature = "utrace-parallel")]
+    let parallel_cpu_candidate = decode_options.serial_dispatch_hint.is_some()
+        && cpu_timeline_sink.is_none()
+        && monotonic_cpu_timeline_sink.is_none();
+    #[cfg(feature = "utrace-parallel")]
+    let mut parallel_cpu_unsupported = false;
+    #[cfg(feature = "utrace-parallel")]
+    let mut metadata_introductions = FxHashMap::<u32, u32>::default();
+    #[cfg(feature = "utrace-parallel")]
+    let mut parallel_batch_contexts = FxHashMap::<u16, Vec<cpu_parallel::BatchContext>>::default();
+    #[cfg(feature = "utrace-parallel")]
+    let mut parallel_batch_order = 0_u32;
     let dispatch_summary = crate::utrace_dispatch::dispatch_normal_events_with_hint(
         streams,
         &registry,
@@ -4276,10 +4291,43 @@ fn read_dashboard_events(
                             record.rendered_name.as_deref(),
                         );
                     }
+                    #[cfg(feature = "utrace-parallel")]
+                    if parallel_cpu_candidate && !parallel_cpu_unsupported {
+                        let introduction_generation = metadata_generation
+                            .checked_add(1)
+                            .and_then(|generation| u32::try_from(generation).ok());
+                        match introduction_generation {
+                            Some(generation)
+                                if !metadata_by_id.contains_key(&record.metadata_id) =>
+                            {
+                                metadata_introductions.insert(record.metadata_id, generation);
+                            }
+                            _ => parallel_cpu_unsupported = true,
+                        }
+                    }
                     metadata_by_id.insert(record.metadata_id, record);
                     metadata_generation = metadata_generation.saturating_add(1);
                 }
                 DashboardEventKind::CpuProfilerEventBatchV3 => {
+                    #[cfg(feature = "utrace-parallel")]
+                    if parallel_cpu_candidate {
+                        if !parallel_cpu_unsupported {
+                            let generation = u32::try_from(metadata_generation);
+                            let next_order = parallel_batch_order.checked_add(1);
+                            if let (Ok(generation), Some(next_order)) = (generation, next_order) {
+                                parallel_batch_contexts.entry(thread_id).or_default().push(
+                                    cpu_parallel::BatchContext {
+                                        generation,
+                                        order: parallel_batch_order,
+                                    },
+                                );
+                                parallel_batch_order = next_order;
+                            } else {
+                                parallel_cpu_unsupported = true;
+                            }
+                        }
+                        return Ok(());
+                    }
                     let Some(data) = read_aux_bytes(event, raw_event.data, "Data", 0)? else {
                         return Ok(());
                     };
@@ -4303,7 +4351,7 @@ fn read_dashboard_events(
                         known_scope_ids: known_scope_ids.as_deref(),
                         metadata_generation,
                     };
-                    decode_cpu_batch::<false>(
+                    decode_cpu_batch::<false, _>(
                         &data,
                         &spec_by_id,
                         &metadata_by_id,
@@ -4450,6 +4498,10 @@ fn read_dashboard_events(
                     );
                 }
                 DashboardEventKind::MetadataStack => {
+                    #[cfg(feature = "utrace-parallel")]
+                    if parallel_cpu_candidate {
+                        parallel_cpu_unsupported = true;
+                    }
                     decode_metadata_stack_event(event, raw_event.data, &mut metadata_stack, 0)?;
                     apply_metadata_stack_event_to_cpu_context(
                         event,
@@ -4471,6 +4523,53 @@ fn read_dashboard_events(
         },
     )?;
     decoded.dispatch = Some(dispatch_summary);
+
+    #[cfg(feature = "utrace-parallel")]
+    if parallel_cpu_candidate {
+        let parallel = if parallel_cpu_unsupported {
+            cpu_parallel::aggregate_serial_fallback(
+                cpu_parallel::ParallelCpuInputs {
+                    streams,
+                    registry: &registry,
+                    events_by_uid: &events_by_uid,
+                    event_kinds: &event_kinds,
+                    specs: &spec_by_id,
+                    metadata: &metadata_by_id,
+                    metadata_introductions: &metadata_introductions,
+                    batch_contexts: &parallel_batch_contexts,
+                    known_scope_ids: known_scope_ids.as_deref(),
+                    cycle_frequency,
+                    prologue_start_cycle,
+                },
+                &metadata_spec_by_id,
+                sync_count,
+                decode_options.serial_dispatch_hint,
+            )?
+        } else {
+            cpu_parallel::aggregate(cpu_parallel::ParallelCpuInputs {
+                streams,
+                registry: &registry,
+                events_by_uid: &events_by_uid,
+                event_kinds: &event_kinds,
+                specs: &spec_by_id,
+                metadata: &metadata_by_id,
+                metadata_introductions: &metadata_introductions,
+                batch_contexts: &parallel_batch_contexts,
+                known_scope_ids: known_scope_ids.as_deref(),
+                cycle_frequency,
+                prologue_start_cycle,
+            })?
+        };
+        decoded.cpu.batches = parallel.batches;
+        scope_totals = parallel.scope_totals;
+        metadata_scope_totals = parallel.metadata_scope_totals;
+        metadata_interval_state = parallel.metadata_interval_state;
+        frame_scope_totals = parallel.frame_scope_totals;
+        frame_cycle_bounds = parallel.frame_cycle_bounds;
+        thread_scope_totals = parallel.thread_scope_totals;
+        cpu_batch_thread_states.clear();
+        metadata_stack_contexts.clear();
+    }
 
     decoded.cpu.batches.unterminated_scopes =
         decoded.cpu.batches.unterminated_scopes.saturating_add(
@@ -6925,9 +7024,9 @@ impl CpuMetadataStackRuntimeState {
             .map(|entry| entry.metadata_id)
     }
 
-    fn active_frame_number(
+    fn active_frame_number<M: CpuMetadataLookup + ?Sized>(
         &mut self,
-        metadata: &FxHashMap<u32, CpuMetadataRecord>,
+        metadata: &M,
         metadata_generation: u64,
     ) -> Option<u32> {
         if let Some((cached_generation, cached_revision, frame_number)) = self.active_frame_cache
@@ -6938,7 +7037,7 @@ impl CpuMetadataStackRuntimeState {
         }
         let frame_number = self.active.iter().rev().find_map(|entry| {
             metadata
-                .get(&entry.metadata_id)
+                .get_at(entry.metadata_id, metadata_generation)
                 .and_then(|record| record.rendered_name.as_deref())
                 .and_then(parse_rendered_frame_number)
         });
@@ -8182,7 +8281,12 @@ fn scope_summaries(
             }
         })
         .collect::<Vec<_>>();
-    scopes.sort_by(|left, right| right.total_cycles.cmp(&left.total_cycles));
+    scopes.sort_by(|left, right| {
+        right
+            .total_cycles
+            .cmp(&left.total_cycles)
+            .then_with(|| left.spec_id.cmp(&right.spec_id))
+    });
     scopes
 }
 
@@ -8550,6 +8654,16 @@ struct CpuMetadataRecord {
     strings: Vec<String>,
 }
 
+trait CpuMetadataLookup: Sync {
+    fn get_at(&self, metadata_id: u32, generation: u64) -> Option<&CpuMetadataRecord>;
+}
+
+impl CpuMetadataLookup for FxHashMap<u32, CpuMetadataRecord> {
+    fn get_at(&self, metadata_id: u32, _generation: u64) -> Option<&CpuMetadataRecord> {
+        self.get(&metadata_id)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CpuStackEntryKind {
     PlainSpec(u32),
@@ -8578,6 +8692,15 @@ struct CpuBatchThreadState {
 struct CpuMetadataIntervalState {
     rendered_scope_totals: BTreeMap<(u32, String), (u64, u64)>,
     samples: Vec<CpuMetadataIntervalSample>,
+    sample_orders: Vec<(u64, u64)>,
+    next_sample_order: Option<(u64, u64)>,
+}
+
+impl CpuMetadataIntervalState {
+    #[cfg(feature = "utrace-parallel")]
+    fn begin_parallel_batch(&mut self, batch_order: u64) {
+        self.next_sample_order = Some((batch_order, 0));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8664,7 +8787,7 @@ impl ProgressiveCpuTimelineDecoder {
             known_scope_ids: None,
             metadata_generation: 0,
         };
-        decode_cpu_batch::<true>(&data, &specs, &metadata, &mut state)
+        decode_cpu_batch::<true, _>(&data, &specs, &metadata, &mut state)
     }
 
     pub(super) fn finish(self) -> CpuMonotonicTimelineBuilder {
@@ -9537,10 +9660,10 @@ pub(super) fn decode_frame_marker(
     })
 }
 
-fn decode_cpu_batch<const TIMELINE_ONLY: bool>(
+fn decode_cpu_batch<const TIMELINE_ONLY: bool, M: CpuMetadataLookup + ?Sized>(
     data: &[u8],
     specs: &BTreeMap<u32, CpuScopeSpec>,
-    metadata: &FxHashMap<u32, CpuMetadataRecord>,
+    metadata: &M,
     state: &mut CpuBatchDecodeState<'_, '_>,
 ) -> Result<(), TraceError> {
     state.batches.count += 1;
@@ -9694,6 +9817,7 @@ fn decode_cpu_batch<const TIMELINE_ONLY: bool>(
                                         attribution: CpuMetadataAttribution::Inline,
                                     },
                                     metadata,
+                                    state.metadata_generation,
                                     state.metadata_interval_state,
                                 );
                                 if let Some(timeline) = state.timeline.as_mut() {
@@ -9708,7 +9832,7 @@ fn decode_cpu_batch<const TIMELINE_ONLY: bool>(
                                             .map(|spec| Cow::Borrowed(spec.name.as_str()))
                                             .unwrap_or_else(|| Cow::Owned(format!("#{spec_id}")));
                                         let rendered = metadata
-                                            .get(&metadata_id)
+                                            .get_at(metadata_id, state.metadata_generation)
                                             .and_then(|record| record.rendered_name.as_deref());
                                         timeline.record(
                                             CpuTimelineIntervalView {
@@ -9756,7 +9880,11 @@ fn decode_cpu_batch<const TIMELINE_ONLY: bool>(
                         )
                     })?;
                     let spec_id = (!TIMELINE_ONLY)
-                        .then(|| metadata.get(&metadata_id).map(|record| record.spec_id))
+                        .then(|| {
+                            metadata
+                                .get_at(metadata_id, state.metadata_generation)
+                                .map(|record| record.spec_id)
+                        })
                         .flatten();
                     if !TIMELINE_ONLY {
                         state.metadata_stack_context.enter_inline(metadata_id);
@@ -9896,15 +10024,15 @@ fn rebase_cpu_stack_starts(stack: &mut [CpuStackEntry], shift: u64) {
     }
 }
 
-fn record_restored_cpu_metadata_scope(
+fn record_restored_cpu_metadata_scope<M: CpuMetadataLookup + ?Sized>(
     metadata_id: u32,
     start_cycle: u64,
     end_cycle: u64,
     duration: u64,
-    metadata: &FxHashMap<u32, CpuMetadataRecord>,
+    metadata: &M,
     state: &mut CpuBatchDecodeState<'_, '_>,
 ) {
-    let Some(record) = metadata.get(&metadata_id) else {
+    let Some(record) = metadata.get_at(metadata_id, state.metadata_generation) else {
         return;
     };
     let spec_id = record.spec_id;
@@ -9922,16 +10050,17 @@ fn record_restored_cpu_metadata_scope(
             attribution: CpuMetadataAttribution::RestoredStack,
         },
         metadata,
+        state.metadata_generation,
         state.metadata_interval_state,
     );
 }
 
-fn record_cpu_frame_scope(
+fn record_cpu_frame_scope<M: CpuMetadataLookup + ?Sized>(
     spec_id: u32,
     start_cycle: u64,
     end_cycle: u64,
     duration: u64,
-    metadata: &FxHashMap<u32, CpuMetadataRecord>,
+    metadata: &M,
     state: &mut CpuBatchDecodeState<'_, '_>,
 ) {
     let Some(frame_number) = state
@@ -9978,12 +10107,18 @@ fn coroutine_stack_depth(depth: u64) -> usize {
     usize::try_from(depth).unwrap_or(usize::MAX)
 }
 
-fn record_cpu_metadata_interval(
+fn record_cpu_metadata_interval<M: CpuMetadataLookup + ?Sized>(
     interval: CpuMetadataIntervalRecord,
-    metadata: &FxHashMap<u32, CpuMetadataRecord>,
+    metadata: &M,
+    metadata_generation: u64,
     state: &mut CpuMetadataIntervalState,
 ) {
-    let Some(record) = metadata.get(&interval.metadata_id) else {
+    let sample_order = state.next_sample_order;
+    if let Some((batch_order, interval_order)) = &mut state.next_sample_order {
+        *interval_order = interval_order.saturating_add(1);
+        debug_assert_eq!(sample_order.map(|order| order.0), Some(*batch_order));
+    }
+    let Some(record) = metadata.get_at(interval.metadata_id, metadata_generation) else {
         return;
     };
     let rendered_name = record.rendered_name.clone();
@@ -10006,6 +10141,9 @@ fn record_cpu_metadata_interval(
             end_cycle: interval.end_cycle,
             duration_cycles: interval.duration,
         });
+        if let Some(sample_order) = sample_order {
+            state.sample_orders.push(sample_order);
+        }
     }
 }
 
@@ -12012,7 +12150,7 @@ mod tests {
             metadata_generation: 0,
         };
 
-        decode_cpu_batch::<false>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
+        decode_cpu_batch::<false, _>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(batches.coroutine_records, 3);
         assert_eq!(batches.intervals, 2);
@@ -12071,7 +12209,7 @@ mod tests {
                 known_scope_ids: None,
                 metadata_generation: 0,
             };
-            decode_cpu_batch::<false>(batch, &specs, &FxHashMap::default(), &mut state).unwrap();
+            decode_cpu_batch::<false, _>(batch, &specs, &FxHashMap::default(), &mut state).unwrap();
         }
 
         assert_eq!(batches.count, 2);
@@ -12128,7 +12266,7 @@ mod tests {
             metadata_generation: 0,
         };
 
-        decode_cpu_batch::<false>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
+        decode_cpu_batch::<false, _>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(batches.intervals, 1);
         // Relative deltas 25 then 15 against base 1000 → absolute 1025..1040.
@@ -12188,7 +12326,7 @@ mod tests {
             metadata_generation: 0,
         };
 
-        decode_cpu_batch::<false>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
+        decode_cpu_batch::<false, _>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(batches.preamble_timeline_rebases, 0);
         assert_eq!(scope_totals[&1], (1, 5 * freq));
@@ -12277,7 +12415,7 @@ mod tests {
             metadata_generation: 0,
         };
 
-        decode_cpu_batch::<false>(&data, &specs, &metadata, &mut state).unwrap();
+        decode_cpu_batch::<false, _>(&data, &specs, &metadata, &mut state).unwrap();
 
         assert_eq!(batches.preamble_timeline_rebases, 1);
         assert_eq!(scope_totals[&1], (1, 20));
@@ -12357,8 +12495,8 @@ mod tests {
             metadata_generation: 0,
         };
 
-        decode_cpu_batch::<false>(&preamble, &specs, &FxHashMap::default(), &mut state).unwrap();
-        decode_cpu_batch::<false>(&flush_aligned, &specs, &FxHashMap::default(), &mut state)
+        decode_cpu_batch::<false, _>(&preamble, &specs, &FxHashMap::default(), &mut state).unwrap();
+        decode_cpu_batch::<false, _>(&flush_aligned, &specs, &FxHashMap::default(), &mut state)
             .unwrap();
 
         assert_eq!(batches.count, 2);
@@ -12434,7 +12572,7 @@ mod tests {
             metadata_generation: 0,
         };
 
-        decode_cpu_batch::<false>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
+        decode_cpu_batch::<false, _>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(scope_totals[&2], (1, 30));
         assert_eq!(scope_totals[&1], (1, 100));
@@ -12486,7 +12624,7 @@ mod tests {
             metadata_generation: 0,
         };
 
-        decode_cpu_batch::<false>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
+        decode_cpu_batch::<false, _>(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(batches.unmatched_ends, 1);
         assert!(scope_totals.is_empty());
@@ -12596,7 +12734,7 @@ mod tests {
                 metadata_generation: 0,
             };
 
-            decode_cpu_batch::<false>(&data, &specs, &metadata, &mut state).unwrap();
+            decode_cpu_batch::<false, _>(&data, &specs, &metadata, &mut state).unwrap();
         }
 
         assert_eq!(batches.metadata_scopes, 0);

@@ -37,5 +37,7 @@ pub(crate) mod utrace_tasks;
 pub(crate) mod utrace_timeline;
 #[cfg(all(feature = "utrace-wasm", target_arch = "wasm32"))]
 mod wasm;
+#[cfg(all(feature = "utrace-wasm-threads", target_arch = "wasm32"))]
+pub use wasm_bindgen_rayon::init_thread_pool;
 
 pub use uasset_parser::{ArchiveError, ArchiveErrorKind, ArchiveLimits, Reader, Span};

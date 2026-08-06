@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "build:wasm": "wasm-pack build .. --target web --out-dir web/src/generated/wasm --out-name uasset_parser_wasm --no-typescript -- --no-default-features --features wasm",
+    "build:wasm": "node scripts/build-wasm.mjs",
     "predev": "npm run build:wasm",
     "dev": "vite",
     "prebuild": "npm run build:wasm",

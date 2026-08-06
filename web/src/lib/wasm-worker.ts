@@ -33,6 +33,7 @@ export type WorkerTiming = {
 
 type WasmModule = {
   default: () => Promise<void>;
+  initThreadPool?: (threads: number) => Promise<void>;
   parse: (kind: string, filename: string, bytes: Uint8Array, options: string) => string;
   ProgressiveUtraceSession: new (
     filename: string,
@@ -49,6 +50,7 @@ type WasmModule = {
 };
 
 let modulePromise: Promise<WasmModule> | null = null;
+let threadPoolPromise: Promise<void> | null = null;
 const progressiveSessions = new Map<number, InstanceType<WasmModule["ProgressiveUtraceSession"]>>();
 
 async function wasm(): Promise<WasmModule> {
@@ -57,6 +59,12 @@ async function wasm(): Promise<WasmModule> {
   }
   const loaded = await modulePromise;
   await loaded.default();
+  if (loaded.initThreadPool && !threadPoolPromise) {
+    const hardwareThreads = navigator.hardwareConcurrency || 1;
+    const workerThreads = Math.max(1, Math.min(8, hardwareThreads - 1));
+    threadPoolPromise = loaded.initThreadPool(workerThreads);
+  }
+  await threadPoolPromise;
   return loaded;
 }
 

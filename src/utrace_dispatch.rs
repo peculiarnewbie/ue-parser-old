@@ -288,6 +288,42 @@ impl<'a> ThreadCursor<'a> {
     }
 }
 
+/// Visit one normal stream in its physical order.
+///
+/// Protocol 5 appends events to a thread-local stream. Consumers whose state is
+/// entirely thread-local can therefore process different streams in parallel
+/// while retaining the exact event order within each stream.
+#[cfg(feature = "utrace-parallel")]
+pub(crate) fn visit_normal_thread_events<'a>(
+    thread_id: u16,
+    stream: &'a [u8],
+    registry: &BTreeMap<u16, &EventTypeInfo>,
+    mut visit: impl FnMut(DispatchedNormalEventView<'a>) -> Result<(), TraceError>,
+) -> Result<(), TraceError> {
+    let layouts = normal_event_layouts(registry);
+    let mut cursor = ThreadCursor::new(stream);
+    while let Some(event) = cursor.next_event(&layouts)? {
+        let data_start = usize::try_from(event.data_start).unwrap();
+        let data_end = usize::try_from(event.data_end).unwrap();
+        let data = stream.get(data_start..data_end).ok_or_else(|| {
+            TraceError::new(
+                TraceErrorKind::MalformedData,
+                u64::from(event.data_start),
+                "Events.Data",
+                "normal event descriptor points outside its thread stream",
+            )
+        })?;
+        visit(DispatchedNormalEventView {
+            thread_id,
+            uid: event.uid,
+            data,
+            scope_cycle: event.scope_cycle,
+            serial: event.serial,
+        })?;
+    }
+    Ok(())
+}
+
 /// Dispatch normal events from all threads in global serial order.
 pub fn dispatch_normal_events(
     streams: &BTreeMap<u16, Vec<u8>>,
