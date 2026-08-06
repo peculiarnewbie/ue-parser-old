@@ -1,4 +1,8 @@
-# UAsset class coverage
+# Legacy UAsset class coverage
+
+> Historical document. This scoreboard describes the repository's former asset
+> parser surface and is retained for provenance only; UTrace is the current
+> product scope. Do not use this file to plan new parser work.
 
 The living scoreboard for which UObject export classes the parser can decode, and
 how completely. This is the prioritization surface — when we pick up new asset

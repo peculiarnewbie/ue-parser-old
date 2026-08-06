@@ -5,9 +5,17 @@ metadata:
   type: plan
 ---
 
-Goal: add UTrace (`.utrace`) parsing to the existing `uasset` CLI so tools can
-quickly extract dashboard-grade performance facts from Unreal Insights traces,
-while preserving enough identity to deep-dive in the original trace file.
+> Historical design note. The implementation has since moved into this
+> UTrace-focused repository. The CLI target retains a legacy compatibility name,
+> but asset parsing is not part of the current product scope.
+>
+> The feature snippets and pre-split file paths below describe the original
+> implementation plan; current `Cargo.toml`, `src/utrace.rs`, and the active
+> plans are authoritative.
+
+Goal: provide UTrace (`.utrace`) parsing so tools can quickly extract
+dashboard-grade performance facts from Unreal Insights traces, while preserving
+enough identity to deep-dive in the original trace file.
 Format reference: [[utrace-format-deepdive]].
 
 The first product milestone is **not** a full Unreal Insights replacement. It is

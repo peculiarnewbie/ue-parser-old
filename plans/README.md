@@ -34,7 +34,7 @@ even though that family is absent from the CPU-frame fixture.
 | 007 | Module-aware optional symbolization | P0 | L/XL | 006 | DONE |
 | 008 | PlatformFile activity summaries | P1 | M | — (independent of 004–007) | DONE |
 | 009 | Bookmark/log FormatArgs rendering | P1 | M | — (independent) | DONE |
-| 010 | Browser WASM + native comparison modes | P1 | L | — (001–009 already DONE) | IN PROGRESS — worker-backed WASM baseline landed; shared full UAsset contract and repeat/median comparison remain |
+| 010 | Browser WASM + native comparison modes | P1 | L | — (001–009 already DONE) | IN PROGRESS — worker-backed UTrace WASM baseline landed; native/compare modes and repeat/median parity remain |
 | 011 | Progressive UTrace dashboard streaming | P0 UX/perf | XL | 010 shared output/backend dispatcher | TODO |
 | 012 | Timeline `.utix` build/query performance | P1 perf | M/L | 002 `.utix` format; 011 phase 1 session core (landed) | TODO |
 | 013 | Live frame chart streaming performance | P1 UX/perf | S/M | landed 011 streaming UI; independent of 012 | TODO |
@@ -66,10 +66,10 @@ provider implementation task.
   that output shape before either executor edits it concurrently.
 - **007 starts with a spike** because module/build-id parity and a trustworthy
   offline Windows symbol backend must be proven before committing to an API.
-- **010 preserves the native bridge** and adds WASM as a worker-backed peer.
-  Capture-wide `.utix` range queries and PDB symbolization stay native-only;
-  UAsset inspect plus UTrace inventory/dashboard/selected-frame operations are
-  the parity and performance-comparison surface.
+- **010 preserves the native bridge** and adds WASM as a worker-backed peer for
+  UTrace. Capture-wide `.utix` range queries and PDB symbolization stay
+  native-only; UTrace inventory/dashboard/selected-frame operations are the
+  parity and performance-comparison surface.
 - **012 phases 1 and 3 are independent of 011**; only phase 2 (building the
   `.utix` during the progressive parse) rides on the landed session core and
   extends the `dashboard-progress` protocol, so coordinate its DTO changes

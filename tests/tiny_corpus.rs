@@ -3,9 +3,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-#[cfg(feature = "utrace")]
-use uasset_parser::utrace::{self, TraceErrorKind};
 use uasset_parser::{Package, PackageErrorKind, PackageSummary};
+#[cfg(feature = "utrace")]
+use utrace_parser::utrace::{self, TraceErrorKind};
 
 const MINIMAL_CURRENT_SUMMARY: &str =
     include_str!("fixtures/tiny/minimal-current-summary.uasset.hex");

@@ -6,6 +6,9 @@ import initWasm, {
   inventoryUtrace,
 } from "./wasm/utrace_parser_wasm.js";
 
+export { parserManifest } from "./manifest.js";
+export { createUtraceParserWorker, UtraceParserWorkerError } from "./worker-client.js";
+
 export const UTRACE_SCHEMA_VERSION = 2;
 
 let initialization = null;

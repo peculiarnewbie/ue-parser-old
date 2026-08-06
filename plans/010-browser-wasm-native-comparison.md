@@ -1,4 +1,4 @@
-# Plan 010: Run UAsset and UTrace through native and browser-WASM backends
+# Plan 010: Run UTrace through native and browser-WASM backends
 
 > **Executor instructions**: Follow this plan step by step. Run every
 > verification command and confirm the expected result before moving to the
@@ -7,7 +7,7 @@
 > `plans/README.md` unless a reviewer says they maintain the index.
 >
 > **Drift check (run first)**:
-> `git diff --stat 039b112..HEAD -- Cargo.toml Cargo.lock src/lib.rs src/bin/uasset.rs src/output.rs src/wasm.rs tests/cli.rs tests/tiny_corpus.rs web/package.json web/package-lock.json web/vite.config.ts web/vite.parse-plugin.ts web/src/lib/api.ts web/src/lib/parser-backend.ts web/src/lib/wasm-worker.ts web/src/lib/wasm-worker-client.ts web/src/lib/types.ts web/src/routes/Uasset.tsx web/src/routes/Utrace.tsx web/src/index.css web/README.md`
+> `git diff --stat 039b112..HEAD -- Cargo.toml Cargo.lock src/lib.rs src/bin/uasset.rs src/output.rs src/wasm.rs tests/cli.rs tests/tiny_corpus.rs web/package.json web/package-lock.json web/vite.config.ts web/vite.parse-plugin.ts web/src/lib/api.ts web/src/lib/parser-backend.ts web/src/lib/wasm-worker.ts web/src/lib/wasm-worker-client.ts web/src/lib/types.ts web/src/routes/Utrace.tsx web/src/index.css web/README.md`
 >
 > Several of these paths already have uncommitted user changes at planning
 > time. Preserve them. If an in-scope file changed after `039b112`, compare the
@@ -25,13 +25,13 @@
 
 ## Why this matters
 
-The local SolidJS app currently parses both `.uasset` and `.utrace` files by
-uploading bytes to Vite middleware, writing a temporary file, and spawning the
-native `uasset` CLI. Both Rust library feature sets already compile for
-`wasm32-unknown-unknown`, so the parser can also run wholly inside a browser
-worker. Keeping both paths selectable provides a safe fallback and makes it
-possible to compare native process/file overhead with WASM transfer, parse,
-serialization, and result-transfer costs using identical inputs and options.
+The local SolidJS app parses `.utrace` captures by uploading bytes to Vite
+middleware, writing a temporary file, and spawning the native `uasset` CLI.
+The UTrace library already compiles for `wasm32-unknown-unknown`, so the parser
+can also run wholly inside a browser worker. Keeping both paths selectable
+provides a safe fallback and makes it possible to compare native process/file
+overhead with WASM transfer, parse, serialization, and result-transfer costs
+using identical captures and options.
 
 This plan must preserve the CLI's versioned JSON contract. Do not create an
 independent WASM DTO tree: extract one shared contract implementation and make
@@ -50,10 +50,10 @@ the CLI and WASM facade call it.
   result is native while this feature is experimental.
 - Output parity is semantic JSON parity after removing only explicitly
   nondeterministic envelope fields (`path`) and timing metadata. Array order,
-  numeric values, status, truncation flags, schema versions, decoded assets,
+  numeric values, status, truncation flags, schema versions, decoded values,
   and errors must match exactly.
-- The comparison UI supports UAsset inspect and these UTrace operations:
-  inventory, dashboard, dashboard-with-selected-CPU-frame, and
+- The comparison UI supports these UTrace operations: inventory, dashboard,
+  dashboard-with-selected-CPU-frame, and
   dashboard-with-selected-GPU-frame.
 - Capture-wide CPU range queries backed by `.utix` remain native-only in this
   plan. `src/utrace_timeline.rs` uses `std::fs`, `File`, `Seek`, and atomic
@@ -70,16 +70,11 @@ the CLI and WASM facade call it.
 
 ## Current state
 
-- `Cargo.toml` defines one library and the `uasset` binary. Features are
-  `uasset`, `utrace`, and native-oriented `utrace-symbols`; there is no WASM
-  facade or `wasm-bindgen` dependency.
-- `src/package.rs:326` exposes `Package::parse(source: &[u8])`.
 - `src/utrace.rs:1846`, `:1861`, and `:3249` expose byte-slice based inspect,
   inventory, and configurable dashboard functions. The parser core therefore
   does not require browser filesystem access.
-- `src/bin/uasset.rs:2520+` privately owns `InspectOutput`, UTrace envelope
-  structs, `InspectOutput::from_package`, asset/property conversion DTOs, and
-  JSON rendering. This is the current schema-versioned integration contract.
+- `src/bin/uasset.rs:2520+` privately owns the UTrace envelope structs and JSON
+  rendering. This is the current schema-versioned integration contract.
 - `src/bin/uasset.rs:710+` duplicates orchestration around reading bytes,
   parsing, building those output envelopes, serializing, and mapping errors to
   exit codes. Keep CLI argument parsing, filesystem/stdin/stdout, HTML/text
@@ -88,19 +83,18 @@ the CLI and WASM facade call it.
   `web/vite.parse-plugin.ts:322` writes uploads to a temporary file. It already
   returns detailed `X-Ue-Parse-Timing` fields and caches `.utix` sidecars.
 - `web/src/lib/api.ts:126+` contains the native HTTP transport and exports
-  `inspectUasset`, `utraceDashboard`, `utraceInventory`, and `utraceTimeline`.
+  the UTrace dashboard, inventory, and timeline operations.
   Preserve these native functions as a transport implementation rather than
   deleting them.
-- `web/src/routes/Uasset.tsx` and `web/src/routes/Utrace.tsx` call the API
-  functions directly. Route code should depend on a backend dispatcher, not
-  know worker protocol details.
+- `web/src/routes/Utrace.tsx` calls the API functions directly. Route code
+  should depend on a backend dispatcher, not know worker protocol details.
 - `web/src/lib/types.ts` manually defines the JSON contract consumed by the UI.
   Do not casually rename or widen these stable result shapes.
 - `src/utrace_timeline.rs:1-8` explicitly owns a bounded disk-backed timeline
   index and imports native filesystem/seek APIs. It is out of the WASM build.
-- `tests/tiny_corpus.rs` has committed tiny `.uasset` and `.utrace` fixtures;
-  `tests/cli.rs` asserts the CLI JSON contract. Reuse these bytes for cross-
-  backend parity tests.
+- `tests/tiny_corpus.rs` has a committed tiny `.utrace` fixture and
+  `tests/cli.rs` asserts the CLI JSON contract. Reuse these bytes for
+  cross-backend parity tests.
 - Repository parser discipline from `AGENTS.md` applies: all file-provided
   counts remain bounded before allocation, recursion remains bounded, enums
   replace stringly dispatch, mutually-exclusive output uses tagged enums, and
@@ -109,7 +103,6 @@ the CLI and WASM facade call it.
 The following compile probes succeeded at planning time:
 
 ```text
-cargo check --lib --target wasm32-unknown-unknown --no-default-features --features uasset
 cargo check --lib --target wasm32-unknown-unknown --no-default-features --features utrace
 ```
 
@@ -133,7 +126,6 @@ Suggested TypeScript shape (names may change, invariants may not):
 export type ParserBackend = "native" | "wasm" | "compare";
 
 export type ParseOperation =
-  | { kind: "uasset-inspect" }
   | { kind: "utrace-inventory" }
   | { kind: "utrace-dashboard"; options: UtraceDashboardQuery }
   | { kind: "utrace-timeline"; options: UtraceTimelineQueryOptions };
@@ -208,7 +200,7 @@ bindings rather than depending on uncommitted generated output.
 
 - `Cargo.toml`, `Cargo.lock`
 - `src/lib.rs`
-- `src/output.rs` (create; shared JSON contracts and orchestration)
+- `src/output.rs` (create; shared UTrace JSON contracts and orchestration)
 - `src/wasm.rs` (create; thin `wasm-bindgen` facade)
 - `src/bin/uasset.rs`
 - `tests/cli.rs`, `tests/tiny_corpus.rs`
@@ -218,7 +210,7 @@ bindings rather than depending on uncommitted generated output.
 - `web/src/lib/parser-backend.ts` (create)
 - `web/src/lib/wasm-worker.ts` (create)
 - `web/src/lib/wasm-worker-client.ts` (create)
-- `web/src/routes/Uasset.tsx`, `web/src/routes/Utrace.tsx`
+- `web/src/routes/Utrace.tsx`
 - `web/src/index.css`, `web/README.md`, root `README.md`
 - focused browser/worker test files and checked-in WASM build configuration
 - CI workflow only if one exists by execution time
@@ -248,21 +240,20 @@ bindings rather than depending on uncommitted generated output.
 
 ### Step 1: Extract the versioned output contract from the CLI
 
-Create `src/output.rs`. Move—not copy—the serializable UAsset and UTrace JSON
-envelopes, asset/property DTO conversions, schema constants, and byte-oriented
-orchestration out of `src/bin/uasset.rs`. Expose narrowly scoped functions that
-accept `(path_label: &str, source: &[u8], typed options)` and return either a
-serializable output or a typed contract error. Include a typed partial-success
-state for UAsset rather than making callers infer it from an unrelated flag.
+Create `src/output.rs`. Move—not copy—the serializable UTrace JSON envelopes,
+schema constants, and byte-oriented orchestration out of `src/bin/uasset.rs`.
+Expose narrowly scoped functions that accept `(path_label: &str, source: &[u8],
+typed options)` and return either a serializable output or a typed contract
+error.
 
 Keep text/HTML rendering, CLI flags, filesystem/stdin/stdout, native timeline
 index/query, PDB path handling, and exit-code selection in the binary. Update
 the CLI to call the shared functions. Do not make all DTO internals public;
 expose only what the WASM facade and contract tests require.
 
-Add Rust tests that run the shared UAsset inspect and UTrace operations on the
-committed tiny fixtures and compare `serde_json::Value` with CLI stdout after
-normalizing only `path`.
+Add Rust tests that run the shared UTrace operations on the committed tiny
+fixture and compare `serde_json::Value` with CLI stdout after normalizing only
+`path`.
 
 **Verify**:
 
@@ -276,7 +267,7 @@ shared-contract-versus-CLI parity assertions pass.
 
 ### Step 2: Add a browser-only WASM facade
 
-Add a `wasm` feature that implies `uasset`, `utrace`, and target-specific
+Add a UTrace WASM feature that implies `utrace` and target-specific
 `wasm-bindgen` support, but never implies `utrace-symbols`. Gate `src/wasm.rs`
 with both the feature and `target_arch = "wasm32"`; fail clearly at compile time
 if the feature is misconfigured rather than leaking browser types into native
@@ -288,10 +279,9 @@ contain the exact shared-contract JSON string and Rust-side parse/serialize
 timings. Map malformed, unsupported, resource-limit, partial, and internal
 states into a stable tagged error payload. Do not expose raw Rust panic text.
 
-Enforce a named maximum input length before copying/decoding. Choose the limit
-from measured fixture sizes and document it; it must be configurable at build
-time or centralized in one constant, and rejection must distinguish UAsset and
-UTrace limits if they differ.
+Enforce a named maximum UTrace input length before copying/decoding. Choose the
+limit from measured fixture sizes and document it; it must be configurable at
+build time or centralized in one constant.
 
 **Verify**:
 
@@ -339,7 +329,7 @@ parse time.
 
 Add focused tests for request/response discrimination, stale result rejection,
 worker failure, cancellation, oversized input, malformed parser input, and
-successful tiny UAsset/UTrace operations. Prefer a real generated WASM module
+successful tiny UTrace operations. Prefer a real generated WASM module
 for contract tests; mock only Worker lifecycle mechanics that a unit test cannot
 exercise reliably.
 
@@ -382,8 +372,8 @@ every operation/backend combination.
 ### Step 6: Expose backend and comparison controls in both routes
 
 Add a shared compact backend selector or equivalent consistent UI to
-`Uasset.tsx` and `Utrace.tsx`. Options are Native, WASM, and Compare. Persist the
-selection locally, defaulting to Native until comparison has proven parity.
+`Utrace.tsx`. Options are Native, WASM, and Compare. Persist the selection
+locally, defaulting to Native until comparison has proven parity.
 Compare mode adds repetitions (1–10, default 3), a parity indicator, per-backend
 median total and parse times, and expandable phase/sample details.
 
@@ -408,9 +398,9 @@ reachable.
 
 Add an automated browser smoke test if the repository already has or can add a
 lightweight browser-test dependency without introducing a second test stack.
-It must open the local Vite app, select Compare, load the committed tiny UAsset
-and UTrace fixtures, and assert successful native and WASM runs, equal semantic
-output, timing presence, and no console errors.
+It must open the local Vite app, select Compare, load the committed tiny UTrace
+fixture, and assert successful native and WASM runs, equal semantic output,
+timing presence, and no console errors.
 
 If spawning a browser is not portable in CI, add a deterministic Node/Vitest
 integration harness around the built worker plus a manual smoke checklist in
@@ -437,9 +427,6 @@ executor also exits 0 and is documented in `web/README.md`.
 ## Test plan
 
 - Rust shared-contract tests:
-  - tiny valid UAsset inspect equals CLI JSON;
-  - partial UAsset retains exit/status semantics and decode errors;
-  - malformed and unsupported UAsset map to the same error category;
   - tiny UTrace inventory and dashboard equal CLI JSON;
   - dashboard bounds and CPU/GPU selected-frame options survive the facade;
   - WASM input limits reject before parser allocation;
@@ -458,20 +445,19 @@ executor also exits 0 and is documented in `web/README.md`.
   - diagnostics remain bounded.
 - UI/integration tests:
   - native remains default and functional;
-  - WASM handles tiny UAsset and UTrace;
+  - WASM handles the tiny UTrace fixture;
   - Compare shows parity and both timing sets;
   - range timeline forces/explains native-only capability;
   - changing file during a run cannot display stale output.
 
 ## Done criteria
 
-- [ ] CLI JSON for committed UAsset and UTrace fixtures is unchanged.
+- [ ] CLI JSON for the committed UTrace fixture is unchanged.
 - [ ] `cargo fmt --check` exits 0.
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` exits 0.
 - [ ] `cargo test --all-targets --all-features` exits 0.
 - [ ] Browser WASM feature compiles and excludes `pdb-addr2line`.
 - [ ] `cd web && npm run build` builds WASM, worker, and SolidJS app from a clean checkout.
-- [ ] UAsset inspect runs in Native, WASM, and Compare modes.
 - [ ] UTrace inventory/dashboard/selected-frame requests run in all three modes.
 - [ ] Compare mode alternates sequential order, retains samples, reports medians, and checks semantic parity.
 - [ ] Native `.utix` range queries still work and are clearly native-only.

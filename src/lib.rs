@@ -1,14 +1,8 @@
-//! Read-only parser foundation for classic Unreal Engine asset packages.
+//! Read-only parser for Unreal Engine UTrace captures.
 //!
-//! Dependencies flow from asset adapters down toward the archive layer:
-//! `asset -> codec/property/schema -> package -> archive/version`.
-
-pub mod archive;
-pub mod asset;
-pub mod codec;
-pub mod package;
-pub mod property;
-pub mod schema;
+//! The bounded byte reader and archive error taxonomy come from UE Shed's
+//! `uasset-parser` crate. UTrace owns the trace transport, event registry,
+//! provider aggregation, dashboards, and progressive session model here.
 #[cfg(feature = "utrace")]
 pub mod utrace;
 #[cfg(feature = "utrace")]
@@ -37,12 +31,7 @@ pub mod utrace_symbols;
 pub(crate) mod utrace_tasks;
 #[cfg(feature = "utrace")]
 pub(crate) mod utrace_timeline;
-pub mod version;
 #[cfg(all(feature = "utrace-wasm", target_arch = "wasm32"))]
 mod wasm;
 
-#[cfg(test)]
-mod test_support;
-
-pub use archive::{ArchiveError, ArchiveErrorKind, ArchiveLimits, Reader, Span};
-pub use package::{Package, PackageError, PackageErrorKind, PackageSummary};
+pub use uasset_parser::{ArchiveError, ArchiveErrorKind, ArchiveLimits, Reader, Span};

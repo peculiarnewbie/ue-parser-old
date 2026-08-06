@@ -1710,7 +1710,8 @@ pub struct TracePrologue {
     pub cycle_frequency: u64,
     pub endian: u16,
     pub pointer_size: u8,
-    pub start_date_time: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_date_time: Option<f64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2024,7 +2025,7 @@ pub const EVENT_COVERAGE: &[EventCoverage] = &[
         logger: "$Trace",
         event: "NewTrace",
         status: DecodeStatus::Decoded,
-        note: "Trace prologue: start cycle, cycle frequency, endian, pointer size, start date.",
+        note: "Trace prologue: start cycle, cycle frequency, endian, pointer size, and optional start date.",
     },
     EventCoverage {
         logger: "$Trace",
@@ -9500,7 +9501,7 @@ pub(super) fn decode_new_trace(
         cycle_frequency: read_u64_field(event, data, "CycleFrequency", base_offset)?,
         endian: read_u16_field(event, data, "Endian", base_offset)?,
         pointer_size: read_u8_field(event, data, "PointerSize", base_offset)?,
-        start_date_time: read_f64_field(event, data, "StartDateTime", base_offset)?,
+        start_date_time: read_optional_f64_field(event, data, "StartDateTime", base_offset)?,
     })
 }
 
@@ -9664,6 +9665,19 @@ pub(crate) fn read_f64_field(
             .try_into()
             .expect("fixed field length was checked"),
     ))
+}
+
+fn read_optional_f64_field(
+    event: &EventTypeInfo,
+    data: &[u8],
+    name: &str,
+    base_offset: u64,
+) -> Result<Option<f64>, TraceError> {
+    if event.fields.iter().any(|field| field.name == name) {
+        Ok(Some(read_f64_field(event, data, name, base_offset)?))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) fn fixed_field_bytes<'a>(
@@ -10185,7 +10199,7 @@ mod tests {
                 cycle_frequency: 1_000_000,
                 endian: 0x524d,
                 pointer_size: 8,
-                start_date_time: 1234.5,
+                start_date_time: Some(1234.5),
             })
         );
         assert_eq!(
@@ -10199,6 +10213,48 @@ mod tests {
                 active_group: None,
             }]
         );
+    }
+
+    #[test]
+    fn decodes_ue56_new_trace_without_start_date_time() {
+        let new_trace_uid = 10;
+        let new_trace_decl = new_event(
+            new_trace_uid,
+            0x05,
+            "$Trace",
+            "NewTrace",
+            &[
+                regular_field(0, 8, UINT64, "StartCycle"),
+                regular_field(8, 8, UINT64, "CycleFrequency"),
+                regular_field(16, 2, UINT16, "Endian"),
+                regular_field(18, 1, UINT8, "PointerSize"),
+            ],
+        );
+
+        let mut new_trace_data = Vec::new();
+        new_trace_data.extend_from_slice(&100_u64.to_le_bytes());
+        new_trace_data.extend_from_slice(&1_000_000_u64.to_le_bytes());
+        new_trace_data.extend_from_slice(&0x524d_u16.to_le_bytes());
+        new_trace_data.push(8);
+
+        let bytes = trace_with_events(&[
+            important_event(0, &new_trace_decl),
+            important_event(new_trace_uid, &new_trace_data),
+        ]);
+
+        let trace = inspect(&bytes).unwrap();
+        assert_eq!(
+            trace.prologue,
+            Some(TracePrologue {
+                start_cycle: 100,
+                cycle_frequency: 1_000_000,
+                endian: 0x524d,
+                pointer_size: 8,
+                start_date_time: None,
+            })
+        );
+        let json = serde_json::to_value(trace).unwrap();
+        assert!(json["prologue"].get("start_date_time").is_none());
     }
 
     #[test]

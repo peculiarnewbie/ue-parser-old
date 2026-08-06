@@ -18,13 +18,13 @@ use uasset_parser::asset::{
 use uasset_parser::package::{PackageError, PackageErrorKind, PackageIndex, TableLocation};
 use uasset_parser::property::{PropertyRecord, PropertyValue, RawReason};
 use uasset_parser::schema::{ClassSchema, SchemaProvider, StructSchema};
+use uasset_parser::{Package, PackageSummary};
 #[cfg(feature = "utrace")]
-use uasset_parser::utrace::{
+use utrace_parser::utrace::{
     CpuTimelineIndexInfo, CpuTimelineQuery, CpuTimelineQueryResult, TimelineIndexError,
     TimelineIndexRequest, TraceCoverage, TraceDashboard, TraceError, TraceErrorKind, TraceInspect,
     TraceInventory,
 };
-use uasset_parser::{Package, PackageSummary};
 
 const SCHEMA_VERSION: u32 = 6;
 #[cfg(feature = "utrace")]
@@ -272,7 +272,7 @@ impl Command {
             gpu_timeline_frame: None,
             gpu_timeline_limit: 500,
             timeline_index_output: None,
-            timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
+            timeline_index_max_intervals: utrace_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
             symbol_paths: Vec::new(),
         }))
     }
@@ -286,7 +286,7 @@ impl Command {
         let mut gpu_timeline_frame = None;
         let mut gpu_timeline_limit = 500;
         let mut timeline_index_output = None;
-        let mut timeline_index_max_intervals = uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS;
+        let mut timeline_index_max_intervals = utrace_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS;
         let mut symbol_paths = Vec::new();
         let mut index = 0;
 
@@ -555,7 +555,7 @@ impl Command {
         let mut input = None;
         let mut output = None;
         let mut format = OutputFormat::Text;
-        let mut max_intervals = uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS;
+        let mut max_intervals = utrace_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS;
         let mut index = 0;
         while index < arguments.len() {
             let argument = &arguments[index];
@@ -915,7 +915,7 @@ fn inspect_utrace(options: &InspectOptions) -> u8 {
         }
     };
 
-    let trace = match uasset_parser::utrace::inspect(&bytes) {
+    let trace = match utrace_parser::utrace::inspect(&bytes) {
         Ok(trace) => trace,
         Err(error) => {
             let exit_code = exit_code_for_trace_error(&error);
@@ -958,9 +958,9 @@ fn dashboard_utrace(options: &InspectOptions) -> u8 {
     };
 
     #[allow(unused_mut)] // mutated when `utrace-symbols` is enabled
-    let mut dashboard = match uasset_parser::utrace::dashboard_with_options(
+    let mut dashboard = match utrace_parser::utrace::dashboard_with_options(
         &bytes,
-        uasset_parser::utrace::DashboardOptions {
+        utrace_parser::utrace::DashboardOptions {
             timeline_frame: options.timeline_frame,
             timeline_limit: Some(options.timeline_limit),
             max_frames: Some(options.max_frames),
@@ -979,8 +979,8 @@ fn dashboard_utrace(options: &InspectOptions) -> u8 {
         #[cfg(feature = "utrace-symbols")]
         {
             let mut resolver =
-                uasset_parser::utrace_symbols::PdbSymbolResolver::new(options.symbol_paths.clone());
-            uasset_parser::utrace_symbols::enrich_callstacks_with_symbols(
+                utrace_parser::utrace_symbols::PdbSymbolResolver::new(options.symbol_paths.clone());
+            utrace_parser::utrace_symbols::enrich_callstacks_with_symbols(
                 &mut dashboard.callstacks,
                 &mut resolver,
             );
@@ -1034,9 +1034,9 @@ fn dashboard_bundle_utrace(options: &InspectOptions) -> u8 {
             return EXIT_IO;
         }
     };
-    let (dashboard, inventory) = match uasset_parser::utrace::dashboard_and_inventory_with_options(
+    let (dashboard, inventory) = match utrace_parser::utrace::dashboard_and_inventory_with_options(
         &bytes,
-        uasset_parser::utrace::DashboardOptions {
+        utrace_parser::utrace::DashboardOptions {
             timeline_frame: options.timeline_frame,
             timeline_limit: Some(options.timeline_limit),
             max_frames: Some(options.max_frames),
@@ -1092,8 +1092,8 @@ fn dashboard_progress_utrace(options: &InspectOptions) -> u8 {
         Input::Stdin => Box::new(io::stdin()),
     };
     let mut input = io::BufReader::with_capacity(1024 * 1024, input);
-    let mut session = uasset_parser::utrace::ProgressiveDashboardSession::new(
-        uasset_parser::utrace::DashboardOptions {
+    let mut session = utrace_parser::utrace::ProgressiveDashboardSession::new(
+        utrace_parser::utrace::DashboardOptions {
             timeline_frame: options.timeline_frame,
             timeline_limit: Some(options.timeline_limit),
             max_frames: Some(options.max_frames),
@@ -1126,7 +1126,7 @@ fn dashboard_progress_utrace(options: &InspectOptions) -> u8 {
         if !bootstrap_emitted {
             if let Some((progress, bootstrap)) = session.bootstrap(total_bytes) {
                 if write_progress_json(&ProgressiveCliEvent::Bootstrap {
-                    protocol_version: uasset_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
+                    protocol_version: utrace_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
                     sequence,
                     progress,
                     bootstrap,
@@ -1145,7 +1145,7 @@ fn dashboard_progress_utrace(options: &InspectOptions) -> u8 {
             last_packet_count = progress.packets_observed;
             last_transport_snapshot = Instant::now();
             if write_progress_json(&ProgressiveCliEvent::Snapshot {
-                protocol_version: uasset_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
+                protocol_version: utrace_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
                 sequence,
                 progress,
                 patch,
@@ -1164,7 +1164,7 @@ fn dashboard_progress_utrace(options: &InspectOptions) -> u8 {
             last_frame_revision = frame_revision;
             last_frame_snapshot = Instant::now();
             if write_progress_json(&ProgressiveCliEvent::Snapshot {
-                protocol_version: uasset_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
+                protocol_version: utrace_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
                 sequence,
                 progress,
                 patch,
@@ -1178,7 +1178,7 @@ fn dashboard_progress_utrace(options: &InspectOptions) -> u8 {
     let (progress, patch) = session.frame_patch(total_bytes);
     if session.frame_revision() != last_frame_revision {
         if write_progress_json(&ProgressiveCliEvent::Snapshot {
-            protocol_version: uasset_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
+            protocol_version: utrace_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
             sequence,
             progress,
             patch,
@@ -1190,7 +1190,7 @@ fn dashboard_progress_utrace(options: &InspectOptions) -> u8 {
     }
     let (progress, patch) = session.analyzing_patch(total_bytes);
     if write_progress_json(&ProgressiveCliEvent::Snapshot {
-        protocol_version: uasset_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
+        protocol_version: utrace_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
         sequence,
         progress,
         patch,
@@ -1230,7 +1230,7 @@ fn dashboard_progress_utrace(options: &InspectOptions) -> u8 {
         None => (None, None),
     };
     write_progress_json(&ProgressiveCliEvent::Complete {
-        protocol_version: uasset_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
+        protocol_version: utrace_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
         sequence,
         progress: complete_progress,
         dashboard: Box::new(UtraceDashboardOutput {
@@ -1253,7 +1253,7 @@ fn dashboard_progress_utrace(options: &InspectOptions) -> u8 {
 #[cfg(feature = "utrace")]
 fn write_progress_failure(sequence: u64, error: String) {
     let _ = write_progress_json(&ProgressiveCliEvent::Failed {
-        protocol_version: uasset_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
+        protocol_version: utrace_parser::utrace_progress::PROGRESS_PROTOCOL_VERSION,
         sequence,
         error,
     });
@@ -1286,7 +1286,7 @@ fn timeline_index_utrace(options: &TimelineIndexOptions) -> u8 {
             return EXIT_IO;
         }
     };
-    let index = match uasset_parser::utrace::build_cpu_timeline_index_with_source_identity(
+    let index = match utrace_parser::utrace::build_cpu_timeline_index_with_source_identity(
         &bytes,
         &options.output,
         options.max_intervals,
@@ -1321,14 +1321,14 @@ fn timeline_index_utrace(options: &TimelineIndexOptions) -> u8 {
 #[cfg(feature = "utrace")]
 fn read_timeline_input(
     input: &Input,
-) -> io::Result<(Vec<u8>, uasset_parser::utrace::SourceIdentity)> {
+) -> io::Result<(Vec<u8>, utrace_parser::utrace::SourceIdentity)> {
     let mut reader: Box<dyn Read> = match input {
         Input::File(path) => Box::new(fs::File::open(path)?),
         Input::Stdin => Box::new(io::stdin()),
     };
     let mut bytes = Vec::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
-    let mut fingerprint = uasset_parser::utrace::SourceFingerprint::new();
+    let mut fingerprint = utrace_parser::utrace::SourceFingerprint::new();
     loop {
         let count = reader.read(&mut buffer)?;
         if count == 0 {
@@ -1344,7 +1344,7 @@ fn read_timeline_input(
 #[cfg(feature = "utrace")]
 fn timeline_query_utrace(options: &TimelineQueryOptions) -> u8 {
     let path = options.index.to_string_lossy().into_owned();
-    let timeline = match uasset_parser::utrace::query_cpu_timeline_index(
+    let timeline = match utrace_parser::utrace::query_cpu_timeline_index(
         &options.index,
         &CpuTimelineQuery {
             start_cycle: options.start_cycle,
@@ -1393,7 +1393,7 @@ fn inventory_utrace(options: &InspectOptions) -> u8 {
         }
     };
 
-    let inventory = match uasset_parser::utrace::inventory(&bytes) {
+    let inventory = match utrace_parser::utrace::inventory(&bytes) {
         Ok(inventory) => inventory,
         Err(error) => {
             let exit_code = exit_code_for_trace_error(&error);
@@ -1452,7 +1452,7 @@ fn coverage_utrace(options: &CoverageOptions) -> u8 {
         None => None,
     };
 
-    let coverage = match uasset_parser::utrace::coverage(&bytes, universe.as_ref()) {
+    let coverage = match utrace_parser::utrace::coverage(&bytes, universe.as_ref()) {
         Ok(coverage) => coverage,
         Err(error) => {
             let exit_code = exit_code_for_trace_error(&error);
@@ -1490,7 +1490,7 @@ fn html_utrace(options: &UtraceHtmlOptions) -> u8 {
         }
     };
 
-    let dashboard = match uasset_parser::utrace::dashboard(&bytes) {
+    let dashboard = match utrace_parser::utrace::dashboard(&bytes) {
         Ok(dashboard) => dashboard,
         Err(error) => {
             let exit_code = exit_code_for_trace_error(&error);
@@ -1723,7 +1723,9 @@ pre { overflow: auto; border: 1px solid var(--border); border-radius: 6px; paddi
         html_kv_row(&mut rendered, "Start cycle", prologue.start_cycle);
         html_kv_row(&mut rendered, "Cycle frequency", prologue.cycle_frequency);
         html_kv_row(&mut rendered, "Pointer size", prologue.pointer_size);
-        html_kv_row(&mut rendered, "Start date time", prologue.start_date_time);
+        if let Some(start_date_time) = prologue.start_date_time {
+            html_kv_row(&mut rendered, "Start date time", start_date_time);
+        }
         rendered.push_str("</tbody></table>\n");
     }
 
@@ -1970,7 +1972,7 @@ fn render_utrace_coverage_text_output(output: &UtraceCoverageOutput) -> String {
     for entry in coverage
         .events
         .iter()
-        .filter(|entry| entry.status == uasset_parser::utrace::DecodeStatus::Raw)
+        .filter(|entry| entry.status == utrace_parser::utrace::DecodeStatus::Raw)
         .take(20)
     {
         writeln!(
@@ -2616,16 +2618,16 @@ fn render_utrace_text_output(output: &UtraceInspectOutput) -> String {
         .unwrap();
     }
     if let Some(prologue) = &output.trace.prologue {
-        writeln!(
+        write!(
             rendered,
-            "prologue: start_cycle={} cycle_frequency={} endian=0x{:04x} pointer_size={} start_date_time={}",
-            prologue.start_cycle,
-            prologue.cycle_frequency,
-            prologue.endian,
-            prologue.pointer_size,
-            prologue.start_date_time
+            "prologue: start_cycle={} cycle_frequency={} endian=0x{:04x} pointer_size={}",
+            prologue.start_cycle, prologue.cycle_frequency, prologue.endian, prologue.pointer_size,
         )
         .unwrap();
+        if let Some(start_date_time) = prologue.start_date_time {
+            write!(rendered, " start_date_time={start_date_time}").unwrap();
+        }
+        writeln!(rendered).unwrap();
     }
     writeln!(
         rendered,
@@ -3296,19 +3298,19 @@ enum ProgressiveCliEvent {
     Bootstrap {
         protocol_version: u32,
         sequence: u64,
-        progress: uasset_parser::utrace_progress::DecodeProgress,
-        bootstrap: uasset_parser::utrace_progress::DashboardBootstrap,
+        progress: utrace_parser::utrace_progress::DecodeProgress,
+        bootstrap: utrace_parser::utrace_progress::DashboardBootstrap,
     },
     Snapshot {
         protocol_version: u32,
         sequence: u64,
-        progress: uasset_parser::utrace_progress::DecodeProgress,
-        patch: uasset_parser::utrace_progress::DashboardPatch,
+        progress: utrace_parser::utrace_progress::DecodeProgress,
+        patch: utrace_parser::utrace_progress::DashboardPatch,
     },
     Complete {
         protocol_version: u32,
         sequence: u64,
-        progress: uasset_parser::utrace_progress::DecodeProgress,
+        progress: utrace_parser::utrace_progress::DecodeProgress,
         dashboard: Box<UtraceDashboardOutput>,
         inventory: Box<UtraceInventoryOutput>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -3856,9 +3858,9 @@ impl PropertyOutput {
                 value: text.source.clone(),
             },
             PropertyValue::Vector(vector) => PropertyValueOutput::Vector {
-                x: vector.x,
-                y: vector.y,
-                z: vector.z,
+                x: vector.x as f32,
+                y: vector.y as f32,
+                z: vector.z as f32,
             },
             PropertyValue::IntPoint(point) => PropertyValueOutput::IntPoint {
                 x: point.x,
@@ -3903,6 +3905,10 @@ impl PropertyOutput {
             },
             PropertyValue::Raw { reason } => PropertyValueOutput::Raw {
                 reason: render_raw_reason(reason),
+                size: record.payload.len(),
+            },
+            _ => PropertyValueOutput::Raw {
+                reason: "unsupported property value".to_owned(),
                 size: record.payload.len(),
             },
         };
@@ -3964,9 +3970,9 @@ fn value_output(package: &Package, value: &PropertyValue) -> PropertyValueOutput
             value: text.source.clone(),
         },
         PropertyValue::Vector(vector) => PropertyValueOutput::Vector {
-            x: vector.x,
-            y: vector.y,
-            z: vector.z,
+            x: vector.x as f32,
+            y: vector.y as f32,
+            z: vector.z as f32,
         },
         PropertyValue::IntPoint(point) => PropertyValueOutput::IntPoint {
             x: point.x,
@@ -4011,6 +4017,10 @@ fn value_output(package: &Package, value: &PropertyValue) -> PropertyValueOutput
         },
         PropertyValue::Raw { reason } => PropertyValueOutput::Raw {
             reason: render_raw_reason(reason),
+            size: 0,
+        },
+        _ => PropertyValueOutput::Raw {
+            reason: "unsupported property value".to_owned(),
             size: 0,
         },
     }
@@ -4476,7 +4486,7 @@ mod tests {
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
                 timeline_index_output: None,
-                timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
+                timeline_index_max_intervals: utrace_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
                 symbol_paths: Vec::new(),
             })
         );
@@ -4507,7 +4517,7 @@ mod tests {
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
                 timeline_index_output: None,
-                timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
+                timeline_index_max_intervals: utrace_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
                 symbol_paths: Vec::new(),
             })
         );
@@ -4538,7 +4548,7 @@ mod tests {
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
                 timeline_index_output: None,
-                timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
+                timeline_index_max_intervals: utrace_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
                 symbol_paths: Vec::new(),
             }))
         );
@@ -4564,7 +4574,7 @@ mod tests {
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
                 timeline_index_output: None,
-                timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
+                timeline_index_max_intervals: utrace_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
                 symbol_paths: Vec::new(),
             }))
         );
@@ -4594,7 +4604,7 @@ mod tests {
                 gpu_timeline_frame: Some(42),
                 gpu_timeline_limit: 5,
                 timeline_index_output: None,
-                timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
+                timeline_index_max_intervals: utrace_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
                 symbol_paths: Vec::new(),
             }))
         );
@@ -4669,7 +4679,7 @@ mod tests {
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
                 timeline_index_output: None,
-                timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
+                timeline_index_max_intervals: utrace_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
                 symbol_paths: Vec::new(),
             }))
         );
@@ -4746,7 +4756,7 @@ mod tests {
                 gpu_timeline_frame: None,
                 gpu_timeline_limit: 500,
                 timeline_index_output: None,
-                timeline_index_max_intervals: uasset_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
+                timeline_index_max_intervals: utrace_parser::utrace::DEFAULT_MAX_INDEXED_INTERVALS,
                 symbol_paths: Vec::new(),
             }))
         );

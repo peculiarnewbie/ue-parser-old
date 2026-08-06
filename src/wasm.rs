@@ -7,6 +7,7 @@
 use crate::utrace_progress::{
     DashboardBootstrap, DashboardPatch, DecodeProgress, PROGRESS_PROTOCOL_VERSION,
 };
+use crate::utrace_session::MAX_INPUT_BYTES;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -146,6 +147,16 @@ fn dashboard_options(options_json: &str) -> Result<crate::utrace::DashboardOptio
     })
 }
 
+fn bounded_utrace(bytes: &[u8]) -> Result<(), JsValue> {
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(JsValue::from_str(&format!(
+            "UTrace input is {} bytes; browser limit is {MAX_INPUT_BYTES} bytes",
+            bytes.len(),
+        )));
+    }
+    Ok(())
+}
+
 fn inspect_utrace_output(filename: &str, bytes: &[u8]) -> Result<String, JsValue> {
     json(&UtraceOutput {
         schema_version: UTRACE_SCHEMA_VERSION,
@@ -209,12 +220,14 @@ fn dashboard_bundle_utrace_output(
 /// Inspects a UTrace capture and returns the schema-versioned JSON envelope.
 #[wasm_bindgen(js_name = inspectUtrace)]
 pub fn inspect_utrace(filename: &str, bytes: &[u8]) -> Result<String, JsValue> {
+    bounded_utrace(bytes)?;
     inspect_utrace_output(filename, bytes)
 }
 
 /// Produces the parser-oriented UTrace event inventory JSON envelope.
 #[wasm_bindgen(js_name = inventoryUtrace)]
 pub fn inventory_utrace(filename: &str, bytes: &[u8]) -> Result<String, JsValue> {
+    bounded_utrace(bytes)?;
     inventory_utrace_output(filename, bytes)
 }
 
@@ -225,6 +238,7 @@ pub fn dashboard_utrace(
     bytes: &[u8],
     options_json: &str,
 ) -> Result<String, JsValue> {
+    bounded_utrace(bytes)?;
     dashboard_utrace_output(filename, bytes, options_json)
 }
 
@@ -235,6 +249,7 @@ pub fn dashboard_bundle_utrace(
     bytes: &[u8],
     options_json: &str,
 ) -> Result<String, JsValue> {
+    bounded_utrace(bytes)?;
     dashboard_bundle_utrace_output(filename, bytes, options_json)
 }
 
@@ -257,8 +272,8 @@ enum WasmProgressEvent {
         protocol_version: u32,
         sequence: u64,
         progress: DecodeProgress,
-        dashboard: UtraceOutput<DashboardBody<crate::utrace::TraceDashboard>>,
-        inventory: UtraceOutput<InventoryBody<crate::utrace::TraceInventory>>,
+        dashboard: Box<UtraceOutput<DashboardBody<crate::utrace::TraceDashboard>>>,
+        inventory: Box<UtraceOutput<InventoryBody<crate::utrace::TraceInventory>>>,
         timeline_index: crate::utrace::CpuTimelineIndexInfo,
     },
 }
@@ -285,6 +300,11 @@ impl ProgressiveUtraceSession {
             || total_bytes > 9_007_199_254_740_991.0
         {
             return Err(JsValue::from_str("invalid progressive total byte count"));
+        }
+        if total_bytes > MAX_INPUT_BYTES as f64 {
+            return Err(JsValue::from_str(&format!(
+                "progressive UTrace input exceeds browser limit of {MAX_INPUT_BYTES} bytes"
+            )));
         }
         let options = dashboard_options(options_json)?;
         Ok(Self {
@@ -332,7 +352,7 @@ impl ProgressiveUtraceSession {
                 patch,
             });
             self.sequence += 1;
-        } else if self.chunk_count.is_multiple_of(16) {
+        } else if self.chunk_count % 16 == 0 {
             let (progress, patch) = session.transport_patch(Some(self.total_bytes));
             events.push(WasmProgressEvent::Snapshot {
                 protocol_version: PROGRESS_PROTOCOL_VERSION,
@@ -360,18 +380,18 @@ impl ProgressiveUtraceSession {
             protocol_version: PROGRESS_PROTOCOL_VERSION,
             sequence: self.sequence,
             progress,
-            dashboard: UtraceOutput {
+            dashboard: Box::new(UtraceOutput {
                 schema_version: UTRACE_SCHEMA_VERSION,
                 status: "ok",
                 path: self.filename.clone(),
                 body: DashboardBody { dashboard },
-            },
-            inventory: UtraceOutput {
+            }),
+            inventory: Box::new(UtraceOutput {
                 schema_version: UTRACE_SCHEMA_VERSION,
                 status: "ok",
                 path: self.filename.clone(),
                 body: InventoryBody { inventory },
-            },
+            }),
             timeline_index: timeline_index_info,
         };
         json(&event)
@@ -433,7 +453,7 @@ pub fn parse(
     match kind {
         "uasset-inspect" => {
             bounded_uasset(bytes)?;
-            let package = crate::Package::parse(bytes)
+            let package = uasset_parser::Package::parse(bytes)
                 .map_err(|error| JsValue::from_str(&error.to_string()))?;
             let summary = &package.summary;
             json(&UassetOutput {

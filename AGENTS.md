@@ -1,7 +1,9 @@
 # Agent Guidance
 
 This parser has solid low-level defenses. Keep applying the same discipline in
-the upper layers. Avoid these habits when changing the codebase:
+the UTrace layers. The shared bounded reader and archive errors belong to the
+version-pinned UE Shed `uasset-parser` dependency; do not copy them into this
+repository.
 
 ## Habits To Avoid
 
@@ -25,9 +27,10 @@ the upper layers. Avoid these habits when changing the codebase:
   event kinds, and JSON status/kind fields into enums at boundaries when the
   set of values is known.
 
-- Do not copy-paste parser helpers or CLI drivers. Shared behavior such as
-  archive bool decoding, name-reference validation, export class preambles,
-  render dispatch, and trace command plumbing should have one implementation.
+- Do not copy-paste parser helpers or CLI drivers. Shared byte-reading
+  behavior belongs to the `uasset-parser` dependency; trace transport,
+  provider aggregation, render dispatch, and trace command plumbing should
+  have one implementation here.
 
 - Do not represent domain ids and sentinel states as raw primitives when a
   newtype or `Option` captures the invariant. Follow the existing `Span`,

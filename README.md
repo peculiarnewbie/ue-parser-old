@@ -1,263 +1,72 @@
-# UAsset CLI
+# UTrace parser
 
-Fast, read-only command-line inspector for classic Unreal Engine asset packages.
-The Rust library is an implementation detail; the versioned CLI output is the
-integration contract for other programs.
+Read-only parsing and bounded analysis for Unreal Engine `.utrace` captures.
 
-The initial compatibility target is UE 5.7.2, uncooked editor packages using
-versioned tagged properties.
+This repository owns the UTrace transport decoder, event registry, provider
+aggregation, dashboards, progressive sessions, timeline indexes, and the
+browser WebAssembly binding. Common bounded byte-reading and archive error
+behavior comes from the pinned UE Shed dependency in
+[`ue-shed`](https://github.com/ue-shed/ue-shed).
 
-## Current status
+## Rust crate
 
-Per-class decode coverage and the prioritized backlog are tracked in
-[`docs/asset-coverage.md`](docs/asset-coverage.md). Where to thicken tests and
-how to prioritize TDD for this translation-style parser:
-[`docs/test-opportunity-catalog.md`](docs/test-opportunity-catalog.md),
-[`docs/tdd-prioritization.md`](docs/tdd-prioritization.md). The feature changelog
-below records how the parser got here.
+The library exposes the UTrace API from `src/utrace.rs` and its focused helper
+modules. The native command-line target retains a legacy name for
+compatibility; its UTrace commands are:
 
-Phases 1 through 6 are implemented:
+```text
+cargo run -- utrace inspect Trace.utrace --format json
+cargo run -- utrace inventory Trace.utrace --format json
+cargo run -- utrace dashboard Trace.utrace --format json
+cargo run -- utrace timeline index Trace.utrace --output Trace.utix --format json
+cargo run -- utrace timeline query Trace.utix --format json
+cargo run -- utrace coverage Trace.utrace --format json
+cargo run -- utrace html Trace.utrace --output Trace.html
+```
 
-- Downward-only module skeleton
-- Bounded little-endian binary reader
-- Checked cursor operations and child readers
-- Configurable count and allocation limits
-- Offset- and field-aware errors
-- `FGuid`, `FIoHash`, classic `FName`, `FString`, and generic `TArray` reads
-- Reusable source `Span`
-- Version-gated classic `FPackageFileSummary` parsing
-- Custom versions for enum, GUID, and optimized legacy layouts
-- Explicit rejection of cooked, unversioned-property, future-version, and
-  swapped-endian packages
-- Validated header/table locations
-- Name map parsing with legacy hash handling
-- Import/export map parsing for supported classic UE4/UE5 layouts
-- `FPackageIndex` object-path resolution across imports and exports
-- Bounded export readers validated against `SerialOffset + SerialSize`
-- Fixture-backed `UDataTable` export discovery by `/Script/Engine.DataTable`
-- Modern UE5 tagged-property envelope parsing with complete type names
-- Root UObject serialization-control extension handling
-- Raw payload spans retained for unsupported property values
-- Fixture-backed `UDataTable` property stream parsing through `NAME_None`
-- Minimum property value decoding for bool, integers, floats, names, strings,
-  and object/class references
-- Fixture-backed `RowStruct` object-reference decoding and path resolution
-- `UDataTable` asset adapter with row-count and row-name decoding
-- Row tagged-property streams are parsed and decoded where the supported
-  property subset applies
-- Per-row property names, types, and decoded values are surfaced in both the
-  text and JSON `inspect` output; unsupported property types are reported as
-  raw with their type and payload byte length
-- `UUserDefinedEnum` decoding: the `UEnum` name/value pairs and `CppForm`
-  from the export tail, with per-entry display names resolved from the
-  `DisplayNameMap` carried in the tagged-property stream
-- `UUserDefinedStruct` decoding: the `UStruct` tail (`SuperStruct`, `Children`,
-  the `ChildProperties` `FField`/`FProperty` schema, `StructFlags`) plus the
-  default-instance property stream; each field surfaces its on-disk type, the
-  struct/enum/class it references, and its friendly `DisplayName`
-- Package `SoftObjectPaths` summary table parsed as `FTopLevelAssetPath`
-  (PackageName + AssetName name-map pairs) + subpath, so indexed soft-object
-  references resolve to real paths
-- Generic exports decode as `UObject` (tagged properties + retained binary
-  `tail_bytes`); `*ImportData` sub-objects skip their leading JSON blob so
-  imported assets (StaticMesh, Texture2D, …) decode
-- Per-export resilient `inspect`: a single undecodable export no longer aborts the
-  file — decoded assets are emitted with failures in `decode_errors` and
-  `status: "partial"` (exit `6`)
-- `uasset inspect` command with text and schema-versioned JSON output
-  (current `schema_version` is 6)
-- `uasset authoring` projection for DataTable and Composite DataTable packages,
-  using the versioned language-neutral Unreal authoring contract
-- File and stdin input
-- Stable stdout/stderr and exit-code behavior
+Run the native checks with:
 
-## Web UI
+```text
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+```
 
-A SolidJS + Vite frontend lives in [`web/`](web/). It provides drop zones for
-`.uasset` and `.utrace` files and shells out to this CLI for JSON inspect /
-dashboard output.
+Real-capture tests are feature-gated and accept `UTRACE_FIXTURE`,
+`UTRACE_FIXTURE_DIR`, and the provider-specific fixture variables documented
+in `tests/utrace_fixture.rs`.
 
-The browser-only UTrace parser is also prepared as the standalone npm package
-[`packages/utrace-parser-wasm/`](packages/utrace-parser-wasm/). Its typed
-facade parses locally in a browser or worker and owns the WASM lifecycle. To
-publish the checked-out `0.1.0` package after the normal Rust checks:
+## Browser WebAssembly package
+
+[`@ue-shed/utrace-parser-wasm`](packages/utrace-parser-wasm) is browser-only
+and should be used from a web worker for large captures. It exposes
+`inspect`, `inventory`, `dashboard`, `dashboardBundle`, and
+`createProgressiveDashboard`.
 
 ```text
 cd packages/utrace-parser-wasm
-npm login
+npm install
+npm run build
+npm run check
 npm publish
 ```
 
-```text
-cargo build --features utrace
-cd web && npm install && npm run dev
-```
+The package build requires `wasm-pack` and the
+`wasm32-unknown-unknown` Rust target. `npm publish` runs the repository Rust
+checks, builds the WASM artifact, and validates the package contents.
+
+The local SolidJS web UI is in [`web/`](web/). It is documented and supported
+as a UTrace viewer:
 
 ```text
-uasset inspect Asset.uasset
-uasset inspect Asset.uasset --format json
-uasset inspect - --format json
-uasset authoring DataTable.uasset --format json
+cd web
+npm install
+npm run dev
 ```
 
-With `--features utrace`, the same binary also exposes preliminary UTrace
-inspection and dashboard summaries:
+## Shared byte-reader dependency
 
-```text
-uasset utrace inspect Trace.utrace
-uasset utrace inspect Trace.utrace --format json
-uasset utrace inventory Trace.utrace --format json
-uasset utrace dashboard Trace.utrace --format json
-uasset utrace dashboard Trace.utrace --format json --max-frames 500 --frame 42 --timeline-limit 250
-uasset utrace dashboard Trace.utrace --format json --gpu-frame 42 --gpu-timeline-limit 250
-uasset utrace timeline index Trace.utrace --output Trace.utix --format json
-uasset utrace timeline query Trace.utix --start-cycle 1280000 --end-cycle 1296000 --search Render --format json
-uasset utrace coverage Trace.utrace --format json
-uasset utrace html Trace.utrace --output Trace.html
-```
-
-`utrace inventory` is parser-oriented: it counts observed event families and
-includes a small decoded payload sample per event type where fields can be
-decoded generically.
-
-`utrace dashboard` retains a bounded frame summary by default (120 rows).
-`--max-frames` changes that bound, and the JSON reports the uncapped total plus
-truncation status. `--frame` / `--timeline-limit` select a bounded CPU frame
-timeline; `--gpu-frame` / `--gpu-timeline-limit` do the same for one queue-local
-GPU frame number. These two frame-number spaces are intentionally kept
-separate.
-
-`utrace timeline index` writes a bounded disk-backed CPU scope index (default
-cap: 1,000,000 intervals). `utrace timeline query` reads that sidecar without
-reparsing the trace; it supports arbitrary inclusive cycle ranges, a thread
-filter, and case-insensitive scope/rendered-name search. Both index and query
-report `truncated` when a configured bound means the result is incomplete.
-
-`utrace html` writes a simple static dashboard page for quick local review. It
-uses the same decoded data as `utrace dashboard` and defaults to stdout when
-`--output` is omitted.
-
-`utrace coverage` reports decode coverage: it classifies every event a trace
-declares as decoded / partial / raw (with a note on what each decoder drops),
-ranks the remaining raw families by observed volume, and — given `--universe
-<file>` — cross-references the trace against the full set of engine trace events
-to list the ones this trace never declared. The classification comes from the
-`EVENT_COVERAGE` table in `src/utrace.rs` (the single source of truth), so it
-cannot drift from what the parser actually decodes.
-
-Generate a universe file from an engine source tree with
-[`scripts/harvest-ue-trace-events.sh`](scripts/harvest-ue-trace-events.sh):
-
-```text
-scripts/harvest-ue-trace-events.sh /path/to/UE/Engine/Source ue_events.txt
-uasset utrace coverage Trace.utrace --universe ue_events.txt
-```
-
-UTrace parser coverage notes for future agents live in
-[`memory/utrace-coverage-matrix.md`](memory/utrace-coverage-matrix.md).
-
-Successful output is written only to stdout. Errors and diagnostics are written
-only to stderr.
-
-Exit codes:
-
-- `0`: success
-- `2`: malformed package data
-- `3`: unsupported format, version, or capability
-- `4`: input/output failure
-- `5`: internal output failure
-- `6`: partial success — the package parsed but one or more exports failed to
-  decode; decoded assets are still emitted and the failures are listed in
-  `decode_errors` (JSON) with `status: "partial"`
-- `64`: invalid command-line usage
-
-Run checks with:
-
-```text
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
-```
-
-For UTrace work, include the feature:
-
-```text
-cargo test --all-targets --features utrace
-cargo clippy --all-targets --features utrace -- -D warnings
-```
-
-## Unreal Engine source
-
-Serialization contracts (package summary layout, version gates, property tags,
-primitive wire formats) can be verified against the local UE 5.7 tree:
-
-```text
-C:\Users\Ryzen\Perforce\Arif_UE-ManaBreak
-```
-
-Start with `Engine/Source/Runtime/CoreUObject/Public/UObject/PackageFileSummary.h`,
-`Engine/Source/Runtime/Core/Public/UObject/ObjectVersion.h`, and
-`Engine/Source/Runtime/CoreUObject/Private/UObject/PropertyTag.cpp`. A fuller
-file-to-module map lives in `memory/ue-source-reference.md`.
-
-## Shared Unreal fixture project
-
-The parser reuses Electroswag's UE 5.7 fixture project rather than maintaining
-a second Unreal project. The parser-owned mirror of the current fixture contract is:
-
-```text
-tests/fixtures/electroswag-v15.json
-```
-
-Its upstream source of truth is Electroswag's
-`e2e/fixtures/unreal/contract.ts`; keep the two in sync when the contract
-changes. The mirror's `datatables` section pins each DataTable's object path,
-ordered row names, expected columns, and typed cell values, which the fixture
-tests assert against decoded output (e.g. `DT_Scalars2` row `Row_Beta` decodes
-to `IntValue = 222`, `StringValue = "FromScalars2"`, the composite override
-that `contract.ts` pins).
-
-Fixture tests validate both the Rust parser and the spawned CLI against every
-contract asset. Resolution order:
-
-1. `UASSET_FIXTURE_DIR`
-2. Studio default `D:\Perforce\Arif_Fixtures`
-
-When no fixture exists, these tests skip so normal builds remain portable. To
-make absence a test failure in fixture-backed CI:
-
-```text
-UASSET_REQUIRE_FIXTURE=1 cargo test --test fixture_project
-```
-
-## UTrace fixture
-
-The preliminary `.utrace` e2e tests are feature-gated and skip unless a real
-trace is provided. They cover both parser inspection and the CPU dashboard
-summary. Resolution order:
-
-1. `UTRACE_FIXTURE`
-2. first `*.utrace` in `UTRACE_FIXTURE_DIR`
-3. first `*.utrace` in studio default `D:\Perforce\Arif_Fixtures\Traces`
-
-When no fixture exists, the test skips so normal builds remain portable. To make
-absence a failure:
-
-```text
-UTRACE_REQUIRE_FIXTURE=1 cargo test --test utrace_fixture --features utrace
-```
-
-Provider-specific captures can be supplied separately with
-`UTRACE_TARGETED_FIXTURE` or `UTRACE_TARGETED_FIXTURE_DIR`. The ignored
-`targeted_utrace_fixtures_exercise_provider_lifecycles` test requires the
-combined corpus to exercise LoadTime requests, counter values, memory scopes,
-and metadata-stack restoration. IoStore requires a cooked capture and is
-validated separately with `UTRACE_IOSTORE_FIXTURE`.
-
-The ignored `memory_utrace_fixture_exposes_alloc_and_tag_summaries` test uses
-`UTRACE_MEMORY_FIXTURE`. It requires `Memory.Init`, `Memory.TagSpec`, and
-allocation/free traffic; the checked dashboard aggregates use bounded samples
-and a capped outstanding-address map. The same provider decodes LLM tag,
-tracker, and tag-set catalogs plus bounded latest tag values. The current studio
-provider capture has Memory allocation traffic but declares no LLM events, so
-the LLM wire decoder is covered by synthetic tests until a MemTag capture is
-available.
+`Cargo.toml` pins the shared UE Shed reader dependency to an exact Git
+revision. UTrace uses only its bounded reader and archive error types. If that
+reader seam becomes unstable, extracting a small shared Rust crate is the next
+step.

@@ -1,9 +1,18 @@
 {
-  "name": "uasset-parser-utrace-wasm",
-  "version": "0.1.0",
+  "name": "@ue-shed/utrace-parser-wasm",
+  "version": "0.1.2",
   "description": "Browser WebAssembly parser for Unreal Engine UTrace captures",
+  "homepage": "https://github.com/ue-shed/ue-shed-utrace#readme",
+  "bugs": {
+    "url": "https://github.com/ue-shed/ue-shed-utrace/issues"
+  },
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ue-shed/ue-shed-utrace.git",
+    "directory": "packages/utrace-parser-wasm"
+  },
   "keywords": [
     "unreal-engine",
     "utrace",
@@ -22,6 +31,17 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./manifest": {
+      "types": "./dist/manifest.d.ts",
+      "import": "./dist/manifest.js",
+      "default": "./dist/manifest.js"
+    },
+    "./parser-manifest.json": "./dist/parser-manifest.json",
+    "./worker": {
+      "types": "./dist/worker.d.ts",
+      "import": "./dist/worker.js",
+      "default": "./dist/worker.js"
     }
   },
   "types": "./dist/index.d.ts",
@@ -36,7 +56,7 @@
     "registry": "https://registry.npmjs.org"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.14.0"
   },
-  "packageManager": "npm@11.16.0"
+  "packageManager": "pnpm@11.20.0"
 }

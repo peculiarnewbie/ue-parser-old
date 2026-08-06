@@ -1,5 +1,5 @@
 [package]
-name = "uasset-parser-fuzz"
+name = "utrace-parser-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -9,21 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-uasset-parser = { path = "..", features = ["utrace"] }
-
-[[bin]]
-name = "package_parse"
-path = "fuzz_targets/package_parse.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "property_stream"
-path = "fuzz_targets/property_stream.rs"
-test = false
-doc = false
-bench = false
+utrace-parser = { path = "..", features = ["utrace"] }
 
 [[bin]]
 name = "utrace_packets"

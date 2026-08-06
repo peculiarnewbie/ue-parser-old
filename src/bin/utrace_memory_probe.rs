@@ -4,8 +4,8 @@ fn main() {
         .nth(1)
         .expect("usage: utrace_memory_probe <trace>");
     let bytes = std::fs::read(&path).expect("read trace");
-    let mut session = uasset_parser::utrace::ProgressiveDashboardSession::new(
-        uasset_parser::utrace::DashboardOptions::default(),
+    let mut session = utrace_parser::utrace::ProgressiveDashboardSession::new(
+        utrace_parser::utrace::DashboardOptions::default(),
     );
     for chunk in bytes.chunks(1024 * 1024) {
         session.push_chunk(chunk).expect("stream trace chunk");

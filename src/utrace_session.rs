@@ -22,7 +22,8 @@ use crate::utrace_progress::{
 };
 
 pub(crate) const MAX_PUSH_CHUNK_BYTES: usize = 1024 * 1024;
-const MAX_DECODED_STREAM_BYTES: usize = 1024 * 1024 * 1024;
+pub(crate) const MAX_INPUT_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_DECODED_STREAM_BYTES: usize = MAX_INPUT_BYTES;
 const MAX_BOOTSTRAP_THREADS: usize = 4096;
 const MAX_PROGRESSIVE_GPU_QUEUES: usize = 64;
 const MAX_PROGRESSIVE_OPEN_GPU_WORK_PER_QUEUE: usize = 256;

@@ -1,4 +1,8 @@
-# Test opportunity catalog
+# Historical test opportunity catalog
+
+> Historical mixed-scope catalog. Asset-parser entries are retained as
+> provenance from before this repository narrowed to UTrace. For current work,
+> use the UTrace-focused tests and coverage notes instead.
 
 Evidence-based index of where more tests would help. Companion policy:
 [`tdd-prioritization.md`](tdd-prioritization.md). Class/event scoreboards stay in

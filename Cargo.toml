@@ -1,13 +1,14 @@
 [package]
-name = "uasset-parser"
-version = "0.1.0"
+name = "utrace-parser"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
-description = "Read-only parser foundation for classic Unreal Engine asset packages"
+description = "Read-only parser for Unreal Engine UTrace captures"
 license = "MIT"
+repository = "https://github.com/ue-shed/ue-shed-utrace"
 
 [lib]
-name = "uasset_parser"
+name = "utrace_parser"
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
@@ -16,23 +17,20 @@ name = "uasset"
 path = "src/bin/uasset.rs"
 
 [dependencies]
-lz4_flex = { version = "0.11", optional = true, default-features = false }
+lz4_flex = { version = "0.11", default-features = false }
 pdb-addr2line = { version = "0.12", optional = true }
-rustc-hash = { version = "2", optional = true }
+rustc-hash = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+uasset-parser = { git = "https://github.com/ue-shed/ue-shed.git", rev = "ee0eddbbe2fbdb9a191441da6811a64b9fef16fa", package = "uasset-parser" }
 wasm-bindgen = { version = "0.2", optional = true }
 
 [features]
-default = ["uasset"]
-uasset = []
-utrace = ["dep:lz4_flex", "dep:rustc-hash"]
+default = ["utrace"]
+utrace = []
 utrace-symbols = ["utrace", "dep:pdb-addr2line"]
-# The existing browser UI needs both package-summary and UTrace operations.
-# Keep that compatibility feature, but let the published npm package compile a
-# UTrace-only binding surface.
 utrace-wasm = ["utrace", "dep:wasm-bindgen"]
-wasm-uasset = ["uasset"]
+wasm-uasset = []
 wasm = ["utrace-wasm", "wasm-uasset"]
 
 [lints.rust]

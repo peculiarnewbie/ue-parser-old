@@ -1,5 +1,8 @@
 export const UTRACE_SCHEMA_VERSION: 2;
 
+export { parserManifest } from "./manifest.js";
+export type { UtraceParserManifest, UtraceParserOperation } from "./manifest.js";
+
 export type JsonPrimitive = boolean | number | string | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
 export type JsonObject = { readonly [key: string]: JsonValue };
@@ -82,6 +85,28 @@ export type UtraceProgressEvent =
   | CompleteProgressEvent;
 
 export class UtraceParserError extends Error {}
+
+export class UtraceParserWorkerError extends Error {}
+
+export type UtraceParserWorkerOptions = Readonly<{
+  /** Use an already-created module Worker instead of creating one. */
+  worker?: Worker;
+  /** Options for the module Worker created by the helper. */
+  workerOptions?: WorkerOptions;
+}>;
+
+export type UtraceParserWorker = Readonly<{
+  inspect(input: UtraceInput): Promise<UtraceInspect>;
+  inventory(input: UtraceInput): Promise<UtraceInventory>;
+  dashboard(input: DashboardInput): Promise<UtraceDashboard>;
+  dashboardBundle(input: DashboardInput): Promise<UtraceDashboardBundle>;
+  terminate(): void;
+}>;
+
+/** Creates a dedicated module Worker for one-shot UTrace operations. */
+export function createUtraceParserWorker(
+  options?: UtraceParserWorkerOptions,
+): UtraceParserWorker;
 
 /** Eagerly initialize the bundled browser WebAssembly module. */
 export function init(): Promise<void>;
