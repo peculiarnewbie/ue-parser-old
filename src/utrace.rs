@@ -1,5 +1,6 @@
 //! Read-only UTrace (`.utrace`) container inspection.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -4050,207 +4051,217 @@ fn read_dashboard_events(
         }
     }
 
-    let (dispatched_events, dispatch_summary) =
-        crate::utrace_dispatch::dispatch_normal_events(streams, &registry, sync_count)?;
-    decoded.dispatch = Some(dispatch_summary);
-
-    for raw_event in &dispatched_events {
-        let thread_id = raw_event.thread_id;
-        let Some(event) = registry.get(&raw_event.uid).copied() else {
-            continue;
-        };
-        if !decode_scope.includes_normal_event(event) {
-            continue;
-        }
-        if decode_status_for(event) == DecodeStatus::Raw {
-            unmodeled_events.entry(event.uid).or_default().record(
-                event,
-                &raw_event.data,
-                thread_id,
-            )?;
-            continue;
-        }
-        let kind = event_kinds
-            .get(usize::from(raw_event.uid))
-            .copied()
-            .unwrap_or(DashboardEventKind::Unknown);
-        match kind {
-            DashboardEventKind::CpuProfilerMetadata => {
-                let mut record = decode_cpu_metadata_record(event, &raw_event.data, 0)?;
-                enrich_cpu_metadata_record(&metadata_spec_by_id, &mut record);
-                metadata_by_id.insert(record.metadata_id, record);
+    let dispatch_summary = crate::utrace_dispatch::dispatch_normal_events_with(
+        streams,
+        &registry,
+        sync_count,
+        |raw_event| {
+            let thread_id = raw_event.thread_id;
+            let Some(event) = registry.get(&raw_event.uid).copied() else {
+                return Ok(());
+            };
+            if !decode_scope.includes_normal_event(event) {
+                return Ok(());
             }
-            DashboardEventKind::CpuProfilerEventBatchV3 => {
-                let Some(data) = read_aux_bytes(event, &raw_event.data, "Data", 0)? else {
-                    continue;
-                };
-                let mut batch_state = CpuBatchDecodeState {
-                    batches: &mut decoded.cpu.batches,
-                    scope_totals: &mut scope_totals,
-                    metadata_scope_totals: &mut metadata_scope_totals,
-                    metadata_interval_state: &mut metadata_interval_state,
-                    metadata_stack_context: metadata_stack_contexts.entry(thread_id).or_default(),
-                    thread_state: cpu_batch_thread_states.entry(thread_id).or_default(),
-                    batch_base_cycle: raw_event.scope_cycle.or(prologue_start_cycle),
-                    frame_scope_totals: &mut frame_scope_totals,
-                    frame_cycle_bounds: &mut frame_cycle_bounds,
-                    thread_scope_totals: thread_scope_totals.entry(thread_id).or_default(),
-                    timeline: cpu_timeline_sink.take(),
+            if decode_status_for(event) == DecodeStatus::Raw {
+                unmodeled_events.entry(event.uid).or_default().record(
+                    event,
+                    raw_event.data,
                     thread_id,
-                    cycle_frequency,
-                };
-                decode_cpu_batch(&data, &spec_by_id, &metadata_by_id, &mut batch_state)?;
-                cpu_timeline_sink = batch_state.timeline.take();
-            }
-            DashboardEventKind::MiscBeginFrame => {
-                decoded.frames.push(decode_frame_marker(
-                    event,
-                    &raw_event.data,
-                    0,
-                    thread_id,
-                    FrameMarkerKind::Begin,
-                )?);
-            }
-            DashboardEventKind::MiscEndFrame => {
-                decoded.frames.push(decode_frame_marker(
-                    event,
-                    &raw_event.data,
-                    0,
-                    thread_id,
-                    FrameMarkerKind::End,
-                )?);
-            }
-            DashboardEventKind::Cpu => {
-                cpu_named_events
-                    .entry(event.event.clone())
-                    .or_default()
-                    .record(event, &raw_event.data, thread_id)?;
-            }
-            DashboardEventKind::GpuProfiler => {
-                let mut gpu_state = GpuNormalEventState {
-                    specs: &gpu_breadcrumb_specs,
-                    queues: &mut gpu_queues,
-                    breadcrumb_totals: &mut gpu_breadcrumb_totals,
-                    submission_latency_samples: &mut submission_latency_samples,
-                    timeline: gpu_timeline_collector.as_mut(),
-                };
-                decode_gpu_normal_event(event, &raw_event.data, &mut gpu_state, 0)?;
-            }
-            DashboardEventKind::Counters => {
-                decode_counter_value(
-                    event,
-                    &raw_event.data,
-                    &counter_specs,
-                    &mut counter_states,
-                    &mut unresolved_counter_samples,
-                    0,
                 )?;
+                return Ok(());
             }
-            DashboardEventKind::StatsEventBatch2 => {
-                stats_samples.record_batch(event, &raw_event.data, &stat_specs, 0)?;
-            }
-            DashboardEventKind::CsvProfilerStat => {
-                csv_samples.record_event(event, &raw_event.data, thread_id, &csv_stats, 0)?;
-            }
-            DashboardEventKind::TaskTrace => {
-                tasks.record_event(event, &raw_event.data, thread_id, 0)?;
-            }
-            DashboardEventKind::Misc => {
-                decode_misc_annotation_event(
-                    event,
-                    &raw_event.data,
-                    &bookmark_specs,
-                    &mut bookmark_states,
-                    &mut unresolved_bookmark_events,
-                    &mut region_state,
-                    0,
-                )?;
-            }
-            DashboardEventKind::LoggingLogMessage => {
-                decode_log_message(
-                    event,
-                    &raw_event.data,
-                    &log_message_specs,
-                    &mut log_message_states,
-                    &mut unresolved_log_messages,
-                    0,
-                )?;
-            }
-            DashboardEventKind::LoadTime => {
-                decode_load_time_event(event, &raw_event.data, &mut load_time, 0)?;
-            }
-            DashboardEventKind::IoStore => {
-                decode_io_store_event(event, &raw_event.data, &mut io_store, 0)?;
-            }
-            DashboardEventKind::PlatformFile => {
-                decode_platform_file_event(
-                    event,
-                    &raw_event.data,
-                    &mut platform_file,
-                    thread_id,
-                    0,
-                )?;
-            }
-            DashboardEventKind::TraceThreadTiming => {
-                let timing = decode_trace_thread_timing(event, &raw_event.data, 0, thread_id)?;
-                trace_thread_timing.insert(timing.thread_id, timing);
-            }
-            DashboardEventKind::CpuProfilerEndThread => {
-                cpu_end_threads.push(decode_cpu_end_thread(event, &raw_event.data, 0, thread_id)?);
-            }
-            DashboardEventKind::MemoryScope => {
-                memory.record_scope(decode_memory_scope(event, &raw_event.data, 0)?);
-            }
-            DashboardEventKind::MemoryCallstackSpec => {
-                callstacks.record(decode_callstack_spec(event, &raw_event.data, 0)?);
-            }
-            DashboardEventKind::MemoryAlloc => {
-                let init = memory.init().ok_or_else(|| {
-                    TraceError::new(
-                        TraceErrorKind::MalformedData,
+            let kind = event_kinds
+                .get(usize::from(raw_event.uid))
+                .copied()
+                .unwrap_or(DashboardEventKind::Unknown);
+            match kind {
+                DashboardEventKind::CpuProfilerMetadata => {
+                    let mut record = decode_cpu_metadata_record(event, raw_event.data, 0)?;
+                    enrich_cpu_metadata_record(&metadata_spec_by_id, &mut record);
+                    metadata_by_id.insert(record.metadata_id, record);
+                }
+                DashboardEventKind::CpuProfilerEventBatchV3 => {
+                    let Some(data) = read_aux_bytes(event, raw_event.data, "Data", 0)? else {
+                        return Ok(());
+                    };
+                    let mut batch_state = CpuBatchDecodeState {
+                        batches: &mut decoded.cpu.batches,
+                        scope_totals: &mut scope_totals,
+                        metadata_scope_totals: &mut metadata_scope_totals,
+                        metadata_interval_state: &mut metadata_interval_state,
+                        metadata_stack_context: metadata_stack_contexts
+                            .entry(thread_id)
+                            .or_default(),
+                        thread_state: cpu_batch_thread_states.entry(thread_id).or_default(),
+                        batch_base_cycle: raw_event.scope_cycle.or(prologue_start_cycle),
+                        frame_scope_totals: &mut frame_scope_totals,
+                        frame_cycle_bounds: &mut frame_cycle_bounds,
+                        thread_scope_totals: thread_scope_totals.entry(thread_id).or_default(),
+                        timeline: cpu_timeline_sink.take(),
+                        thread_id,
+                        cycle_frequency,
+                    };
+                    decode_cpu_batch(&data, &spec_by_id, &metadata_by_id, &mut batch_state)?;
+                    cpu_timeline_sink = batch_state.timeline.take();
+                }
+                DashboardEventKind::MiscBeginFrame => {
+                    decoded.frames.push(decode_frame_marker(
+                        event,
+                        raw_event.data,
                         0,
-                        "Memory.Init",
-                        "allocation event appeared before required Memory.Init",
-                    )
-                })?;
-                memory.record_allocation(decode_memory_allocation(
-                    event,
-                    &raw_event.data,
-                    init,
-                    0,
-                )?);
+                        thread_id,
+                        FrameMarkerKind::Begin,
+                    )?);
+                }
+                DashboardEventKind::MiscEndFrame => {
+                    decoded.frames.push(decode_frame_marker(
+                        event,
+                        raw_event.data,
+                        0,
+                        thread_id,
+                        FrameMarkerKind::End,
+                    )?);
+                }
+                DashboardEventKind::Cpu => {
+                    cpu_named_events
+                        .entry(event.event.clone())
+                        .or_default()
+                        .record(event, raw_event.data, thread_id)?;
+                }
+                DashboardEventKind::GpuProfiler => {
+                    let mut gpu_state = GpuNormalEventState {
+                        specs: &gpu_breadcrumb_specs,
+                        queues: &mut gpu_queues,
+                        breadcrumb_totals: &mut gpu_breadcrumb_totals,
+                        submission_latency_samples: &mut submission_latency_samples,
+                        timeline: gpu_timeline_collector.as_mut(),
+                    };
+                    decode_gpu_normal_event(event, raw_event.data, &mut gpu_state, 0)?;
+                }
+                DashboardEventKind::Counters => {
+                    decode_counter_value(
+                        event,
+                        raw_event.data,
+                        &counter_specs,
+                        &mut counter_states,
+                        &mut unresolved_counter_samples,
+                        0,
+                    )?;
+                }
+                DashboardEventKind::StatsEventBatch2 => {
+                    stats_samples.record_batch(event, raw_event.data, &stat_specs, 0)?;
+                }
+                DashboardEventKind::CsvProfilerStat => {
+                    csv_samples.record_event(event, raw_event.data, thread_id, &csv_stats, 0)?;
+                }
+                DashboardEventKind::TaskTrace => {
+                    tasks.record_event(event, raw_event.data, thread_id, 0)?;
+                }
+                DashboardEventKind::Misc => {
+                    decode_misc_annotation_event(
+                        event,
+                        raw_event.data,
+                        &bookmark_specs,
+                        &mut bookmark_states,
+                        &mut unresolved_bookmark_events,
+                        &mut region_state,
+                        0,
+                    )?;
+                }
+                DashboardEventKind::LoggingLogMessage => {
+                    decode_log_message(
+                        event,
+                        raw_event.data,
+                        &log_message_specs,
+                        &mut log_message_states,
+                        &mut unresolved_log_messages,
+                        0,
+                    )?;
+                }
+                DashboardEventKind::LoadTime => {
+                    decode_load_time_event(event, raw_event.data, &mut load_time, 0)?;
+                }
+                DashboardEventKind::IoStore => {
+                    decode_io_store_event(event, raw_event.data, &mut io_store, 0)?;
+                }
+                DashboardEventKind::PlatformFile => {
+                    decode_platform_file_event(
+                        event,
+                        raw_event.data,
+                        &mut platform_file,
+                        thread_id,
+                        0,
+                    )?;
+                }
+                DashboardEventKind::TraceThreadTiming => {
+                    let timing = decode_trace_thread_timing(event, raw_event.data, 0, thread_id)?;
+                    trace_thread_timing.insert(timing.thread_id, timing);
+                }
+                DashboardEventKind::CpuProfilerEndThread => {
+                    cpu_end_threads.push(decode_cpu_end_thread(
+                        event,
+                        raw_event.data,
+                        0,
+                        thread_id,
+                    )?);
+                }
+                DashboardEventKind::MemoryScope => {
+                    memory.record_scope(decode_memory_scope(event, raw_event.data, 0)?);
+                }
+                DashboardEventKind::MemoryCallstackSpec => {
+                    callstacks.record(decode_callstack_spec(event, raw_event.data, 0)?);
+                }
+                DashboardEventKind::MemoryAlloc => {
+                    let init = memory.init().ok_or_else(|| {
+                        TraceError::new(
+                            TraceErrorKind::MalformedData,
+                            0,
+                            "Memory.Init",
+                            "allocation event appeared before required Memory.Init",
+                        )
+                    })?;
+                    memory.record_allocation(decode_memory_allocation(
+                        event,
+                        raw_event.data,
+                        init,
+                        0,
+                    )?);
+                }
+                DashboardEventKind::MemoryFree => {
+                    memory.record_free(decode_memory_free(event, raw_event.data, 0)?);
+                }
+                DashboardEventKind::LlmTagValue => {
+                    let sample = decode_llm_tag_values(event, raw_event.data, 0)?;
+                    memory.record_llm_tag_values(
+                        sample.tracker_id,
+                        sample.cycle,
+                        &sample.values,
+                        sample.dropped_values,
+                    );
+                }
+                DashboardEventKind::MetadataStack => {
+                    decode_metadata_stack_event(event, raw_event.data, &mut metadata_stack, 0)?;
+                    apply_metadata_stack_event_to_cpu_context(
+                        event,
+                        raw_event.data,
+                        metadata_stack_contexts.entry(thread_id).or_default(),
+                        0,
+                    )?;
+                }
+                DashboardEventKind::SlateTraceAddWidget => {
+                    let widget = decode_slate_add_widget(event, raw_event.data, 0)?;
+                    slate_widgets
+                        .entry(widget.widget_id)
+                        .or_default()
+                        .record(widget.cycle);
+                }
+                DashboardEventKind::Unknown => {}
             }
-            DashboardEventKind::MemoryFree => {
-                memory.record_free(decode_memory_free(event, &raw_event.data, 0)?);
-            }
-            DashboardEventKind::LlmTagValue => {
-                let sample = decode_llm_tag_values(event, &raw_event.data, 0)?;
-                memory.record_llm_tag_values(
-                    sample.tracker_id,
-                    sample.cycle,
-                    &sample.values,
-                    sample.dropped_values,
-                );
-            }
-            DashboardEventKind::MetadataStack => {
-                decode_metadata_stack_event(event, &raw_event.data, &mut metadata_stack, 0)?;
-                apply_metadata_stack_event_to_cpu_context(
-                    event,
-                    &raw_event.data,
-                    metadata_stack_contexts.entry(thread_id).or_default(),
-                    0,
-                )?;
-            }
-            DashboardEventKind::SlateTraceAddWidget => {
-                let widget = decode_slate_add_widget(event, &raw_event.data, 0)?;
-                slate_widgets
-                    .entry(widget.widget_id)
-                    .or_default()
-                    .record(widget.cycle);
-            }
-            DashboardEventKind::Unknown => {}
-        }
-    }
+            Ok(())
+        },
+    )?;
+    decoded.dispatch = Some(dispatch_summary);
 
     decoded.cpu.batches.unterminated_scopes =
         decoded.cpu.batches.unterminated_scopes.saturating_add(
@@ -4592,7 +4603,7 @@ fn decode_gpu_normal_event(
                 return Ok(());
             }
             let metadata = read_aux_bytes(event, data, "Metadata", base_offset)?;
-            let metadata_bytes = metadata.as_ref().map_or(0, Vec::len);
+            let metadata_bytes = metadata.as_ref().map_or(0, |bytes| bytes.len());
             let metadata_report = metadata
                 .as_ref()
                 .map(|bytes| decode_cbor_report(bytes))
@@ -9749,65 +9760,87 @@ pub(crate) fn parse_protocol5_aux(
     base_offset: u64,
 ) -> Result<BTreeMap<u8, Vec<u8>>, TraceError> {
     let mut aux = BTreeMap::<u8, Vec<u8>>::new();
-    if event_data_size >= data.len() {
-        return Ok(aux);
+    let mut fields = Protocol5AuxFields::new(data, event_data_size, base_offset);
+    while let Some((field_index, payload)) = fields.next_field()? {
+        aux.entry(field_index)
+            .or_default()
+            .extend_from_slice(payload);
+    }
+    Ok(aux)
+}
+
+struct Protocol5AuxFields<'a> {
+    data: &'a [u8],
+    cursor: usize,
+    base_offset: u64,
+    finished: bool,
+}
+
+impl<'a> Protocol5AuxFields<'a> {
+    const fn new(data: &'a [u8], event_data_size: usize, base_offset: u64) -> Self {
+        Self {
+            data,
+            cursor: event_data_size,
+            base_offset,
+            finished: event_data_size >= data.len(),
+        }
     }
 
-    let mut cursor = event_data_size;
-    while cursor < data.len() {
-        let uid = data[cursor];
-        if uid == 3 {
-            return Ok(aux);
+    fn next_field(&mut self) -> Result<Option<(u8, &'a [u8])>, TraceError> {
+        if self.finished || self.cursor >= self.data.len() {
+            return Ok(None);
         }
-        if uid != 1 {
+        let uid = self.data[self.cursor];
+        if matches!(uid, 3 | 6) {
+            self.finished = true;
+            return Ok(None);
+        }
+        if !matches!(uid, 1 | 2) {
             return Err(TraceError::new(
                 TraceErrorKind::MalformedData,
-                base_offset + u64::try_from(cursor).unwrap(),
+                self.base_offset + u64::try_from(self.cursor).unwrap(),
                 "Aux.Uid",
                 format!("expected AuxData/AuxDataTerminal, got uid {uid}"),
             ));
         }
-        if data.len() - cursor < 4 {
+        if self.data.len() - self.cursor < 4 {
             return Err(TraceError::new(
                 TraceErrorKind::MalformedData,
-                base_offset + u64::try_from(cursor).unwrap(),
+                self.base_offset + u64::try_from(self.cursor).unwrap(),
                 "Aux.Header",
                 "truncated aux header",
             ));
         }
         let pack = u32::from_le_bytes(
-            data[cursor..cursor + 4]
+            self.data[self.cursor..self.cursor + 4]
                 .try_into()
                 .expect("aux header length was checked"),
         );
         let field_index = ((pack >> 8) & 0x1f) as u8;
         let size = usize::try_from(pack >> 13).expect("u32 fits in usize");
-        let payload_start = cursor + 4;
+        let payload_start = self.cursor + 4;
         let payload_end = payload_start.checked_add(size).ok_or_else(|| {
             TraceError::new(
                 TraceErrorKind::MalformedData,
-                base_offset + u64::try_from(cursor).unwrap(),
+                self.base_offset + u64::try_from(self.cursor).unwrap(),
                 "Aux.Size",
                 "aux payload range overflows",
             )
         })?;
-        if payload_end > data.len() {
+        if payload_end > self.data.len() {
             return Err(TraceError::new(
                 TraceErrorKind::MalformedData,
-                base_offset + u64::try_from(payload_start).unwrap(),
+                self.base_offset + u64::try_from(payload_start).unwrap(),
                 "Aux.Data",
                 format!(
                     "aux payload extends past event payload of {} bytes",
-                    data.len()
+                    self.data.len()
                 ),
             ));
         }
-        aux.entry(field_index)
-            .or_default()
-            .extend_from_slice(&data[payload_start..payload_end]);
-        cursor = payload_end;
+        self.cursor = payload_end;
+        Ok(Some((field_index, &self.data[payload_start..payload_end])))
     }
-    Ok(aux)
 }
 
 pub(crate) fn read_aux_string(
@@ -9903,17 +9936,60 @@ fn aux_bytes_len(event: &EventTypeInfo, aux: &BTreeMap<u8, Vec<u8>>, name: &str)
     aux.get(&(index as u8)).map_or(0, Vec::len)
 }
 
-fn read_aux_bytes(
+fn read_aux_bytes<'a>(
     event: &EventTypeInfo,
-    data: &[u8],
+    data: &'a [u8],
     name: &str,
     base_offset: u64,
-) -> Result<Option<Vec<u8>>, TraceError> {
+) -> Result<Option<Cow<'a, [u8]>>, TraceError> {
     let Some(index) = event.fields.iter().position(|field| field.name == name) else {
         return Ok(None);
     };
-    let aux = parse_protocol5_aux(data, event_data_size(event), base_offset)?;
-    Ok(aux.get(&(index as u8)).cloned())
+    let target = index as u8;
+    let mut matched = None::<Cow<'a, [u8]>>;
+    let mut fields = Protocol5AuxFields::new(data, event_data_size(event), base_offset);
+    while let Some((field_index, payload)) = fields.next_field()? {
+        if field_index != target {
+            continue;
+        }
+        match &mut matched {
+            None => matched = Some(Cow::Borrowed(payload)),
+            Some(Cow::Borrowed(previous)) => {
+                let capacity = previous.len().checked_add(payload.len()).ok_or_else(|| {
+                    TraceError::new(
+                        TraceErrorKind::ResourceLimit,
+                        base_offset,
+                        "Aux.Data",
+                        "fragmented aux field size overflows",
+                    )
+                })?;
+                let mut combined = Vec::new();
+                combined.try_reserve_exact(capacity).map_err(|_| {
+                    TraceError::new(
+                        TraceErrorKind::ResourceLimit,
+                        base_offset,
+                        "Aux.Data",
+                        "could not allocate fragmented aux field",
+                    )
+                })?;
+                combined.extend_from_slice(previous);
+                combined.extend_from_slice(payload);
+                matched = Some(Cow::Owned(combined));
+            }
+            Some(Cow::Owned(combined)) => {
+                combined.try_reserve(payload.len()).map_err(|_| {
+                    TraceError::new(
+                        TraceErrorKind::ResourceLimit,
+                        base_offset,
+                        "Aux.Data",
+                        "could not extend fragmented aux field",
+                    )
+                })?;
+                combined.extend_from_slice(payload);
+            }
+        }
+    }
+    Ok(matched)
 }
 
 fn decode_ansi_bytes(bytes: &[u8]) -> String {
@@ -11898,6 +11974,8 @@ mod tests {
         .collect::<BTreeMap<_, _>>();
 
         let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
+        let mut frame_scope_totals = FxHashMap::default();
+        let mut frame_cycle_bounds = FxHashMap::default();
         metadata_stack_context.enter_inline(42);
         apply_metadata_stack_event_to_cpu_context(
             &save_stack_event,
@@ -11932,8 +12010,6 @@ mod tests {
         let mut metadata_scope_totals = FxHashMap::default();
         let mut metadata_interval_state = CpuMetadataIntervalState::default();
         let mut thread_state = CpuBatchThreadState::default();
-        let mut frame_scope_totals = FxHashMap::default();
-        let mut frame_cycle_bounds = FxHashMap::default();
         let mut thread_scope_totals = FxHashMap::default();
         {
             let mut state = CpuBatchDecodeState {
@@ -12935,6 +13011,41 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn targeted_aux_reader_borrows_single_fragments_and_joins_multiple_fragments() {
+        let event = test_event_type(
+            16,
+            "Test",
+            "Aux",
+            &[
+                regular_field(0, 1, 0, "Fixed"),
+                regular_field(0, 0, 0, "Data"),
+            ],
+        );
+        let aux_header =
+            |size: usize| ((u32::try_from(size).unwrap() << 13) | (1 << 8) | 1).to_le_bytes();
+
+        let mut single = vec![0xaa];
+        single.extend_from_slice(&aux_header(3));
+        single.extend_from_slice(&[1, 2, 3]);
+        single.push(3);
+        let field = read_aux_bytes(&event, &single, "Data", 0).unwrap().unwrap();
+        assert!(matches!(field, Cow::Borrowed(_)));
+        assert_eq!(field.as_ref(), &[1, 2, 3]);
+
+        let mut fragmented = vec![0xaa];
+        fragmented.extend_from_slice(&aux_header(2));
+        fragmented.extend_from_slice(&[1, 2]);
+        fragmented.extend_from_slice(&aux_header(2));
+        fragmented.extend_from_slice(&[3, 4]);
+        fragmented.push(3);
+        let field = read_aux_bytes(&event, &fragmented, "Data", 0)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(field, Cow::Owned(_)));
+        assert_eq!(field.as_ref(), &[1, 2, 3, 4]);
     }
 
     fn new_event(uid: u16, flags: u8, logger: &str, event: &str, fields: &[TestField]) -> Vec<u8> {

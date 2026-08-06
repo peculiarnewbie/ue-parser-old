@@ -78,20 +78,35 @@ pub struct DispatchedNormalEvent {
     pub serial: Option<TraceSerial>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ThreadEvent {
     uid: u16,
-    data: Vec<u8>,
+    data_start: u32,
+    data_end: u32,
     scope_cycle: Option<u64>,
     /// `None` means well-known or `no_sync` (UE Ignored).
     serial: Option<TraceSerial>,
+}
+
+struct ThreadCursor<'a> {
+    reader: Reader<'a>,
+    stream: &'a [u8],
+    scope_cycles: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DispatchedNormalEventView<'a> {
+    pub thread_id: u16,
+    pub uid: u16,
+    pub data: &'a [u8],
+    pub scope_cycle: Option<u64>,
+    pub serial: Option<TraceSerial>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HeapEntry {
     distance: u32,
     thread_index: usize,
-    event_index: usize,
     serial: TraceSerial,
 }
 
@@ -102,7 +117,6 @@ impl Ord for HeapEntry {
             .distance
             .cmp(&self.distance)
             .then_with(|| other.thread_index.cmp(&self.thread_index))
-            .then_with(|| other.event_index.cmp(&self.event_index))
     }
 }
 
@@ -123,69 +137,92 @@ struct ParsedNormalEvent {
     serial: Option<TraceSerial>,
 }
 
-/// Parse one thread's normal stream into owned events with retained serials.
-fn parse_thread_normal_events(
-    stream: &[u8],
-    registry: &BTreeMap<u16, &EventTypeInfo>,
-) -> Result<Vec<ThreadEvent>, TraceError> {
-    let mut reader = Reader::new(stream);
-    let mut events = Vec::new();
-    let mut scope_cycles = Vec::<u64>::new();
-    while reader.remaining() > 0 {
-        let parsed = parse_protocol5_normal_event(&mut reader, registry)?;
-        if parsed.uid == 3 {
-            continue;
+impl<'a> ThreadCursor<'a> {
+    fn new(stream: &'a [u8]) -> Self {
+        Self {
+            reader: Reader::new(stream),
+            stream,
+            scope_cycles: Vec::new(),
         }
-        let mut data = stream[parsed.data_start..parsed.data_end].to_vec();
-        match parsed.uid {
-            6 | 8 => {
-                if let Some(cycle) = decode_known_scope_cycle(parsed.uid, &data) {
-                    scope_cycles.push(cycle);
-                }
-            }
-            7 | 9 => {
-                scope_cycles.pop();
-            }
-            _ => {}
-        }
-        let scope_cycle = (parsed.uid >= 16)
-            .then(|| scope_cycles.last().copied())
-            .flatten();
-        if parsed.has_aux {
-            let mut aux_chain = 0_u32;
-            loop {
-                aux_chain = aux_chain.saturating_add(1);
-                if aux_chain > 64_000 {
-                    return Err(TraceError::new(
-                        TraceErrorKind::ResourceLimit,
-                        reader.tell(),
-                        "Events.Aux",
-                        "aux event chain exceeded 64000 events",
-                    ));
-                }
-                let aux = parse_protocol5_normal_event(&mut reader, registry)?;
-                match aux.uid {
-                    1 => {
-                        let mut aux_bytes = stream[aux.offset..aux.total_end].to_vec();
-                        aux_bytes[0] = 1;
-                        data.extend_from_slice(&aux_bytes);
-                    }
-                    3 => {
-                        data.push(3);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        events.push(ThreadEvent {
-            uid: parsed.uid,
-            data,
-            scope_cycle,
-            serial: parsed.serial,
-        });
     }
-    Ok(events)
+
+    fn next_event(
+        &mut self,
+        registry: &BTreeMap<u16, &EventTypeInfo>,
+    ) -> Result<Option<ThreadEvent>, TraceError> {
+        while self.reader.remaining() > 0 {
+            let parsed = parse_protocol5_normal_event(&mut self.reader, registry)?;
+            if parsed.uid == 3 {
+                continue;
+            }
+            let data = &self.stream[parsed.data_start..parsed.data_end];
+            match parsed.uid {
+                6 | 8 => {
+                    if let Some(cycle) = decode_known_scope_cycle(parsed.uid, data) {
+                        self.scope_cycles.push(cycle);
+                    }
+                }
+                7 | 9 => {
+                    self.scope_cycles.pop();
+                }
+                _ => {}
+            }
+            let scope_cycle = (parsed.uid >= 16)
+                .then(|| self.scope_cycles.last().copied())
+                .flatten();
+            let mut data_end = parsed.data_end;
+            if parsed.has_aux {
+                let mut aux_chain = 0_u32;
+                loop {
+                    aux_chain = aux_chain.saturating_add(1);
+                    if aux_chain > 64_000 {
+                        return Err(TraceError::new(
+                            TraceErrorKind::ResourceLimit,
+                            self.reader.tell(),
+                            "Events.Aux",
+                            "aux event chain exceeded 64000 events",
+                        ));
+                    }
+                    let aux = parse_protocol5_normal_event(&mut self.reader, registry)?;
+                    data_end = aux.total_end;
+                    match aux.uid {
+                        1 => {}
+                        3 => break,
+                        uid => {
+                            return Err(TraceError::new(
+                                TraceErrorKind::MalformedData,
+                                u64::try_from(aux.offset).unwrap_or(u64::MAX),
+                                "Events.Aux",
+                                format!("expected AuxData/AuxDataTerminal, got uid {uid}"),
+                            ));
+                        }
+                    }
+                }
+            }
+            return Ok(Some(ThreadEvent {
+                uid: parsed.uid,
+                data_start: u32::try_from(parsed.data_start).map_err(|_| {
+                    TraceError::new(
+                        TraceErrorKind::ResourceLimit,
+                        u64::try_from(parsed.data_start).unwrap_or(u64::MAX),
+                        "Events.Data",
+                        "normal event data offset exceeds u32",
+                    )
+                })?,
+                data_end: u32::try_from(data_end).map_err(|_| {
+                    TraceError::new(
+                        TraceErrorKind::ResourceLimit,
+                        u64::try_from(data_end).unwrap_or(u64::MAX),
+                        "Events.Data",
+                        "normal event data end exceeds u32",
+                    )
+                })?,
+                scope_cycle,
+                serial: parsed.serial,
+            }));
+        }
+        Ok(None)
+    }
 }
 
 /// Dispatch normal events from all threads in global serial order.
@@ -194,25 +231,41 @@ pub fn dispatch_normal_events(
     registry: &BTreeMap<u16, &EventTypeInfo>,
     sync_count: u64,
 ) -> Result<(Vec<DispatchedNormalEvent>, SerialDispatchSummary), TraceError> {
+    let mut out = Vec::new();
+    let summary = dispatch_normal_events_with(streams, registry, sync_count, |event| {
+        let event_info = registry.get(&event.uid).copied();
+        out.push(DispatchedNormalEvent {
+            thread_id: event.thread_id,
+            uid: event.uid,
+            data: owned_event_data(event.data, event_info),
+            scope_cycle: event.scope_cycle,
+            serial: event.serial,
+        });
+        Ok(())
+    })?;
+    Ok((out, summary))
+}
+
+pub(crate) fn dispatch_normal_events_with<'a>(
+    streams: &'a BTreeMap<u16, Vec<u8>>,
+    registry: &BTreeMap<u16, &EventTypeInfo>,
+    sync_count: u64,
+    mut visit: impl FnMut(DispatchedNormalEventView<'a>) -> Result<(), TraceError>,
+) -> Result<SerialDispatchSummary, TraceError> {
+    let next_serial = serial_origin_from_streams(streams, registry)?;
     let mut thread_ids = Vec::new();
-    let mut thread_events = Vec::new();
+    let mut cursors = Vec::new();
     for (thread_id, stream) in streams {
         if *thread_id <= 1 {
             continue;
         }
         thread_ids.push(*thread_id);
-        thread_events.push(parse_thread_normal_events(stream, registry)?);
+        cursors.push(ThreadCursor::new(stream));
     }
-
-    let synced_events = thread_events
-        .iter()
-        .flat_map(|events| events.iter())
-        .filter(|event| event.serial.is_some())
-        .count();
-    ensure_single_serial_epoch(synced_events)?;
-
-    let mut cursors = vec![0_usize; thread_events.len()];
-    let mut out = Vec::new();
+    let mut pending = cursors
+        .iter_mut()
+        .map(|cursor| cursor.next_event(registry))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut summary = SerialDispatchSummary {
         serial_ordered: true,
         sync_count,
@@ -220,27 +273,38 @@ pub fn dispatch_normal_events(
     };
 
     // Peel leading unsynchronized events from every thread.
-    for (thread_index, events) in thread_events.iter_mut().enumerate() {
-        while cursors[thread_index] < events.len() && events[cursors[thread_index]].serial.is_none()
-        {
-            let event = take_event(events, cursors[thread_index]);
-            push_taken(&mut out, &mut summary, thread_ids[thread_index], event);
-            cursors[thread_index] += 1;
+    for thread_index in 0..cursors.len() {
+        while pending[thread_index].is_some_and(|event| event.serial.is_none()) {
+            let event = pending[thread_index]
+                .take()
+                .expect("pending event was checked");
+            visit_taken(
+                cursors[thread_index].stream,
+                &mut visit,
+                &mut summary,
+                thread_ids[thread_index],
+                event,
+            )?;
+            pending[thread_index] = cursors[thread_index].next_event(registry)?;
         }
     }
 
-    let mut next_serial = wrap_aware_origin(&thread_events, &cursors);
-    let mut observed_serials = Vec::<u32>::new();
-
+    let mut next_serial = next_serial;
     let mut heap = BinaryHeap::new();
     if let Some(origin) = next_serial {
-        for (thread_index, events) in thread_events.iter().enumerate() {
-            if let Some(entry) = heap_entry_for(thread_index, cursors[thread_index], events, origin)
-            {
+        for (thread_index, event) in pending.iter().enumerate() {
+            if let Some(entry) = heap_entry_for_pending(thread_index, *event, origin) {
                 heap.push(entry);
             }
         }
     }
+
+    let gap_kind = if sync_count >= 3 {
+        SerialGapKind::Genuine
+    } else {
+        SerialGapKind::Provisional
+    };
+    let mut last_observed_serial = None;
 
     while let Some(top) = heap.pop() {
         let Some(mut expected) = next_serial else {
@@ -254,62 +318,50 @@ pub fn dispatch_normal_events(
         }
 
         let thread_index = top.thread_index;
-        let mut event_index = top.event_index;
-
-        while event_index < thread_events[thread_index].len() {
-            let serial = thread_events[thread_index][event_index].serial;
+        loop {
+            let Some(event) = pending[thread_index] else {
+                break;
+            };
+            let serial = event.serial;
             match serial {
                 Some(serial) if serial == expected => {
-                    observed_serials.push(serial.raw());
-                    let event = take_event(&mut thread_events[thread_index], event_index);
-                    push_taken(&mut out, &mut summary, thread_ids[thread_index], event);
-                    event_index += 1;
+                    record_gap(&mut summary, last_observed_serial, serial.raw(), gap_kind);
+                    last_observed_serial = Some(serial.raw());
+                    pending[thread_index] = None;
+                    visit_taken(
+                        cursors[thread_index].stream,
+                        &mut visit,
+                        &mut summary,
+                        thread_ids[thread_index],
+                        event,
+                    )?;
+                    pending[thread_index] = cursors[thread_index].next_event(registry)?;
                     expected = expected.wrapping_add(1);
                     next_serial = Some(expected);
                 }
                 None => {
-                    let event = take_event(&mut thread_events[thread_index], event_index);
-                    push_taken(&mut out, &mut summary, thread_ids[thread_index], event);
-                    event_index += 1;
+                    pending[thread_index] = None;
+                    visit_taken(
+                        cursors[thread_index].stream,
+                        &mut visit,
+                        &mut summary,
+                        thread_ids[thread_index],
+                        event,
+                    )?;
+                    pending[thread_index] = cursors[thread_index].next_event(registry)?;
                 }
                 Some(_) => break,
             }
         }
 
-        cursors[thread_index] = event_index;
         if let Some(origin) = next_serial {
-            if let Some(entry) = heap_entry_for(
-                thread_index,
-                cursors[thread_index],
-                &thread_events[thread_index],
-                origin,
-            ) {
+            if let Some(entry) = heap_entry_for_pending(thread_index, pending[thread_index], origin)
+            {
                 heap.push(entry);
             }
         }
     }
-
-    let gap_kind = if sync_count >= 3 {
-        SerialGapKind::Genuine
-    } else {
-        SerialGapKind::Provisional
-    };
-    summary.gaps = serial_gaps_from_observed(&observed_serials, gap_kind);
-    summary.gap_count = u64::try_from(summary.gaps.len()).unwrap_or(u64::MAX);
-    summary.missing_serial_count = summary
-        .gaps
-        .iter()
-        .map(|gap| u64::from(gap.missing_count))
-        .sum();
-    summary.dispatched_event_count = u64::try_from(out.len()).unwrap_or(u64::MAX);
-    if summary.gaps.len() > 64 {
-        summary.gaps.truncate(64);
-    }
-    Ok((out, summary))
-}
-
-fn take_event(events: &mut [ThreadEvent], index: usize) -> ThreadEvent {
-    std::mem::take(&mut events[index])
+    Ok(summary)
 }
 
 fn ensure_single_serial_epoch(synced_events: usize) -> Result<(), TraceError> {
@@ -324,44 +376,150 @@ fn ensure_single_serial_epoch(synced_events: usize) -> Result<(), TraceError> {
     Ok(())
 }
 
-fn push_taken(
-    out: &mut Vec<DispatchedNormalEvent>,
+fn visit_taken<'a>(
+    stream: &'a [u8],
+    visit: &mut impl FnMut(DispatchedNormalEventView<'a>) -> Result<(), TraceError>,
     summary: &mut SerialDispatchSummary,
     thread_id: u16,
     event: ThreadEvent,
-) {
+) -> Result<(), TraceError> {
     if event.serial.is_some() {
         summary.synced_event_count += 1;
     } else {
         summary.unsynced_event_count += 1;
     }
-    out.push(DispatchedNormalEvent {
+    summary.dispatched_event_count = summary.dispatched_event_count.saturating_add(1);
+    let data_start = usize::try_from(event.data_start).unwrap();
+    let data_end = usize::try_from(event.data_end).unwrap();
+    let data = stream.get(data_start..data_end).ok_or_else(|| {
+        TraceError::new(
+            TraceErrorKind::MalformedData,
+            u64::from(event.data_start),
+            "Events.Data",
+            "normal event descriptor points outside its thread stream",
+        )
+    })?;
+    visit(DispatchedNormalEventView {
         thread_id,
         uid: event.uid,
-        data: event.data,
+        data,
         scope_cycle: event.scope_cycle,
         serial: event.serial,
-    });
+    })
 }
 
-/// Pick the serial origin among all buffered serials using the largest circular gap.
-///
-/// The element immediately after the largest forward gap is the start of the
-/// captured serial run. Considering every buffered serial, rather than only
-/// thread heads, avoids mistaking a late-created thread for a wrap when a long
-/// non-wrapping capture spans more than half the 24-bit range.
-fn wrap_aware_origin(thread_events: &[Vec<ThreadEvent>], cursors: &[usize]) -> Option<TraceSerial> {
-    let mut serials = Vec::new();
-    for (thread_index, events) in thread_events.iter().enumerate() {
-        serials.extend(
-            events[cursors[thread_index]..]
-                .iter()
-                .filter_map(|event| event.serial.map(TraceSerial::raw)),
-        );
+fn owned_event_data(data: &[u8], event: Option<&EventTypeInfo>) -> Vec<u8> {
+    let mut owned = data.to_vec();
+    let Some(event) = event else {
+        return owned;
+    };
+    let mut cursor = event_data_size(event);
+    while cursor < owned.len() {
+        match owned[cursor] {
+            2 => owned[cursor] = 1,
+            6 => {
+                owned[cursor] = 3;
+                break;
+            }
+            1 => {}
+            3 => break,
+            _ => break,
+        }
+        if owned.len().saturating_sub(cursor) < 4 {
+            break;
+        }
+        let pack = u32::from_le_bytes(owned[cursor..cursor + 4].try_into().unwrap());
+        let size = usize::try_from(pack >> 13).unwrap();
+        let Some(next) = cursor
+            .checked_add(4)
+            .and_then(|start| start.checked_add(size))
+        else {
+            break;
+        };
+        cursor = next;
     }
-    circular_run_start(&serials).map(TraceSerial)
+    owned
 }
 
+/// Find the serial origin without retaining one descriptor per event.
+///
+/// Protocol 5 serials occupy a fixed 24-bit domain, so a 2 MiB bitmap is both
+/// bounded and substantially smaller than buffering millions of serials. The
+/// dispatch pass then reparses each thread while holding only one pending event
+/// per thread.
+fn serial_origin_from_streams(
+    streams: &BTreeMap<u16, Vec<u8>>,
+    registry: &BTreeMap<u16, &EventTypeInfo>,
+) -> Result<Option<TraceSerial>, TraceError> {
+    let word_count = usize::try_from(SERIAL_RANGE / 64).unwrap();
+    let mut serial_bits = vec![0_u64; word_count];
+    let mut synced_events = 0_usize;
+
+    for (thread_id, stream) in streams {
+        if *thread_id <= 1 {
+            continue;
+        }
+        let mut cursor = ThreadCursor::new(stream);
+        while let Some(event) = cursor.next_event(registry)? {
+            let Some(serial) = event.serial else {
+                continue;
+            };
+            synced_events = synced_events.checked_add(1).ok_or_else(|| {
+                TraceError::new(
+                    TraceErrorKind::ResourceLimit,
+                    0,
+                    "Events.Serial",
+                    "normal event count exceeds addressable memory",
+                )
+            })?;
+            let raw = usize::try_from(serial.raw()).unwrap();
+            serial_bits[raw / 64] |= 1_u64 << (raw % 64);
+        }
+    }
+
+    ensure_single_serial_epoch(synced_events)?;
+    Ok(circular_run_start_bitmap(&serial_bits).map(TraceSerial))
+}
+
+fn circular_run_start_bitmap(words: &[u64]) -> Option<u32> {
+    let mut first = None;
+    let mut previous = None;
+    let mut best_gap = 0_u32;
+    let mut best_next = None;
+
+    for (word_index, encoded_word) in words.iter().copied().enumerate() {
+        let mut word = encoded_word;
+        while word != 0 {
+            let bit_index = word.trailing_zeros();
+            let value = u32::try_from(word_index)
+                .unwrap()
+                .saturating_mul(64)
+                .saturating_add(bit_index);
+            first.get_or_insert(value);
+            best_next.get_or_insert(value);
+            if let Some(left) = previous {
+                let gap = value.wrapping_sub(left) & SERIAL_MASK;
+                if gap > best_gap {
+                    best_gap = gap;
+                    best_next = Some(value);
+                }
+            }
+            previous = Some(value);
+            word &= word - 1;
+        }
+    }
+
+    let first = first?;
+    let last = previous.unwrap_or(first);
+    let wrap_gap = first.wrapping_add(SERIAL_RANGE).wrapping_sub(last) & SERIAL_MASK;
+    if wrap_gap > best_gap {
+        Some(first)
+    } else {
+        best_next
+    }
+}
+
+#[cfg(test)]
 fn circular_run_start(values: &[u32]) -> Option<u32> {
     if values.is_empty() {
         return None;
@@ -393,6 +551,7 @@ fn circular_run_start(values: &[u32]) -> Option<u32> {
     Some(best_next)
 }
 
+#[cfg(test)]
 fn serial_gaps_from_observed(observed: &[u32], kind: SerialGapKind) -> Vec<SerialGap> {
     if observed.len() < 2 {
         return Vec::new();
@@ -404,38 +563,54 @@ fn serial_gaps_from_observed(observed: &[u32], kind: SerialGapKind) -> Vec<Seria
     gaps
 }
 
+#[cfg(test)]
 fn push_gap_if_small(gaps: &mut Vec<SerialGap>, left: u32, right: u32, kind: SerialGapKind) {
-    let forward = right.wrapping_sub(left) & SERIAL_MASK;
-    if forward == 0 || forward >= SERIAL_HALF {
-        return;
+    if let Some(gap) = serial_gap(left, right, kind) {
+        gaps.push(gap);
     }
-    let missing = forward.saturating_sub(1);
-    if missing == 0 {
-        return;
-    }
-    gaps.push(SerialGap {
-        after_serial: left.wrapping_add(1) & SERIAL_MASK,
-        missing_count: missing,
-        kind,
-    });
 }
 
-fn heap_entry_for(
+fn serial_gap(left: u32, right: u32, kind: SerialGapKind) -> Option<SerialGap> {
+    let forward = right.wrapping_sub(left) & SERIAL_MASK;
+    if forward == 0 || forward >= SERIAL_HALF {
+        return None;
+    }
+    let missing_count = forward.saturating_sub(1);
+    (missing_count != 0).then_some(SerialGap {
+        after_serial: left.wrapping_add(1) & SERIAL_MASK,
+        missing_count,
+        kind,
+    })
+}
+
+fn record_gap(
+    summary: &mut SerialDispatchSummary,
+    left: Option<u32>,
+    right: u32,
+    kind: SerialGapKind,
+) {
+    let Some(gap) = left.and_then(|left| serial_gap(left, right, kind)) else {
+        return;
+    };
+    summary.gap_count = summary.gap_count.saturating_add(1);
+    summary.missing_serial_count = summary
+        .missing_serial_count
+        .saturating_add(u64::from(gap.missing_count));
+    if summary.gaps.len() < 64 {
+        summary.gaps.push(gap);
+    }
+}
+
+fn heap_entry_for_pending(
     thread_index: usize,
-    event_index: usize,
-    events: &[ThreadEvent],
+    event: Option<ThreadEvent>,
     origin: TraceSerial,
 ) -> Option<HeapEntry> {
-    let mut index = event_index;
-    while index < events.len() && events[index].serial.is_none() {
-        index += 1;
-    }
-    let event = events.get(index)?;
+    let event = event?;
     let serial = event.serial?;
     Some(HeapEntry {
         distance: serial.distance_from(origin),
         thread_index,
-        event_index: index,
         serial,
     })
 }
@@ -570,6 +745,12 @@ mod tests {
         event
     }
 
+    fn synced_event_with_aux(uid: u16, name: &str) -> EventTypeInfo {
+        let mut event = synced_event(uid, name);
+        event.flags.maybe_has_aux = true;
+        event
+    }
+
     fn encode_uid(uid: u16) -> Vec<u8> {
         let shifted = uid << 1;
         if shifted < 128 {
@@ -590,6 +771,20 @@ mod tests {
     fn push_unsynced(stream: &mut Vec<u8>, uid: u16, payload: u8) {
         stream.extend(encode_uid(uid));
         stream.push(payload);
+    }
+
+    fn push_synced_with_aux(
+        stream: &mut Vec<u8>,
+        uid: u16,
+        serial: u32,
+        payload: u8,
+        aux_payload: &[u8],
+    ) {
+        push_synced(stream, uid, serial, payload);
+        let pack = (u32::try_from(aux_payload.len()).unwrap() << 13) | 2;
+        stream.extend_from_slice(&pack.to_le_bytes());
+        stream.extend_from_slice(aux_payload);
+        stream.extend(encode_uid(3));
     }
 
     #[test]
@@ -628,6 +823,42 @@ mod tests {
         assert!(summary.serial_ordered);
         assert_eq!(summary.gap_count, 0);
         assert_eq!(summary.synced_event_count, 3);
+    }
+
+    #[test]
+    fn borrowed_dispatch_exposes_normal_aux_without_copying() {
+        let events = [synced_event_with_aux(16, "WithAux")];
+        let registry = events
+            .iter()
+            .map(|event| (event.uid, event))
+            .collect::<BTreeMap<_, _>>();
+        let mut stream = Vec::new();
+        push_synced_with_aux(&mut stream, 16, 1, 0xaa, &[0x11, 0x22, 0x33]);
+        let streams = [(5_u16, stream)].into_iter().collect::<BTreeMap<_, _>>();
+
+        let mut borrowed = Vec::new();
+        let mut borrowed_range = None;
+        dispatch_normal_events_with(&streams, &registry, 3, |event| {
+            borrowed_range = Some((event.data.as_ptr() as usize, event.data.len()));
+            borrowed.push(event.data.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        let stream = &streams[&5];
+        let stream_start = stream.as_ptr() as usize;
+        let stream_end = stream_start + stream.len();
+        let (borrowed_start, borrowed_len) = borrowed_range.unwrap();
+        assert!(borrowed_start >= stream_start);
+        assert!(borrowed_start + borrowed_len <= stream_end);
+        assert_eq!(borrowed[0][0], 0xaa);
+        assert_eq!(borrowed[0][1], 2, "normal-stream AuxData uid stays encoded");
+        assert_eq!(*borrowed[0].last().unwrap(), 6);
+        let aux = crate::utrace::parse_protocol5_aux(&borrowed[0], 1, 0).unwrap();
+        assert_eq!(aux.get(&0).unwrap(), &[0x11, 0x22, 0x33]);
+
+        let (owned, _) = dispatch_normal_events(&streams, &registry, 3).unwrap();
+        assert_eq!(owned[0].data[1], 1, "public owned output stays canonical");
+        assert_eq!(*owned[0].data.last().unwrap(), 3);
     }
 
     #[test]
@@ -743,6 +974,39 @@ mod tests {
             circular_run_start(&[0, 0x200000, 0x400000, 0x600000, 0x800000, 0x900000]),
             Some(0)
         );
+    }
+
+    #[test]
+    fn bitmap_origin_matches_sorted_reference() {
+        let values = [0, 1, 17, 63, 64, 0x200000, 0x900000, 0xfffffe, 0xffffff];
+        let mut words = vec![0_u64; usize::try_from(SERIAL_RANGE / 64).unwrap()];
+        for value in values {
+            let index = usize::try_from(value).unwrap();
+            words[index / 64] |= 1_u64 << (index % 64);
+        }
+        assert_eq!(
+            circular_run_start_bitmap(&words),
+            circular_run_start(&values)
+        );
+    }
+
+    #[test]
+    fn streaming_gap_summary_counts_beyond_retained_samples() {
+        let events = [synced_event(16, "A")];
+        let registry = events
+            .iter()
+            .map(|event| (event.uid, event))
+            .collect::<BTreeMap<_, _>>();
+        let mut stream = Vec::new();
+        for serial in (0..140).step_by(2) {
+            push_synced(&mut stream, 16, serial, 1);
+        }
+        let streams = [(5_u16, stream)].into_iter().collect::<BTreeMap<_, _>>();
+
+        let (_, summary) = dispatch_normal_events(&streams, &registry, 3).unwrap();
+        assert_eq!(summary.gap_count, 69);
+        assert_eq!(summary.missing_serial_count, 69);
+        assert_eq!(summary.gaps.len(), 64);
     }
 
     #[test]
