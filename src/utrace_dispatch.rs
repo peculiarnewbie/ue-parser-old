@@ -137,6 +137,28 @@ struct ParsedNormalEvent {
     serial: Option<TraceSerial>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NormalEventLayout {
+    data_size: usize,
+    maybe_has_aux: bool,
+    no_sync: bool,
+}
+
+fn normal_event_layouts(
+    registry: &BTreeMap<u16, &EventTypeInfo>,
+) -> Vec<Option<NormalEventLayout>> {
+    let max_uid = registry.keys().next_back().copied().unwrap_or(0);
+    let mut layouts = vec![None; usize::from(max_uid) + 1];
+    for (&uid, event) in registry {
+        layouts[usize::from(uid)] = Some(NormalEventLayout {
+            data_size: event_data_size(event),
+            maybe_has_aux: event.flags.maybe_has_aux,
+            no_sync: event.flags.no_sync,
+        });
+    }
+    layouts
+}
+
 impl<'a> ThreadCursor<'a> {
     fn new(stream: &'a [u8]) -> Self {
         Self {
@@ -148,10 +170,10 @@ impl<'a> ThreadCursor<'a> {
 
     fn next_event(
         &mut self,
-        registry: &BTreeMap<u16, &EventTypeInfo>,
+        layouts: &[Option<NormalEventLayout>],
     ) -> Result<Option<ThreadEvent>, TraceError> {
         while self.reader.remaining() > 0 {
-            let parsed = parse_protocol5_normal_event(&mut self.reader, registry)?;
+            let parsed = parse_protocol5_normal_event(&mut self.reader, layouts)?;
             if parsed.uid == 3 {
                 continue;
             }
@@ -183,7 +205,7 @@ impl<'a> ThreadCursor<'a> {
                             "aux event chain exceeded 64000 events",
                         ));
                     }
-                    let aux = parse_protocol5_normal_event(&mut self.reader, registry)?;
+                    let aux = parse_protocol5_normal_event(&mut self.reader, layouts)?;
                     data_end = aux.total_end;
                     match aux.uid {
                         1 => {}
@@ -252,7 +274,8 @@ pub(crate) fn dispatch_normal_events_with<'a>(
     sync_count: u64,
     mut visit: impl FnMut(DispatchedNormalEventView<'a>) -> Result<(), TraceError>,
 ) -> Result<SerialDispatchSummary, TraceError> {
-    let next_serial = serial_origin_from_streams(streams, registry)?;
+    let layouts = normal_event_layouts(registry);
+    let next_serial = serial_origin_from_streams(streams, &layouts)?;
     let mut thread_ids = Vec::new();
     let mut cursors = Vec::new();
     for (thread_id, stream) in streams {
@@ -264,7 +287,7 @@ pub(crate) fn dispatch_normal_events_with<'a>(
     }
     let mut pending = cursors
         .iter_mut()
-        .map(|cursor| cursor.next_event(registry))
+        .map(|cursor| cursor.next_event(&layouts))
         .collect::<Result<Vec<_>, _>>()?;
     let mut summary = SerialDispatchSummary {
         serial_ordered: true,
@@ -285,7 +308,7 @@ pub(crate) fn dispatch_normal_events_with<'a>(
                 thread_ids[thread_index],
                 event,
             )?;
-            pending[thread_index] = cursors[thread_index].next_event(registry)?;
+            pending[thread_index] = cursors[thread_index].next_event(&layouts)?;
         }
     }
 
@@ -335,7 +358,7 @@ pub(crate) fn dispatch_normal_events_with<'a>(
                         thread_ids[thread_index],
                         event,
                     )?;
-                    pending[thread_index] = cursors[thread_index].next_event(registry)?;
+                    pending[thread_index] = cursors[thread_index].next_event(&layouts)?;
                     expected = expected.wrapping_add(1);
                     next_serial = Some(expected);
                 }
@@ -348,7 +371,7 @@ pub(crate) fn dispatch_normal_events_with<'a>(
                         thread_ids[thread_index],
                         event,
                     )?;
-                    pending[thread_index] = cursors[thread_index].next_event(registry)?;
+                    pending[thread_index] = cursors[thread_index].next_event(&layouts)?;
                 }
                 Some(_) => break,
             }
@@ -449,7 +472,7 @@ fn owned_event_data(data: &[u8], event: Option<&EventTypeInfo>) -> Vec<u8> {
 /// per thread.
 fn serial_origin_from_streams(
     streams: &BTreeMap<u16, Vec<u8>>,
-    registry: &BTreeMap<u16, &EventTypeInfo>,
+    layouts: &[Option<NormalEventLayout>],
 ) -> Result<Option<TraceSerial>, TraceError> {
     let word_count = usize::try_from(SERIAL_RANGE / 64).unwrap();
     let mut serial_bits = vec![0_u64; word_count];
@@ -460,7 +483,7 @@ fn serial_origin_from_streams(
             continue;
         }
         let mut cursor = ThreadCursor::new(stream);
-        while let Some(event) = cursor.next_event(registry)? {
+        while let Some(event) = cursor.next_event(layouts)? {
             let Some(serial) = event.serial else {
                 continue;
             };
@@ -636,7 +659,7 @@ fn read_serial_24(reader: &mut Reader<'_>) -> Result<TraceSerial, TraceError> {
 
 fn parse_protocol5_normal_event(
     reader: &mut Reader<'_>,
-    registry: &BTreeMap<u16, &EventTypeInfo>,
+    layouts: &[Option<NormalEventLayout>],
 ) -> Result<ParsedNormalEvent, TraceError> {
     const USER_UID: u16 = 16;
     let offset = usize::try_from(reader.tell()).unwrap();
@@ -673,7 +696,7 @@ fn parse_protocol5_normal_event(
         };
         (size, false, None)
     } else {
-        let Some(event) = registry.get(&uid).copied() else {
+        let Some(layout) = layouts.get(usize::from(uid)).copied().flatten() else {
             return Err(TraceError::new(
                 TraceErrorKind::MalformedData,
                 u64::try_from(offset).unwrap(),
@@ -681,12 +704,12 @@ fn parse_protocol5_normal_event(
                 format!("unknown event uid {uid} in normal stream"),
             ));
         };
-        let serial = if event.flags.no_sync {
+        let serial = if layout.no_sync {
             None
         } else {
             Some(read_serial_24(reader)?)
         };
-        (event_data_size(event), event.flags.maybe_has_aux, serial)
+        (layout.data_size, layout.maybe_has_aux, serial)
     };
 
     let data_start = usize::try_from(reader.tell()).unwrap();

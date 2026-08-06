@@ -3737,11 +3737,16 @@ fn read_dashboard_events(
         .iter()
         .map(|event| (event.uid, event))
         .collect::<BTreeMap<_, _>>();
+    let max_event_uid = events.iter().map(|event| event.uid).max().unwrap_or(0);
+    let mut events_by_uid = vec![None; usize::from(max_event_uid) + 1];
+    for event in events {
+        events_by_uid[usize::from(event.uid)] = Some(event);
+    }
     let event_kinds = dashboard_event_kinds(events);
     let mut decoded = DecodedDashboardEvents::default();
     let mut spec_by_id = BTreeMap::<u32, CpuScopeSpec>::new();
     let mut metadata_spec_by_id = BTreeMap::<u32, CpuMetadataSpec>::new();
-    let mut metadata_by_id = BTreeMap::<u32, CpuMetadataRecord>::new();
+    let mut metadata_by_id = FxHashMap::<u32, CpuMetadataRecord>::default();
     let mut metadata_scope_totals = FxHashMap::<u32, (u64, u64)>::default();
     let mut metadata_interval_state = CpuMetadataIntervalState::default();
     let mut metadata_stack_contexts = FxHashMap::<u16, CpuMetadataStackRuntimeState>::default();
@@ -4051,13 +4056,18 @@ fn read_dashboard_events(
         }
     }
 
+    let known_scope_ids = dense_cpu_scope_ids(&spec_by_id);
     let dispatch_summary = crate::utrace_dispatch::dispatch_normal_events_with(
         streams,
         &registry,
         sync_count,
         |raw_event| {
             let thread_id = raw_event.thread_id;
-            let Some(event) = registry.get(&raw_event.uid).copied() else {
+            let Some(event) = events_by_uid
+                .get(usize::from(raw_event.uid))
+                .copied()
+                .flatten()
+            else {
                 return Ok(());
             };
             if !decode_scope.includes_normal_event(event) {
@@ -4101,6 +4111,7 @@ fn read_dashboard_events(
                         timeline: cpu_timeline_sink.take(),
                         thread_id,
                         cycle_frequency,
+                        known_scope_ids: known_scope_ids.as_deref(),
                     };
                     decode_cpu_batch(&data, &spec_by_id, &metadata_by_id, &mut batch_state)?;
                     cpu_timeline_sink = batch_state.timeline.take();
@@ -6669,7 +6680,7 @@ impl CpuMetadataStackRuntimeState {
             .map(|entry| entry.metadata_id)
     }
 
-    fn active_frame_number(&self, metadata: &BTreeMap<u32, CpuMetadataRecord>) -> Option<u32> {
+    fn active_frame_number(&self, metadata: &FxHashMap<u32, CpuMetadataRecord>) -> Option<u32> {
         self.active.iter().rev().find_map(|entry| {
             metadata
                 .get(&entry.metadata_id)
@@ -7877,6 +7888,21 @@ fn update_first_last(first: &mut Option<u64>, last: &mut Option<u64>, value: u64
     *last = Some(value);
 }
 
+fn dense_cpu_scope_ids(specs: &BTreeMap<u32, CpuScopeSpec>) -> Option<Vec<bool>> {
+    const MAX_DENSE_SCOPE_ID: usize = 1 << 20;
+    let max_id = usize::try_from(*specs.keys().next_back()?).ok()?;
+    let dense_len = max_id.checked_add(1)?;
+    let density_limit = specs.len().checked_mul(4)?;
+    if dense_len > MAX_DENSE_SCOPE_ID || dense_len > density_limit {
+        return None;
+    }
+    let mut known = vec![false; dense_len];
+    for &spec_id in specs.keys() {
+        known[usize::try_from(spec_id).ok()?] = true;
+    }
+    Some(known)
+}
+
 fn scope_summaries(
     totals: FxHashMap<u32, (u64, u64)>,
     spec_by_id: &BTreeMap<u32, CpuScopeSpec>,
@@ -8314,6 +8340,7 @@ struct CpuBatchDecodeState<'a, 'timeline> {
     timeline: Option<&'timeline mut dyn CpuTimelineSink>,
     thread_id: u16,
     cycle_frequency: Option<u64>,
+    known_scope_ids: Option<&'a [bool]>,
 }
 
 #[derive(Clone, Debug)]
@@ -8602,7 +8629,6 @@ fn decode_cpu_metadata_record(
     data: &[u8],
     base_offset: u64,
 ) -> Result<CpuMetadataRecord, TraceError> {
-    let aux = parse_protocol5_aux(data, event_data_size(event), base_offset)?;
     let metadata = read_aux_bytes(event, data, "Metadata", base_offset)?.unwrap_or_default();
     let report = decode_cbor_report(&metadata);
     let mut strings = report
@@ -8617,7 +8643,7 @@ fn decode_cpu_metadata_record(
         spec_id: read_u32_field(event, data, "SpecId", base_offset)?,
         name: String::new(),
         rendered_name: None,
-        metadata_bytes: aux_bytes_len(event, &aux, "Metadata"),
+        metadata_bytes: metadata.len(),
         decoded_metadata_bytes: report.consumed_bytes,
         skipped_metadata_bytes: report.skipped_bytes,
         decode_failed: report.failed_reads > 0,
@@ -8639,7 +8665,7 @@ fn enrich_cpu_metadata_record(
 
 fn cpu_metadata_dashboard(
     specs: &BTreeMap<u32, CpuMetadataSpec>,
-    records: &BTreeMap<u32, CpuMetadataRecord>,
+    records: &FxHashMap<u32, CpuMetadataRecord>,
     totals: FxHashMap<u32, (u64, u64)>,
     interval_state: CpuMetadataIntervalState,
     total_metadata_scopes: u64,
@@ -8803,7 +8829,7 @@ struct CpuMetadataSpecState {
 
 fn cpu_metadata_spec_summaries(
     specs: &BTreeMap<u32, CpuMetadataSpec>,
-    records: &BTreeMap<u32, CpuMetadataRecord>,
+    records: &FxHashMap<u32, CpuMetadataRecord>,
     totals: &FxHashMap<u32, (u64, u64)>,
 ) -> Vec<CpuMetadataSpecSummary> {
     let mut states = BTreeMap::<u32, CpuMetadataSpecState>::new();
@@ -8832,7 +8858,11 @@ fn cpu_metadata_spec_summaries(
         }
         if !record.values.is_empty() {
             state.decoded_records += 1;
-            if state.sample.is_none() {
+            if state
+                .sample
+                .as_ref()
+                .is_none_or(|sample| record.metadata_id < sample.metadata_id)
+            {
                 state.sample = Some(cpu_metadata_sample(spec, record));
             }
             if let Some(rendered_name) = record.rendered_name.clone() {
@@ -9106,7 +9136,7 @@ pub(super) fn decode_frame_marker(
 fn decode_cpu_batch(
     data: &[u8],
     specs: &BTreeMap<u32, CpuScopeSpec>,
-    metadata: &BTreeMap<u32, CpuMetadataRecord>,
+    metadata: &FxHashMap<u32, CpuMetadataRecord>,
     state: &mut CpuBatchDecodeState<'_, '_>,
 ) -> Result<(), TraceError> {
     state.batches.count += 1;
@@ -9325,7 +9355,12 @@ fn decode_cpu_batch(
                             "scope spec id does not fit in u32",
                         )
                     })?;
-                    if !specs.contains_key(&spec_id) {
+                    let known_spec = state
+                        .known_scope_ids
+                        .and_then(|known| known.get(usize::try_from(spec_id).unwrap_or(usize::MAX)))
+                        .copied()
+                        .unwrap_or_else(|| specs.contains_key(&spec_id));
+                    if !known_spec {
                         state.batches.unresolved_specs += 1;
                     }
                     state.thread_state.stack.push(CpuStackEntry {
@@ -9397,7 +9432,7 @@ fn record_restored_cpu_metadata_scope(
     start_cycle: u64,
     end_cycle: u64,
     duration: u64,
-    metadata: &BTreeMap<u32, CpuMetadataRecord>,
+    metadata: &FxHashMap<u32, CpuMetadataRecord>,
     state: &mut CpuBatchDecodeState<'_, '_>,
 ) {
     let Some(record) = metadata.get(&metadata_id) else {
@@ -9427,7 +9462,7 @@ fn record_cpu_frame_scope(
     start_cycle: u64,
     end_cycle: u64,
     duration: u64,
-    metadata: &BTreeMap<u32, CpuMetadataRecord>,
+    metadata: &FxHashMap<u32, CpuMetadataRecord>,
     state: &mut CpuBatchDecodeState<'_, '_>,
 ) {
     let Some(frame_number) = state.metadata_stack_context.active_frame_number(metadata) else {
@@ -9473,7 +9508,7 @@ fn coroutine_stack_depth(depth: u64) -> usize {
 
 fn record_cpu_metadata_interval(
     interval: CpuMetadataIntervalRecord,
-    metadata: &BTreeMap<u32, CpuMetadataRecord>,
+    metadata: &FxHashMap<u32, CpuMetadataRecord>,
     state: &mut CpuMetadataIntervalState,
 ) {
     let Some(record) = metadata.get(&interval.metadata_id) else {
@@ -11467,9 +11502,10 @@ mod tests {
             timeline: None,
             thread_id: 0,
             cycle_frequency: None,
+            known_scope_ids: None,
         };
 
-        decode_cpu_batch(&data, &specs, &BTreeMap::new(), &mut state).unwrap();
+        decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(batches.coroutine_records, 3);
         assert_eq!(batches.intervals, 2);
@@ -11524,8 +11560,9 @@ mod tests {
                 timeline: None,
                 thread_id: 0,
                 cycle_frequency: None,
+                known_scope_ids: None,
             };
-            decode_cpu_batch(batch, &specs, &BTreeMap::new(), &mut state).unwrap();
+            decode_cpu_batch(batch, &specs, &FxHashMap::default(), &mut state).unwrap();
         }
 
         assert_eq!(batches.count, 2);
@@ -11577,9 +11614,10 @@ mod tests {
             timeline: None,
             thread_id: 0,
             cycle_frequency: None,
+            known_scope_ids: None,
         };
 
-        decode_cpu_batch(&data, &specs, &BTreeMap::new(), &mut state).unwrap();
+        decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(batches.intervals, 1);
         // Relative deltas 25 then 15 against base 1000 → absolute 1025..1040.
@@ -11634,9 +11672,10 @@ mod tests {
             timeline: None,
             thread_id: 0,
             cycle_frequency: Some(freq),
+            known_scope_ids: None,
         };
 
-        decode_cpu_batch(&data, &specs, &BTreeMap::new(), &mut state).unwrap();
+        decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(batches.preamble_timeline_rebases, 0);
         assert_eq!(scope_totals[&1], (1, 5 * freq));
@@ -11682,7 +11721,7 @@ mod tests {
             },
         )]
         .into_iter()
-        .collect::<BTreeMap<_, _>>();
+        .collect::<FxHashMap<_, _>>();
 
         let base = 1_000_000_000_u64;
         let freq = 1_000_000_u64;
@@ -11720,6 +11759,7 @@ mod tests {
             timeline: None,
             thread_id: 0,
             cycle_frequency: Some(freq),
+            known_scope_ids: None,
         };
 
         decode_cpu_batch(&data, &specs, &metadata, &mut state).unwrap();
@@ -11797,10 +11837,11 @@ mod tests {
             timeline: None,
             thread_id: 0,
             cycle_frequency: Some(freq),
+            known_scope_ids: None,
         };
 
-        decode_cpu_batch(&preamble, &specs, &BTreeMap::new(), &mut state).unwrap();
-        decode_cpu_batch(&flush_aligned, &specs, &BTreeMap::new(), &mut state).unwrap();
+        decode_cpu_batch(&preamble, &specs, &FxHashMap::default(), &mut state).unwrap();
+        decode_cpu_batch(&flush_aligned, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(batches.count, 2);
         assert_eq!(batches.preamble_timeline_rebases, 1);
@@ -11870,9 +11911,10 @@ mod tests {
             timeline: None,
             thread_id: 0,
             cycle_frequency: None,
+            known_scope_ids: None,
         };
 
-        decode_cpu_batch(&data, &specs, &BTreeMap::new(), &mut state).unwrap();
+        decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(scope_totals[&2], (1, 30));
         assert_eq!(scope_totals[&1], (1, 100));
@@ -11919,9 +11961,10 @@ mod tests {
             timeline: None,
             thread_id: 0,
             cycle_frequency: None,
+            known_scope_ids: None,
         };
 
-        decode_cpu_batch(&data, &specs, &BTreeMap::new(), &mut state).unwrap();
+        decode_cpu_batch(&data, &specs, &FxHashMap::default(), &mut state).unwrap();
 
         assert_eq!(batches.unmatched_ends, 1);
         assert!(scope_totals.is_empty());
@@ -11971,7 +12014,7 @@ mod tests {
             },
         )]
         .into_iter()
-        .collect::<BTreeMap<_, _>>();
+        .collect::<FxHashMap<_, _>>();
 
         let mut metadata_stack_context = CpuMetadataStackRuntimeState::default();
         let mut frame_scope_totals = FxHashMap::default();
@@ -12026,6 +12069,7 @@ mod tests {
                 timeline: None,
                 thread_id: 0,
                 cycle_frequency: None,
+                known_scope_ids: None,
             };
 
             decode_cpu_batch(&data, &specs, &metadata, &mut state).unwrap();
