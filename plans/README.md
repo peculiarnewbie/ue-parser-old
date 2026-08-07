@@ -38,7 +38,7 @@ even though that family is absent from the CPU-frame fixture.
 | 011 | Progressive UTrace dashboard streaming | P0 UX/perf | XL | 010 shared output/backend dispatcher | TODO |
 | 012 | Timeline `.utix` build/query performance | P1 perf | M/L | 002 `.utix` format; 011 phase 1 session core (landed) | TODO |
 | 013 | Live frame chart streaming performance | P1 UX/perf | S/M | landed 011 streaming UI; independent of 012 | TODO |
-| 014 | Hot-path parser performance (maps, dispatch, copies) | P1 perf | M/L | 012 phase 1.1 landed | TODO |
+| 014 | Hot-path parser performance (maps, dispatch, copies) | P1 perf | M/L | 012 phase 1.1 landed | IN PROGRESS — [2026-08-07 experiment report](../docs/utrace-performance-experiments-2026-08-07.md) |
 
 Status values: `TODO` | `IN PROGRESS` | `DONE` | `BLOCKED` | `REJECTED`
 

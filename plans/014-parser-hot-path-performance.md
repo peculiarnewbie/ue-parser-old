@@ -16,6 +16,12 @@
 - **Depends on**: Plan 012 phase 1.1 landed (note()/record() split already in
   tree); independent of plans 011/013
 - **Planned**: 2026-07-13
+- **Execution update**: The 2026-08-07 real-capture experiments, including
+  retained, reverted, and investigated-only approaches, are recorded in
+  [`docs/utrace-performance-experiments-2026-08-07.md`](../docs/utrace-performance-experiments-2026-08-07.md).
+  This plan predates the progressive exact timeline and shared-memory WASM
+  work; where its original non-goals conflict with that report, the report is
+  the current decision record.
 
 ## Background — how this was found
 
@@ -138,8 +144,8 @@ Acknowledged in plan 012 as "real but small, optional". The fix is a
 ## Non-goals
 
 - Changing any output bytes, caps, truncation flags, or `.utix` format.
-- Multi-threading the decode (Epic's ingest is also single-threaded per trace;
-  parallelism is query-time only — see TMonotonicTimeline async enumeration).
+- Parallelizing state within one trace thread. CPU batch state is sequential
+  per thread; the later experiment parallelizes independent trace threads only.
 - Adopting Epic's paged/slab timeline storage (`TMonotonicTimeline`) — it is
   the right long-term direction if the 1M-interval cap ever becomes a product
   limit, but is not in scope here.
@@ -370,8 +376,10 @@ serialize sorted if needed.
 
 ## Deferred / rejected
 
-- **Multi-threaded decode**: Epic's analysis is also single-threaded per trace;
-  parallelism is query-time enumeration, not ingest. Not in scope.
+- **Whole-stream multi-threaded decode**: global Protocol 5 serial order still
+  governs metadata and other providers. Independent per-thread CPU aggregation
+  was later implemented behind global metadata/order preparation; see the
+  2026-08-07 experiment report.
 - **`TMonotonicTimeline`-style paged storage**: correct long-term direction for
   removing the 1M-interval cap and enabling zero-alloc timeline ingest; deferred
   until the cap is a product constraint.
