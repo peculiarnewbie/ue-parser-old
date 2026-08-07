@@ -1,7 +1,7 @@
 {
   "name": "@ue-shed/utrace-parser-wasm",
-  "version": "0.2.0",
-  "description": "Browser WebAssembly parser for Unreal Engine UTrace captures",
+  "version": "0.3.0",
+  "description": "Browser and Node.js WebAssembly parser for Unreal Engine UTrace captures",
   "homepage": "https://github.com/ue-shed/ue-shed-utrace#readme",
   "bugs": {
     "url": "https://github.com/ue-shed/ue-shed-utrace/issues"
@@ -32,6 +32,12 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "node": "./dist/node.js",
+      "import": "./dist/node.js",
+      "default": "./dist/node.js"
+    },
     "./manifest": {
       "types": "./dist/manifest.d.ts",
       "import": "./dist/manifest.js",
@@ -44,11 +50,16 @@
       "default": "./dist/worker.js"
     }
   },
+  "bin": {
+    "utrace-parser-wasm": "dist/cli.js"
+  },
   "types": "./dist/index.d.ts",
   "sideEffects": false,
   "scripts": {
     "build": "node ./scripts/build.mjs",
     "check": "node ./scripts/check-package.mjs",
+    "benchmark:real": "node ./scripts/benchmark-real-trace.mjs",
+    "test:node": "node ./scripts/test-packed.mjs",
     "prepack": "node ./scripts/prepack.mjs"
   },
   "publishConfig": {

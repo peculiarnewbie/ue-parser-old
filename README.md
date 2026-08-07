@@ -38,10 +38,17 @@ in `tests/utrace_fixture.rs`.
 
 ## Browser WebAssembly package
 
-[`@ue-shed/utrace-parser-wasm`](packages/utrace-parser-wasm) is browser-only
-and should be used from a web worker for large captures. It exposes
+[`@ue-shed/utrace-parser-wasm`](packages/utrace-parser-wasm) supports portable
+browser WASM and an explicit `/node` entry suitable for subprocess use. Large
+browser captures should be parsed in a web worker. It exposes
 `inspect`, `inventory`, `dashboard`, `dashboardBundle`, and
 `createProgressiveDashboard`.
+
+`DashboardOptions` bounds output selection; it does not enable parallelism.
+The npm artifact is serial portable WASM. The repository web viewer can also
+build a threaded shared-memory variant, which requires cross-origin isolation.
+See the package README for the Node CLI, runtime tradeoffs, and optional
+Node/Bun real-trace benchmark.
 
 ```text
 cd packages/utrace-parser-wasm

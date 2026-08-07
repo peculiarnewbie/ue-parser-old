@@ -28,6 +28,9 @@ const wasmPath = resolve(distDirectory, "wasm", "utrace_parser_wasm_bg.wasm");
 const requiredPaths = [
   resolve(distDirectory, "index.js"),
   resolve(distDirectory, "index.d.ts"),
+  resolve(distDirectory, "node.js"),
+  resolve(distDirectory, "node.d.ts"),
+  resolve(distDirectory, "cli.js"),
   resolve(distDirectory, "worker.js"),
   resolve(distDirectory, "worker.d.ts"),
   resolve(distDirectory, "worker-client.js"),
@@ -69,8 +72,17 @@ if (glue.includes("uasset-inspect") || glue.includes("export function parse(")) 
   throw new Error("The npm package unexpectedly includes the combined UAsset WASM API");
 }
 
-for (const exportName of ["./manifest", "./parser-manifest.json", "./worker"]) {
+const expectedExports = [".", "./manifest", "./node", "./parser-manifest.json", "./worker"];
+assert.deepEqual(
+  Object.keys(packageManifest.exports).sort(),
+  expectedExports.sort(),
+  "Package exports contain unexpected or missing public entries",
+);
+for (const exportName of expectedExports) {
   if (!(exportName in packageManifest.exports)) {
     throw new Error(`Package export is missing: ${exportName}`);
   }
+}
+if (packageManifest.bin?.["utrace-parser-wasm"] !== "dist/cli.js") {
+  throw new Error("Package CLI bin entry is missing or incorrect");
 }

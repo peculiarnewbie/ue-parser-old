@@ -1,16 +1,17 @@
 # `@ue-shed/utrace-parser-wasm`
 
-Browser WebAssembly bindings for the repository's read-only Unreal Engine
-UTrace parser. Parsing happens in the browser; this package does not upload
-captures or use a backend.
-
-It is browser-only in the initial release. Consumers should run parsing in a
-web worker for large captures.
+Browser and Node.js WebAssembly bindings for the repository's read-only Unreal
+Engine UTrace parser. Parsing is local; this package does not upload captures
+or use a backend. Browser consumers should use a web worker for large captures.
 
 The published package uses portable single-thread WebAssembly and does not
 require `SharedArrayBuffer` or cross-origin isolation. The repository's web
 viewer additionally builds an opt-in shared-memory variant and selects it when
 the browser supports cross-origin-isolated workers.
+
+`DashboardOptions` bounds which frame and timeline rows are retained in the
+output. It does not select serial or parallel execution. The published WASM is
+always the portable serial build.
 
 ## Install
 
@@ -35,6 +36,41 @@ const result = await dashboard({
 
 const eventInventory = await inventory({ bytes, filename: file.name });
 ```
+
+## Node.js API and CLI
+
+Node consumers must use the explicit `node` entry. It initializes the same
+generated WASM artifact from the package filesystem and does not call
+`fetch(file://...)`. Keeping Node built-ins out of the root entry prevents
+browser bundlers from pulling in filesystem shims.
+
+```js
+import { readFile } from "node:fs/promises";
+import { dashboard } from "@ue-shed/utrace-parser-wasm/node";
+
+const input = "C:\\traces\\capture.utrace";
+const result = await dashboard({
+  bytes: await readFile(input),
+  filename: input,
+  options: { maxFrames: 120 },
+});
+```
+
+The Node entry exposes `init`, `inspect`, `inventory`, `dashboard`,
+`dashboardBundle`, the progressive API, `parserManifest`, and the same DTO
+types as the browser root.
+
+For subprocess integrations, the package also installs a CLI:
+
+```text
+utrace-parser-wasm dashboard --input trace.utrace \
+  --output trace-dashboard.json --max-frames 120
+```
+
+The CLI writes a temporary file in the destination directory, flushes it, and
+publishes it atomically. It refuses to replace an existing output. A single
+JSON status record is written to stderr; exit codes are `2` for usage, `3` for
+input, `4` for initialization/parsing/validation, and `5` for output errors.
 
 `inspect`, `inventory`, `dashboard`, and `dashboardBundle` return the stable
 JSON envelopes emitted by the Rust parser. Their top-level
@@ -107,6 +143,39 @@ try {
   throw error;
 }
 ```
+
+## Runtime choices and benchmark
+
+- Use the portable root package in a browser Worker for broad compatibility.
+- Use `/node` or the CLI for Node subprocesses. On the measured 65 MB Funguys
+  trace, V8 runs the WASM close to the native serial CLI while using more
+  memory.
+- Bun 1.3.13, 1.3.14, and 1.4.0-canary.1 have a severe cold-WASM execution
+  issue on that workload.
+  File I/O, explicit input copying, initialization, and JSON parsing are not the
+  dominant costs; almost all elapsed time is inside the raw WASM parser call.
+  Prefer Node or native Rust for production subprocess parsing for now.
+- The repository-only threaded browser build uses shared WebAssembly memory.
+  It requires a cross-origin-isolated page (`COOP: same-origin` and
+  `COEP: require-corp`) because browsers expose `SharedArrayBuffer` only in
+  that security context. It is not the artifact published by this package.
+
+Native Rust has the lowest runtime and memory overhead and can use native-only
+features. WASM provides one portable parser artifact and schema across browser
+and Node, at the cost of linear-memory duplication and runtime-specific JIT
+behavior.
+
+After `npm run build`, run the optional fixture-gated benchmark with either
+runtime:
+
+```text
+npm run benchmark:real -- --input C:\\traces\\capture.utrace
+bun ./scripts/benchmark-real-trace.mjs --input C:\\traces\\capture.utrace
+```
+
+Add `--profile-stages` to separate progressive ingest/eager-timeline work from
+finish/aggregation, or `--native-cli <path-to-uasset>` for a native comparison.
+When the fixture is absent the script emits an explicit JSON `skipped` result.
 
 ## Publishing this repository checkout
 

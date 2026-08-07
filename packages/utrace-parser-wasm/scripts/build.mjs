@@ -43,7 +43,17 @@ const build = spawnSync(
 if (build.error) throw build.error;
 if (build.status !== 0) process.exit(build.status ?? 1);
 
-for (const file of ["index.js", "index.d.ts", "worker.js", "worker.d.ts", "worker-client.js", "worker-operations.js"]) {
+for (const file of [
+  "cli.js",
+  "index.js",
+  "index.d.ts",
+  "node.js",
+  "node.d.ts",
+  "worker.js",
+  "worker.d.ts",
+  "worker-client.js",
+  "worker-operations.js",
+]) {
   cpSync(resolve(sourceDirectory, file), resolve(distDirectory, file));
 }
 
