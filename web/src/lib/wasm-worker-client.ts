@@ -117,13 +117,13 @@ export async function parseUtraceProgressWithWasm(
       if (event.type === "complete") finalDashboard = event.dashboard;
     }
   };
-  await workerCall({
+  const startupTiming = (await workerCall({
     kind: "utrace-progress-start",
     session_id: sessionId,
     filename: file.name,
     total_bytes: file.size,
     options,
-  });
+  })).timing;
   const reader = file.stream().getReader();
   const abort = async () => {
     await reader.cancel().catch(() => undefined);
@@ -164,7 +164,14 @@ export async function parseUtraceProgressWithWasm(
   return {
     data: finalDashboard,
     sessionId: String(sessionId),
-    timing: { backend: "wasm", client_ms: performance.now() - started, json_parse_ms: 0, parse_ms: parseMs },
+    timing: {
+      backend: "wasm",
+      client_ms: performance.now() - started,
+      json_parse_ms: 0,
+      parse_ms: parseMs,
+      worker_startup_ms: startupTiming.worker_startup_ms,
+      wasm_threads: startupTiming.wasm_threads,
+    },
   };
 }
 

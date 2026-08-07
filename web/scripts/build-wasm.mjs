@@ -12,7 +12,47 @@ const rustFlags = [
   "-C link-arg=--export=__tls_base",
 ].join(" ");
 
-const build = spawnSync(
+const webRoot = new URL("..", import.meta.url);
+
+function runBuild(label, command, args, extraEnvironment = {}) {
+  console.log(`Building ${label} WASM...`);
+  const build = spawnSync(command, args, {
+    cwd: webRoot,
+    env: { ...process.env, ...extraEnvironment },
+    stdio: "inherit",
+  });
+
+  if (build.error) throw build.error;
+  if (build.status === 0) return;
+  if (label === "shared-memory threaded") {
+    console.error(
+      `Threaded WASM requires ${toolchain} with rust-src and the wasm32-unknown-unknown target.`,
+    );
+  } else {
+    console.error(`${label} WASM build failed.`);
+  }
+  process.exit(build.status ?? 1);
+}
+
+runBuild("single-thread fallback", "wasm-pack", [
+  "build",
+  "..",
+  "--release",
+  "--target",
+  "web",
+  "--out-dir",
+  "web/src/generated/wasm-single",
+  "--out-name",
+  "uasset_parser_wasm",
+  "--no-typescript",
+  "--",
+  "--no-default-features",
+  "--features",
+  "wasm",
+]);
+
+runBuild(
+  "shared-memory threaded",
   "rustup",
   [
     "run",
@@ -35,17 +75,5 @@ const build = spawnSync(
     "-Z",
     "build-std=panic_abort,std",
   ],
-  {
-    cwd: new URL("..", import.meta.url),
-    env: { ...process.env, RUSTFLAGS: rustFlags },
-    stdio: "inherit",
-  },
+  { RUSTFLAGS: rustFlags },
 );
-
-if (build.error) throw build.error;
-if (build.status !== 0) {
-  console.error(
-    `Threaded WASM requires ${toolchain} with rust-src and the wasm32-unknown-unknown target.`,
-  );
-  process.exit(build.status ?? 1);
-}

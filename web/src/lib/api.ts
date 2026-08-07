@@ -22,6 +22,7 @@ export type ParseTiming = {
   json_parse_ms: number;
   input_read_ms?: number;
   worker_startup_ms?: number;
+  wasm_threads?: boolean;
   wasm_copy_ms?: number;
   parse_ms?: number;
   worker_round_trip_ms?: number;
@@ -44,6 +45,9 @@ export type UtraceDashboardQuery = {
 
 export function formatParseTiming(timing: ParseTiming): string {
   const parts = [`browser ${formatMs(timing.client_ms)}`];
+  if (timing.wasm_threads != null) {
+    parts.push(timing.wasm_threads ? "threaded WASM" : "single-thread WASM");
+  }
   if (timing.input_read_ms != null && timing.input_read_ms > 1) {
     parts.push(`read ${formatMs(timing.input_read_ms)}`);
   }

@@ -25,6 +25,7 @@ type WasmResponse =
 
 export type WorkerTiming = {
   worker_startup_ms?: number;
+  wasm_threads?: boolean;
   wasm_copy_ms: number;
   parse_ms: number;
   /** Measured in the page so it uses one clock for send and receive. */
@@ -51,11 +52,14 @@ type WasmModule = {
 
 let modulePromise: Promise<WasmModule> | null = null;
 let threadPoolPromise: Promise<void> | null = null;
+const wasmThreads = self.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
 const progressiveSessions = new Map<number, InstanceType<WasmModule["ProgressiveUtraceSession"]>>();
 
 async function wasm(): Promise<WasmModule> {
   if (!modulePromise) {
-    modulePromise = import("../generated/wasm/uasset_parser_wasm.js") as Promise<WasmModule>;
+    modulePromise = wasmThreads
+      ? import("../generated/wasm/uasset_parser_wasm.js") as Promise<WasmModule>
+      : import("../generated/wasm-single/uasset_parser_wasm.js") as Promise<WasmModule>;
   }
   const loaded = await modulePromise;
   await loaded.default();
@@ -84,7 +88,18 @@ self.onmessage = async (event: MessageEvent<WasmRequest>) => {
           JSON.stringify(request.options),
         ),
       );
-      self.postMessage({ id: request.id, ok: true, json: "[]", timing: { worker_startup_ms: afterInit - started, wasm_copy_ms: 0, parse_ms: performance.now() - afterInit }, sent_at: performance.now() } satisfies WasmResponse);
+      self.postMessage({
+        id: request.id,
+        ok: true,
+        json: "[]",
+        timing: {
+          worker_startup_ms: afterInit - started,
+          wasm_threads: wasmThreads,
+          wasm_copy_ms: 0,
+          parse_ms: performance.now() - afterInit,
+        },
+        sent_at: performance.now(),
+      } satisfies WasmResponse);
       return;
     }
     if (request.kind === "utrace-progress-cancel") {

@@ -31,7 +31,10 @@ the browser route parses them in a dedicated worker. `npm run dev` and
 `npm run build` generate the browser bindings with `wasm-pack`, so Rust's
 `wasm32-unknown-unknown` target and `wasm-pack` must be installed.
 
-CPU dashboard aggregation uses shared-memory WASM workers. Vite development
-and preview responses include the required COOP/COEP headers; production hosts
-must likewise serve `Cross-Origin-Opener-Policy: same-origin` and
-`Cross-Origin-Embedder-Policy: require-corp` so `SharedArrayBuffer` is available.
+CPU dashboard aggregation uses shared-memory WASM workers when the page is
+cross-origin isolated. Vite development and preview responses include the
+required COOP/COEP headers; production hosts should likewise serve
+`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp` to enable the threaded build. The
+worker automatically loads a single-thread build when `SharedArrayBuffer` is
+unavailable, including embedded browser contexts.
