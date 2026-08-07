@@ -7,6 +7,11 @@ captures or use a backend.
 It is browser-only in the initial release. Consumers should run parsing in a
 web worker for large captures.
 
+The published package uses portable single-thread WebAssembly and does not
+require `SharedArrayBuffer` or cross-origin isolation. The repository's web
+viewer additionally builds an opt-in shared-memory variant and selects it when
+the browser supports cross-origin-isolated workers.
+
 ## Install
 
 ```text
