@@ -3,6 +3,7 @@ import { DropZone } from "../components/DropZone";
 import { CompositionBars, HorizontalBars } from "../components/Charts";
 import { DataAssetView } from "../components/DataAssetView";
 import { DataTableView } from "../components/DataTableView";
+import { VirtualTable } from "../components/VirtualTable";
 import { ParseRequestError, formatParseTiming, type ParseTiming } from "../lib/api";
 import { parseWithWasm } from "../lib/wasm-worker-client";
 import { isDataAssetKind, isDataTableKind } from "../lib/datatable";
@@ -173,8 +174,13 @@ export default function UassetPage() {
 
             <section class="panel">
               <h2>Assets</h2>
-              <div class="table-wrap">
-                <table>
+              <VirtualTable
+                rows={inspect.assets}
+                columnCount={6}
+                containerClass="table-wrap datatable-wrap"
+                tableClass="datatable"
+                getRowKey={(asset) => asset.object_path}
+                header={
                   <thead>
                     <tr>
                       <th>Kind</th>
@@ -185,24 +191,21 @@ export default function UassetPage() {
                       <th>Tail</th>
                     </tr>
                   </thead>
-                  <tbody>
-                    <For each={inspect.assets}>
-                      {(asset) => (
-                        <tr>
-                          <td>
-                            <code>{asset.kind}</code>
-                          </td>
-                          <td class="mono">{asset.object_path}</td>
-                          <td class="mono muted">{asset.class_path ?? "—"}</td>
-                          <td>{asset.row_count}</td>
-                          <td>{asset.properties?.length ?? 0}</td>
-                          <td>{asset.tail_bytes ?? 0}</td>
-                        </tr>
-                      )}
-                    </For>
-                  </tbody>
-                </table>
-              </div>
+                }
+              >
+                {(asset) => (
+                  <>
+                    <td>
+                      <code>{asset.kind}</code>
+                    </td>
+                    <td class="mono">{asset.object_path}</td>
+                    <td class="mono muted">{asset.class_path ?? "—"}</td>
+                    <td>{asset.row_count}</td>
+                    <td>{asset.properties?.length ?? 0}</td>
+                    <td>{asset.tail_bytes ?? 0}</td>
+                  </>
+                )}
+              </VirtualTable>
             </section>
           </>
         )}

@@ -14,6 +14,7 @@ import {
   type DataTableRow,
 } from "../lib/datatable";
 import type { AssetSummary } from "../lib/types";
+import { VirtualTable } from "./VirtualTable";
 
 type DataTableViewProps = {
   asset: AssetSummary;
@@ -67,6 +68,8 @@ export function DataTableView(props: DataTableViewProps) {
     getFilteredRowModel: getFilteredRowModel(),
   });
 
+  const rows = () => table.getRowModel().rows;
+
   return (
     <section class="panel datatable-panel">
       <header class="datatable-head">
@@ -100,8 +103,14 @@ export function DataTableView(props: DataTableViewProps) {
         when={data().length > 0}
         fallback={<p class="chart-empty">DataTable decoded with zero rows.</p>}
       >
-        <div class="table-wrap datatable-wrap">
-          <table class="datatable">
+        <VirtualTable
+          rows={rows()}
+          columnCount={table.getVisibleLeafColumns().length}
+          containerClass="table-wrap datatable-wrap"
+          tableClass="datatable"
+          resetKey={`${rows().length}\0${globalFilter()}\0${JSON.stringify(sorting())}`}
+          getRowKey={(row) => row.id}
+          header={
             <thead>
               <For each={table.getHeaderGroups()}>
                 {(headerGroup) => (
@@ -136,28 +145,23 @@ export function DataTableView(props: DataTableViewProps) {
                 )}
               </For>
             </thead>
-            <tbody>
-              <For each={table.getRowModel().rows}>
-                {(row) => (
-                  <tr>
-                    <For each={row.getVisibleCells()}>
-                      {(cell) => (
-                        <td
-                          classList={{
-                            "row-name": cell.column.id === "__rowName",
-                            mono: true,
-                          }}
-                        >
-                          {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                        </td>
-                      )}
-                    </For>
-                  </tr>
-                )}
-              </For>
-            </tbody>
-          </table>
-        </div>
+          }
+        >
+          {(row) => (
+            <For each={row.getVisibleCells()}>
+              {(cell) => (
+                <td
+                  classList={{
+                    "row-name": cell.column.id === "__rowName",
+                    mono: true,
+                  }}
+                >
+                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                </td>
+              )}
+            </For>
+          )}
+        </VirtualTable>
       </Show>
     </section>
   );

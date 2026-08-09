@@ -1,13 +1,11 @@
-import { For, Show, createMemo, createSignal } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, on } from "solid-js";
+import {
+  inspectTimelineIntervals,
+  type TimelineLaneInterval,
+} from "../lib/timeline-inspection";
+import { TimelineInspector } from "./TimelineInspector";
 
-export type TimelineLaneInterval = {
-  id: string;
-  lane: string;
-  label: string;
-  start: number;
-  end: number;
-  durationLabel: string;
-};
+export type { TimelineLaneInterval } from "../lib/timeline-inspection";
 
 type ScopeTimelineProps = {
   title: string;
@@ -16,6 +14,7 @@ type ScopeTimelineProps = {
   end: number;
   cycleFrequency?: number;
   truncated?: boolean;
+  totalIntervalCount?: number;
   intervals: TimelineLaneInterval[];
   empty?: string;
 };
@@ -107,10 +106,18 @@ export function ScopeTimeline(props: ScopeTimelineProps) {
   const [hover, setHover] = createSignal<TimelineLaneInterval | null>(null);
   const [zoom, setZoom] = createSignal<[number, number] | null>(null);
   const [brush, setBrush] = createSignal<[number, number] | null>(null);
+  const [selectedId, setSelectedId] = createSignal<string | null>(null);
   let svgRef: SVGSVGElement | undefined;
 
   const tracks = createMemo(() => buildTracks(props.intervals));
+  const inspections = createMemo(() => inspectTimelineIntervals(props.intervals));
+  const selectedInspection = createMemo(() => {
+    const id = selectedId();
+    return id == null ? undefined : inspections().get(id);
+  });
   const laneCount = createMemo(() => new Set(props.intervals.map((item) => item.lane)).size);
+  const totalIntervalCount = () =>
+    props.totalIntervalCount ?? props.intervals.length;
   const domain = createMemo(() => {
     const full: [number, number] = [props.begin, Math.max(props.end, props.begin + 1)];
     return zoom() ?? full;
@@ -128,6 +135,24 @@ export function ScopeTimeline(props: ScopeTimelineProps) {
         .map((interval) => interval.id),
     );
   });
+  const focusableId = createMemo(() => {
+    const selected = selectedId();
+    if (selected != null && visible().has(selected)) return selected;
+    return props.intervals.find((interval) => visible().has(interval.id))?.id;
+  });
+
+  createEffect(
+    on(
+      () => [props.begin, props.end, props.intervals] as const,
+      () => {
+        setHover(null);
+        setZoom(null);
+        setBrush(null);
+        setSelectedId(null);
+      },
+      { defer: true },
+    ),
+  );
 
   const x = (value: number) => {
     const [min, max] = domain();
@@ -163,6 +188,16 @@ export function ScopeTimeline(props: ScopeTimelineProps) {
     return `+${formatCompact(relative)} cy`;
   };
 
+  const formatDuration = (cycles: number) => {
+    if (props.cycleFrequency != null && props.cycleFrequency > 0) {
+      const milliseconds = (cycles / props.cycleFrequency) * 1000;
+      return milliseconds >= 1000
+        ? `${(milliseconds / 1000).toFixed(3)} s`
+        : `${milliseconds.toFixed(milliseconds < 10 ? 3 : 2)} ms`;
+    }
+    return `${formatCompact(cycles)} cy`;
+  };
+
   const resetZoom = () => setZoom(null);
 
   const zoomTo = (interval: TimelineLaneInterval) => {
@@ -172,6 +207,81 @@ export function ScopeTimeline(props: ScopeTimelineProps) {
       Math.max(props.begin, interval.start - pad),
       Math.min(props.end, interval.end + pad),
     ]);
+  };
+
+  const focusIntervalElement = (id: string) => {
+    queueMicrotask(() => {
+      const elements = svgRef?.querySelectorAll<SVGRectElement>(
+        "[data-timeline-interval-id]",
+      );
+      [...(elements ?? [])]
+        .find((element) => element.dataset.timelineIntervalId === id)
+        ?.focus();
+    });
+  };
+
+  const selectById = (
+    id: string,
+    reveal = true,
+    moveFocus = false,
+  ) => {
+    const inspection = inspections().get(id);
+    if (!inspection) return;
+    setSelectedId(id);
+    if (reveal) {
+      const [min, max] = domain();
+      if (
+        inspection.interval.start < min ||
+        inspection.interval.end > max
+      ) {
+        zoomTo(inspection.interval);
+      }
+    }
+    if (moveFocus) focusIntervalElement(id);
+  };
+
+  const onBarKeyDown = (
+    event: KeyboardEvent,
+    interval: TimelineLaneInterval,
+  ) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      selectById(interval.id, false);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setSelectedId(null);
+      return;
+    }
+
+    const inspection = inspections().get(interval.id);
+    let targetId: string | undefined;
+    if (event.key === "ArrowUp") {
+      targetId = inspection?.parentId;
+    } else if (event.key === "ArrowDown") {
+      targetId = inspection?.childIds[0];
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      const laneIntervals = props.intervals
+        .filter((candidate) => candidate.lane === interval.lane)
+        .sort(
+          (left, right) =>
+            left.start - right.start ||
+            right.end - left.end ||
+            left.id.localeCompare(right.id),
+        );
+      const index = laneIntervals.findIndex(
+        (candidate) => candidate.id === interval.id,
+      );
+      targetId =
+        event.key === "ArrowLeft"
+          ? laneIntervals[index - 1]?.id
+          : laneIntervals[index + 1]?.id;
+    }
+    if (targetId != null) {
+      event.preventDefault();
+      selectById(targetId, true, true);
+    }
   };
 
   const onPointerDown = (event: PointerEvent) => {
@@ -237,17 +347,26 @@ export function ScopeTimeline(props: ScopeTimelineProps) {
         </div>
         <div class="timer-readout" aria-label="Timer query summary">
           <span>{plural(laneCount(), "thread")}</span>
-          <span>{plural(props.intervals.length, "span")}</span>
+          <span>
+            {props.truncated
+              ? `${props.intervals.length.toLocaleString()} of ${totalIntervalCount().toLocaleString()} spans`
+              : plural(props.intervals.length, "span")}
+          </span>
           <span>{formatOffset(domain()[1])}</span>
         </div>
       </header>
 
       <div class="timer-toolbar">
         <span class="timer-toolbar-label">Shared time ruler</span>
-        <span class="muted">drag to zoom · Ctrl/⌘ + wheel to scale · click a span to focus</span>
+        <span class="muted">
+          click or Enter to inspect · double-click to focus · arrows follow call context
+        </span>
         <div class="timer-actions">
           <Show when={props.truncated}>
-            <span class="pill status-partial">query capped</span>
+            <span class="pill status-partial">
+              {props.intervals.length.toLocaleString()} /{" "}
+              {totalIntervalCount().toLocaleString()} returned
+            </span>
           </Show>
           <Show when={zoom()}>
             <button type="button" class="btn ghost compact" onClick={resetZoom}>
@@ -261,6 +380,29 @@ export function ScopeTimeline(props: ScopeTimelineProps) {
         when={props.intervals.length > 0}
         fallback={<p class="chart-empty">{props.empty ?? "No intervals."}</p>}
       >
+        <Show when={selectedInspection()}>
+          {(inspection) => (
+            <TimelineInspector
+              inspection={inspection()}
+              inspections={inspections()}
+              windowDuration={Math.max(1, props.end - props.begin)}
+              color={colorFor(inspection().interval.label)}
+              truncated={props.truncated ?? false}
+              returnedCount={props.intervals.length}
+              totalCount={totalIntervalCount()}
+              formatOffset={formatOffset}
+              formatDuration={formatDuration}
+              onSelect={(id) => selectById(id)}
+              onFocusSpan={(interval) => {
+                setSelectedId(interval.id);
+                zoomTo(interval);
+                focusIntervalElement(interval.id);
+              }}
+              onClear={() => setSelectedId(null)}
+            />
+          )}
+        </Show>
+
         <div class="timeline-wrap timer-wrap">
           <svg
             ref={svgRef}
@@ -365,9 +507,16 @@ export function ScopeTimeline(props: ScopeTimelineProps) {
                         if (!visible().has(interval.id)) return null;
                         const [left, right] = barBounds(interval);
                         const width = right - left;
+                        const inspection = () => inspections().get(interval.id);
                         return (
                           <g>
                             <rect
+                              role="button"
+                              tabindex={focusableId() === interval.id ? 0 : -1}
+                              aria-pressed={selectedId() === interval.id}
+                              aria-label={`${interval.label} · ${interval.durationLabel} · ${interval.lane} · depth ${(inspection()?.depth ?? 0) + 1}`}
+                              aria-keyshortcuts="Enter Space ArrowLeft ArrowRight ArrowUp ArrowDown Escape"
+                              data-timeline-interval-id={interval.id}
                               x={left}
                               y={y + 3}
                               width={width}
@@ -375,13 +524,24 @@ export function ScopeTimeline(props: ScopeTimelineProps) {
                               rx={2}
                               fill={colorFor(interval.label)}
                               class="timer-bar"
-                              classList={{ active: hover()?.id === interval.id }}
+                              classList={{
+                                active: hover()?.id === interval.id,
+                                selected: selectedId() === interval.id,
+                              }}
                               onMouseEnter={() => setHover(interval)}
                               onMouseLeave={() => setHover(null)}
+                              onFocus={() => setHover(interval)}
+                              onBlur={() => setHover(null)}
                               onClick={(event) => {
                                 event.stopPropagation();
+                                selectById(interval.id, false);
+                              }}
+                              onDblClick={(event) => {
+                                event.stopPropagation();
+                                selectById(interval.id, false);
                                 zoomTo(interval);
                               }}
+                              onKeyDown={(event) => onBarKeyDown(event, interval)}
                             >
                               <title>{`${interval.label} · ${interval.durationLabel}`}</title>
                             </rect>
@@ -433,10 +593,11 @@ export function ScopeTimeline(props: ScopeTimelineProps) {
               <span>{interval().lane}</span>
               <span>{formatOffset(interval().start)} → {formatOffset(interval().end)}</span>
               <span class="timer-duration">{interval().durationLabel}</span>
-              <span class="muted">click to isolate</span>
+              <span class="muted">click to inspect · double-click to focus</span>
             </div>
           )}
         </Show>
+
       </Show>
     </section>
   );

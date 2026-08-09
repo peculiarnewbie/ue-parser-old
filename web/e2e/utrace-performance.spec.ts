@@ -95,11 +95,36 @@ test.describe("UTrace browser performance", () => {
         const markerRequestedAt = performance.now();
         await worstMarker.click();
         await expect(page.locator("[data-utrace-timeline-ready]")).toBeVisible();
-        await expect(page.locator(".timer-bar").first()).toBeVisible();
+        const firstTimerBar = page.locator(".timer-bar").first();
+        await expect(firstTimerBar).toBeVisible();
         await expect
           .poll(async () => completedSpanCount(await browserSnapshot(page), UTRACE_SPAN.timelineLoad))
           .toBe(1);
         const timelineReadyAt = performance.now();
+
+        await expect(firstTimerBar).toHaveAttribute("role", "button");
+        await expect(page.locator('.timer-bar[tabindex="0"]')).toHaveCount(1);
+        await firstTimerBar.focus();
+        await page.keyboard.press("Enter");
+        const inspector = page.locator("[data-timeline-inspector]");
+        await expect(inspector).toBeVisible();
+        await expect(inspector).toBeInViewport();
+        await expect(inspector.getByText("Identity", { exact: true })).toBeVisible();
+        await expect(inspector.getByText("Call context", { exact: true })).toBeVisible();
+        await expect(inspector.getByRole("button", { name: "Focus span" })).toBeVisible();
+        await expect(inspector.getByText(/Showing 2,500 of [\d,]+ matching spans/)).toBeVisible();
+        await expect(firstTimerBar).toHaveAttribute("aria-pressed", "true");
+        const nextOccurrence = inspector.getByRole("button", { name: /Next/ });
+        await expect(nextOccurrence).toBeEnabled();
+        await nextOccurrence.click();
+        await expect(inspector.getByText(/occurrence 2 of \d+/)).toBeVisible();
+        await inspector.getByRole("button", { name: /Previous/ }).click();
+        await expect(inspector.getByText(/occurrence 1 of \d+/)).toBeVisible();
+        await inspector.getByRole("button", { name: "Focus span" }).click();
+        await expect(page.getByRole("button", { name: "Fit window" })).toBeVisible();
+        await expect(inspector).toBeInViewport();
+        await page.getByRole("button", { name: "Fit window" }).click();
+        await expect(page.getByRole("button", { name: "Fit window" })).toHaveCount(0);
 
         const snapshot = await browserSnapshot(page);
         lastSnapshot = snapshot;
@@ -159,6 +184,9 @@ test.describe("UTrace browser performance", () => {
         });
 
         if (run === repeatCount) {
+          await inspector.screenshot({
+            path: testInfo.outputPath("utrace-timeline-inspector.png"),
+          });
           const frameScroller = page.locator(".frame-browser-wrap");
           const frameCount = Number(
             await frameScroller.getAttribute("data-utrace-frame-count"),
@@ -198,6 +226,12 @@ test.describe("UTrace browser performance", () => {
           );
           await page.screenshot({ path: screenshotPath, fullPage: true });
           if (durableOutputDirectory) {
+            await inspector.screenshot({
+              path: resolve(
+                durableOutputDirectory,
+                "browser-timeline-inspector.png",
+              ),
+            });
             await page.screenshot({
               path: resolve(durableOutputDirectory, "browser-timeline.png"),
               fullPage: true,

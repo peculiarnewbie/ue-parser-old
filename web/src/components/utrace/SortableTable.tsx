@@ -7,6 +7,7 @@ import {
   type SortingState,
 } from "@tanstack/solid-table";
 import { For, Show, createMemo, createSignal, type JSX } from "solid-js";
+import { VirtualTable } from "../VirtualTable";
 
 type SortableTableProps<T extends object> = {
   title: string;
@@ -51,6 +52,8 @@ export function SortableTable<T extends object>(props: SortableTableProps<T>) {
     getSortedRowModel: getSortedRowModel(),
   });
 
+  const rows = () => table.getRowModel().rows;
+
   return (
     <section class="panel">
       <header class="datatable-head">
@@ -81,8 +84,21 @@ export function SortableTable<T extends object>(props: SortableTableProps<T>) {
         when={filtered().length > 0}
         fallback={<p class="chart-empty">{props.empty ?? "No rows."}</p>}
       >
-        <div class={`table-wrap datatable-wrap ${props.maxHeightClass ?? ""}`}>
-          <table class="datatable">
+        <VirtualTable
+          rows={rows()}
+          columnCount={table.getVisibleLeafColumns().length}
+          containerClass={`table-wrap datatable-wrap ${props.maxHeightClass ?? ""}`}
+          tableClass="datatable"
+          resetKey={`${rows().length}\0${filter()}\0${JSON.stringify(sorting())}`}
+          getRowKey={(row) => row.id}
+          rowProps={(row) => ({
+            classList: {
+              clickable: !!props.onRowClick,
+              ...props.rowClass?.(row.original),
+            },
+            onClick: () => props.onRowClick?.(row.original),
+          })}
+          header={
             <thead>
               <For each={table.getHeaderGroups()}>
                 {(headerGroup) => (
@@ -115,29 +131,18 @@ export function SortableTable<T extends object>(props: SortableTableProps<T>) {
                 )}
               </For>
             </thead>
-            <tbody>
-              <For each={table.getRowModel().rows}>
-                {(row) => (
-                  <tr
-                    classList={{
-                      clickable: !!props.onRowClick,
-                      ...props.rowClass?.(row.original),
-                    }}
-                    onClick={() => props.onRowClick?.(row.original)}
-                  >
-                    <For each={row.getVisibleCells()}>
-                      {(cell) => (
-                        <td class="mono">
-                          {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                        </td>
-                      )}
-                    </For>
-                  </tr>
-                )}
-              </For>
-            </tbody>
-          </table>
-        </div>
+          }
+        >
+          {(row) => (
+            <For each={row.getVisibleCells()}>
+              {(cell) => (
+                <td class="mono">
+                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                </td>
+              )}
+            </For>
+          )}
+        </VirtualTable>
       </Show>
     </section>
   );

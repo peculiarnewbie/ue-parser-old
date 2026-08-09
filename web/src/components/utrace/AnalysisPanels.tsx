@@ -1,6 +1,7 @@
 import { For, Show, createMemo, createSignal, type Accessor } from "solid-js";
 import type { ColumnDef } from "@tanstack/solid-table";
 import { CompositionBars, HorizontalBars, LineSeriesChart } from "../Charts";
+import { VirtualTable } from "../VirtualTable";
 import { SortableTable, StatCard } from "./SortableTable";
 import {
   aggregateTopBreadcrumbs,
@@ -120,7 +121,7 @@ export function OverviewPanel(props: {
 
       <div class="stat-grid">
         <StatCard
-          label={props.window().active ? "Frames in brush" : "Correlated frames"}
+          label={props.window().active ? "Frames selected" : "Correlated frames"}
           value={`${frames().length}${!props.window().active && props.dash().frame_correlation.truncated ? "+" : ""}`}
           hint={
             props.window().active
@@ -180,12 +181,12 @@ export function OverviewPanel(props: {
         <HorizontalBars
           title={
             props.window().active
-              ? "Hottest CPU scopes (brushed frames)"
+              ? "Hottest CPU scopes (selected frames)"
               : "Hottest CPU scopes"
           }
           subtitle={
             props.window().active
-              ? "Merged from per-frame top scopes in the brush"
+              ? "Merged from per-frame top scopes in the selected range"
               : "Capture-wide inclusive cost"
           }
           data={topScopes()}
@@ -346,7 +347,7 @@ export function CpuPanel(props: {
         eyebrow="CPU scopes"
         title={
           props.window().active
-            ? "Scopes in brushed frames"
+            ? "Scopes in selected frames"
             : "Capture-wide scope rollup"
         }
         subtitle={
@@ -584,8 +585,13 @@ export function GpuPanel(props: {
               {timeline().truncated ? " · truncated" : ""} · timestamps are
               GPU-domain (not CPU cycles)
             </p>
-            <div class="table-wrap datatable-wrap frame-browser-wrap">
-              <table class="datatable">
+            <VirtualTable
+              rows={timeline().intervals}
+              columnCount={6}
+              containerClass="table-wrap datatable-wrap frame-browser-wrap"
+              tableClass="datatable"
+              resetKey={timeline().frame_number}
+              header={
                 <thead>
                   <tr>
                     <th>Queue</th>
@@ -596,24 +602,21 @@ export function GpuPanel(props: {
                     <th>Duration</th>
                   </tr>
                 </thead>
-                <tbody>
-                  <For each={timeline().intervals.slice(0, 400)}>
-                    {(interval) => (
-                      <tr>
-                        <td class="mono">{interval.queue_id}</td>
-                        <td>
-                          <span class="pill">{interval.kind}</span>
-                        </td>
-                        <td class="mono">{interval.name}</td>
-                        <td class="mono">{formatCompact(interval.start_timestamp)}</td>
-                        <td class="mono">{formatCompact(interval.end_timestamp)}</td>
-                        <td class="mono">{formatCompact(interval.duration)}</td>
-                      </tr>
-                    )}
-                  </For>
-                </tbody>
-              </table>
-            </div>
+              }
+            >
+              {(interval) => (
+                <>
+                  <td class="mono">{interval.queue_id}</td>
+                  <td>
+                    <span class="pill">{interval.kind}</span>
+                  </td>
+                  <td class="mono">{interval.name}</td>
+                  <td class="mono">{formatCompact(interval.start_timestamp)}</td>
+                  <td class="mono">{formatCompact(interval.end_timestamp)}</td>
+                  <td class="mono">{formatCompact(interval.duration)}</td>
+                </>
+              )}
+            </VirtualTable>
           </section>
         )}
       </Show>
@@ -1088,7 +1091,7 @@ export function MemoryPanel(props: { dash: Dash; window: WindowAcc }) {
           eyebrow="LLM"
           title={
             props.window().active
-              ? "LLM tag values in brush cycles"
+              ? "LLM tag values in selected cycles"
               : "Latest LLM tag values"
           }
           data={llmValues()}

@@ -12,6 +12,7 @@ import {
 } from "../../lib/percentiles";
 import { formatNumber } from "../../lib/format";
 import type { CorrelatedFrameSummary } from "../../lib/types";
+import { VirtualTable } from "../VirtualTable";
 
 export function buildFrameMetricRows(
   frames: CorrelatedFrameSummary[],
@@ -157,8 +158,21 @@ export function FramePercentileTable(props: {
           <p class="chart-empty">No correlated CPU-frame costs in this window.</p>
         }
       >
-        <div class="percentile-table-wrap">
-          <table class="percentile-table">
+        <VirtualTable
+          rows={sorted()}
+          columnCount={columns().length + 3}
+          containerClass="percentile-table-wrap"
+          tableClass="percentile-table"
+          resetKey={`${sorted().length}\0${sortKey()}\0${sortDir()}`}
+          getRowKey={(row) => row.id}
+          rowProps={(row) => ({
+            classList: {
+              clickable: props.onSelectMetric != null,
+              selected: props.selectedMetric === row.id,
+            },
+            onClick: () => props.onSelectMetric?.(row.id),
+          })}
+          header={
             <thead>
               <tr>
                 <th scope="col">Metric</th>
@@ -185,42 +199,36 @@ export function FramePercentileTable(props: {
                 <th scope="col">Budget</th>
               </tr>
             </thead>
-            <tbody>
-              <For each={sorted()}>
-                {(row) => (
-                  <tr
-                    classList={{
-                      clickable: props.onSelectMetric != null,
-                      selected: props.selectedMetric === row.id,
-                    }}
-                    onClick={() => props.onSelectMetric?.(row.id)}
+          }
+        >
+          {(row) => (
+            <>
+              <th scope="row">
+                {row.name}
+                <span class="muted unit"> {row.unit}</span>
+              </th>
+              <td>{row.samples}</td>
+              <For each={columns()}>
+                {(key) => (
+                  <td
+                    class={budgetClass(
+                      row.percentiles[key],
+                      row.budget,
+                    )}
                   >
-                    <th scope="row">
-                      {row.name}
-                      <span class="muted unit"> {row.unit}</span>
-                    </th>
-                    <td>{row.samples}</td>
-                    <For each={columns()}>
-                      {(key) => (
-                        <td
-                          class={budgetClass(
-                            row.percentiles[key],
-                            row.budget,
-                          )}
-                        >
-                          {formatNumber(row.percentiles[key], row.unit === "ms" ? 2 : 1)}
-                        </td>
-                      )}
-                    </For>
-                    <td class="muted">
-                      {row.budget > 0 ? formatNumber(row.budget, 2) : "—"}
-                    </td>
-                  </tr>
+                    {formatNumber(
+                      row.percentiles[key],
+                      row.unit === "ms" ? 2 : 1,
+                    )}
+                  </td>
                 )}
               </For>
-            </tbody>
-          </table>
-        </div>
+              <td class="muted">
+                {row.budget > 0 ? formatNumber(row.budget, 2) : "—"}
+              </td>
+            </>
+          )}
+        </VirtualTable>
       </Show>
     </section>
   );

@@ -1,49 +1,113 @@
 import type { FrameSelection } from "./frame-selection";
 import type { CorrelatedFrameSummary, CpuScopeSummary } from "./types";
 
+export type AnalysisSelection =
+  | { kind: "frames"; range: FrameSelection }
+  | { kind: "cycles"; startCycle: number; endCycle: number };
+
 export type AnalysisWindow = {
-  /** Frames included in the current brush (or all frames when unset). */
+  /** Frames included in the current selection (or all frames when unset). */
   frames: CorrelatedFrameSummary[];
   startFrame: number | null;
   endFrame: number | null;
   startCycle: number | null;
   endCycle: number | null;
-  /** True when the brush narrowed the capture. */
+  /** True when the selection narrowed the capture. */
   active: boolean;
-  selection: FrameSelection | null;
+  selection: AnalysisSelection | null;
 };
 
 export function analysisWindowFromFrameSelection(
   allFrames: CorrelatedFrameSummary[],
   selection: FrameSelection | null,
 ): AnalysisWindow {
+  return analysisWindowFromSelection(
+    allFrames,
+    selection == null ? null : { kind: "frames", range: selection },
+  );
+}
+
+export function analysisWindowFromSelection(
+  allFrames: CorrelatedFrameSummary[],
+  selection: AnalysisSelection | null,
+): AnalysisWindow {
   if (allFrames.length === 0) {
     return {
       frames: [],
-      startFrame: selection?.startFrame ?? null,
-      endFrame: selection?.endFrame ?? null,
-      startCycle: null,
-      endCycle: null,
+      startFrame: selection?.kind === "frames" ? selection.range.startFrame : null,
+      endFrame: selection?.kind === "frames" ? selection.range.endFrame : null,
+      startCycle: selection?.kind === "cycles" ? selection.startCycle : null,
+      endCycle: selection?.kind === "cycles" ? selection.endCycle : null,
       active: selection != null,
       selection,
     };
   }
 
-  const frames = selection
-    ? allFrames.filter(
-        (frame) =>
-          frame.frame_number >= selection.startFrame &&
-          frame.frame_number <= selection.endFrame,
-      )
-    : allFrames;
-  const active =
-    selection != null &&
-    (selection.startFrame > allFrames[0].frame_number ||
-      selection.endFrame < allFrames[allFrames.length - 1].frame_number);
+  const capture = frameBounds(allFrames);
+  const active = selectionIsNarrowerThanCapture(selection, capture);
+  const frames =
+    active && selection != null
+      ? allFrames.filter((frame) => frameMatchesSelection(frame, selection))
+      : allFrames;
 
+  const selected = frameBounds(frames);
+
+  return {
+    frames,
+    startFrame:
+      selection?.kind === "frames" ? selection.range.startFrame : selected.startFrame,
+    endFrame: selection?.kind === "frames" ? selection.range.endFrame : selected.endFrame,
+    startCycle:
+      active && selection?.kind === "cycles" ? selection.startCycle : selected.startCycle,
+    endCycle: active && selection?.kind === "cycles" ? selection.endCycle : selected.endCycle,
+    active,
+    selection: active ? selection : null,
+  };
+}
+
+export function frameSelectionForAnalysisSelection(
+  frames: readonly {
+    frame_number: number;
+    begin_cycle: number;
+    end_cycle: number;
+  }[],
+  selection: AnalysisSelection | null,
+): FrameSelection | null {
+  if (selection == null) return null;
+  if (selection.kind === "frames") return selection.range;
+
+  let startFrame: number | null = null;
+  let endFrame: number | null = null;
+  for (const frame of frames) {
+    if (
+      frame.end_cycle < selection.startCycle ||
+      frame.begin_cycle > selection.endCycle
+    ) {
+      continue;
+    }
+    startFrame =
+      startFrame == null ? frame.frame_number : Math.min(startFrame, frame.frame_number);
+    endFrame = endFrame == null ? frame.frame_number : Math.max(endFrame, frame.frame_number);
+  }
+  return startFrame == null || endFrame == null ? null : { startFrame, endFrame };
+}
+
+type FrameBounds = {
+  startFrame: number | null;
+  endFrame: number | null;
+  startCycle: number | null;
+  endCycle: number | null;
+};
+
+function frameBounds(frames: readonly CorrelatedFrameSummary[]): FrameBounds {
+  let startFrame: number | null = null;
+  let endFrame: number | null = null;
   let startCycle: number | null = null;
   let endCycle: number | null = null;
   for (const frame of frames) {
+    startFrame =
+      startFrame == null ? frame.frame_number : Math.min(startFrame, frame.frame_number);
+    endFrame = endFrame == null ? frame.frame_number : Math.max(endFrame, frame.frame_number);
     if (frame.cpu_begin_cycle != null) {
       startCycle =
         startCycle == null
@@ -57,16 +121,46 @@ export function analysisWindowFromFrameSelection(
           : Math.max(endCycle, frame.cpu_end_cycle);
     }
   }
+  return { startFrame, endFrame, startCycle, endCycle };
+}
 
-  return {
-    frames,
-    startFrame: selection?.startFrame ?? frames[0]?.frame_number ?? null,
-    endFrame: selection?.endFrame ?? frames[frames.length - 1]?.frame_number ?? null,
-    startCycle,
-    endCycle,
-    active,
-    selection: active ? selection : null,
-  };
+function selectionIsNarrowerThanCapture(
+  selection: AnalysisSelection | null,
+  capture: FrameBounds,
+): boolean {
+  if (selection == null) return false;
+  if (selection.kind === "frames") {
+    return (
+      capture.startFrame == null ||
+      capture.endFrame == null ||
+      selection.range.startFrame > capture.startFrame ||
+      selection.range.endFrame < capture.endFrame
+    );
+  }
+  return (
+    capture.startCycle == null ||
+    capture.endCycle == null ||
+    selection.startCycle > capture.startCycle ||
+    selection.endCycle < capture.endCycle
+  );
+}
+
+function frameMatchesSelection(
+  frame: CorrelatedFrameSummary,
+  selection: AnalysisSelection,
+): boolean {
+  if (selection.kind === "frames") {
+    return (
+      frame.frame_number >= selection.range.startFrame &&
+      frame.frame_number <= selection.range.endFrame
+    );
+  }
+  return (
+    frame.cpu_begin_cycle != null &&
+    frame.cpu_end_cycle != null &&
+    frame.cpu_end_cycle >= selection.startCycle &&
+    frame.cpu_begin_cycle <= selection.endCycle
+  );
 }
 
 export function cycleInWindow(

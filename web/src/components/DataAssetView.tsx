@@ -13,6 +13,7 @@ import {
   type PropertyRow,
 } from "../lib/datatable";
 import type { AssetSummary } from "../lib/types";
+import { VirtualTable } from "./VirtualTable";
 
 type DataAssetViewProps = {
   asset: AssetSummary;
@@ -67,6 +68,8 @@ export function DataAssetView(props: DataAssetViewProps) {
     getFilteredRowModel: getFilteredRowModel(),
   });
 
+  const rows = () => table.getRowModel().rows;
+
   return (
     <section class="panel datatable-panel dataasset-panel">
       <header class="datatable-head">
@@ -100,8 +103,20 @@ export function DataAssetView(props: DataAssetViewProps) {
         when={data().length > 0}
         fallback={<p class="chart-empty">DataAsset decoded with zero properties.</p>}
       >
-        <div class="table-wrap datatable-wrap">
-          <table class="datatable dataasset-table">
+        <VirtualTable
+          rows={rows()}
+          columnCount={table.getVisibleLeafColumns().length}
+          containerClass="table-wrap datatable-wrap"
+          tableClass="datatable dataasset-table"
+          resetKey={`${rows().length}\0${globalFilter()}\0${JSON.stringify(sorting())}`}
+          getRowKey={(row) => row.id}
+          rowProps={(row) => ({
+            classList: {
+              "prop-nested": row.original.depth > 0,
+              "prop-struct": row.original.isStruct,
+            },
+          })}
+          header={
             <thead>
               <For each={table.getHeaderGroups()}>
                 {(headerGroup) => (
@@ -136,44 +151,35 @@ export function DataAssetView(props: DataAssetViewProps) {
                 )}
               </For>
             </thead>
-            <tbody>
-              <For each={table.getRowModel().rows}>
-                {(row) => {
-                  const depth = row.original.depth;
-                  return (
-                    <tr
-                      classList={{
-                        "prop-nested": depth > 0,
-                        "prop-struct": row.original.isStruct,
-                      }}
-                    >
-                      <For each={row.getVisibleCells()}>
-                        {(cell) => (
-                          <td
-                            classList={{
-                              "prop-name": cell.column.id === "name",
-                              "prop-type": cell.column.id === "type",
-                              "prop-value": cell.column.id === "value",
-                              mono: true,
-                            }}
-                            data-depth={cell.column.id === "name" ? depth : undefined}
-                            title={
-                              cell.column.id === "name"
-                                ? row.original.path
-                                : cell.getValue<string>() || undefined
-                            }
-                          >
-                            {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                          </td>
-                        )}
-                      </For>
-                    </tr>
-                  );
-                }}
-              </For>
-            </tbody>
-          </table>
-        </div>
+          }
+        >
+          {(row) => (
+            <For each={row.getVisibleCells()}>
+              {(cell) => (
+                <td
+                  classList={{
+                    "prop-name": cell.column.id === "name",
+                    "prop-type": cell.column.id === "type",
+                    "prop-value": cell.column.id === "value",
+                    mono: true,
+                  }}
+                  data-depth={
+                    cell.column.id === "name"
+                      ? row.original.depth
+                      : undefined
+                  }
+                  title={
+                    cell.column.id === "name"
+                      ? row.original.path
+                      : cell.getValue<string>() || undefined
+                  }
+                >
+                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                </td>
+              )}
+            </For>
+          )}
+        </VirtualTable>
       </Show>
     </section>
   );

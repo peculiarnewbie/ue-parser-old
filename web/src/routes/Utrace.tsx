@@ -19,7 +19,10 @@ import {
 } from "../components/utrace/FramePercentileTable";
 import { StatCard } from "../components/utrace/SortableTable";
 import {
-  analysisWindowFromFrameSelection,
+  analysisWindowFromSelection,
+  cyclesToMs,
+  frameSelectionForAnalysisSelection,
+  type AnalysisSelection,
   type AnalysisWindow,
 } from "../lib/analysis-range";
 import type { FrameSelection } from "../lib/frame-selection";
@@ -58,6 +61,7 @@ import {
 import {
   formatCompact,
   formatGpuCost,
+  formatNumber,
   gpuCostUnit,
 } from "../lib/format";
 import type {
@@ -130,8 +134,8 @@ export default function UtracePage() {
   const [threadFilter, setThreadFilter] = createSignal("");
   const [scopeSearch, setScopeSearch] = createSignal("");
   const [tab, setTab] = createSignal<WorkbenchTab>("overview");
-  /** Chart-local navigation state. It never filters analysis or changes a query range. */
-  const [chartNavigation, setChartNavigation] = createSignal<FrameSelection | null>(null);
+  const [analysisSelection, setAnalysisSelection] =
+    createSignal<AnalysisSelection | null>(null);
   const [frameMetric, setFrameMetric] = createSignal<FrameYMetric>("frame_ms");
   const [frameTypeFilter, setFrameTypeFilter] =
     createSignal<TraceFrameTypeFilter>("game");
@@ -241,9 +245,27 @@ export default function UtracePage() {
     return time === "—" ? label : `${label} · ${time}`;
   };
   const analysisWindow = createMemo((): AnalysisWindow =>
-    analysisWindowFromFrameSelection(frames(), null),
+    analysisWindowFromSelection(frames(), analysisSelection()),
+  );
+  const chartSelection = createMemo((): FrameSelection | null =>
+    frameSelectionForAnalysisSelection(
+      chartFrames(),
+      analysisWindow().selection,
+    ),
   );
   const visibleFrames = createMemo(() => analysisWindow().frames);
+  const analysisWindowDuration = createMemo(() => {
+    const window = analysisWindow();
+    if (window.startCycle == null || window.endCycle == null) return null;
+    const durationCycles = Math.max(0, window.endCycle - window.startCycle);
+    const milliseconds = cyclesToMs(
+      durationCycles,
+      dash()?.prologue?.cycle_frequency,
+    );
+    return milliseconds == null
+      ? `${formatNumber(durationCycles, 0)} cycles`
+      : `${formatNumber(milliseconds, 2)} ms`;
+  });
   const frameBudgetMs = createMemo(() => 1000 / targetFps());
   const triage = createMemo(() =>
     triageFrameMarkers({
@@ -308,8 +330,12 @@ export default function UtracePage() {
       id: `cpu-${index}-${interval.thread_id}-${interval.start_cycle}`,
       lane: names.get(interval.thread_id) ?? `thread ${interval.thread_id}`,
       label: interval.rendered_name ?? interval.name,
+      sourceLabel: interval.name,
       start: interval.start_cycle,
       end: interval.end_cycle,
+      threadId: interval.thread_id,
+      specId: interval.spec_id,
+      metadataId: interval.metadata_id,
       durationLabel:
         interval.duration_seconds != null
           ? `${(interval.duration_seconds * 1000).toFixed(3)} ms`
@@ -317,12 +343,54 @@ export default function UtracePage() {
     }));
   });
 
-  const onChartNavigationChange = (selection: FrameSelection | null) => {
-    setChartNavigation(selection);
+  const applyChartSelection = (
+    selection: FrameSelection | null,
+  ): AnalysisWindow => {
+    const next: AnalysisSelection | null =
+      selection == null ? null : { kind: "frames", range: selection };
+    const nextWindow = analysisWindowFromSelection(frames(), next);
+    setAnalysisSelection(next);
+    setSelectedFrame(null);
+    setSelectedMarker(null);
+    setTimelineDetail(null);
+    setGpuTimeline(null);
+    setTimelineTiming(null);
+    setGpuTiming(null);
+    setRangeStart(nextWindow.startCycle == null ? "" : String(nextWindow.startCycle));
+    setRangeEnd(nextWindow.endCycle == null ? "" : String(nextWindow.endCycle));
+    return nextWindow;
   };
 
-  const onChartNavigationClear = () => {
-    setChartNavigation(null);
+  const onChartSelectionChange = (selection: FrameSelection | null) => {
+    applyChartSelection(selection);
+  };
+
+  const onChartSelectionCommit = (selection: FrameSelection | null) => {
+    const nextWindow = applyChartSelection(selection);
+    if (
+      nextWindow.active &&
+      nextWindow.startCycle != null &&
+      nextWindow.endCycle != null
+    ) {
+      void loadCaptureTimeline({
+        start_cycle: nextWindow.startCycle,
+        end_cycle: nextWindow.endCycle,
+        thread: parseOptionalUnsigned(threadFilter()),
+        search: scopeSearch().trim() || undefined,
+      });
+    }
+  };
+
+  const clearAnalysisSelection = () => {
+    setAnalysisSelection(null);
+    setSelectedFrame(null);
+    setSelectedMarker(null);
+    setTimelineDetail(null);
+    setGpuTimeline(null);
+    setRangeStart("");
+    setRangeEnd("");
+    setTimelineTiming(null);
+    setGpuTiming(null);
   };
 
   const tabDefs = createMemo(() => {
@@ -469,7 +537,7 @@ export default function UtracePage() {
     setThreadFilter("");
     setScopeSearch("");
     setTab("overview");
-    setChartNavigation(null);
+    clearAnalysisSelection();
     setFrameMetric("frame_ms");
     setFrameTypeFilter("game");
     setLoadTiming(null);
@@ -709,6 +777,10 @@ export default function UtracePage() {
     frameNumber: number,
     sourceDashboard = dashboard(),
   ) => {
+    setAnalysisSelection({
+      kind: "frames",
+      range: { startFrame: frameNumber, endFrame: frameNumber },
+    });
     const summary = sourceDashboard?.dashboard.frame_correlation.frames.find(
       (frame) => frame.frame_number === frameNumber,
     );
@@ -734,6 +806,11 @@ export default function UtracePage() {
   const loadMarkerTimeline = async (marker: FrameTimingSummary) => {
     setSelectedFrame(null);
     setSelectedMarker(marker);
+    setAnalysisSelection({
+      kind: "cycles",
+      startCycle: marker.begin_cycle,
+      endCycle: marker.end_cycle,
+    });
     setRangeStart(String(marker.begin_cycle));
     setRangeEnd(String(marker.end_cycle));
     setTab("frames");
@@ -769,6 +846,7 @@ export default function UtracePage() {
     }
     setSelectedFrame(null);
     setSelectedMarker(null);
+    setAnalysisSelection({ kind: "cycles", startCycle, endCycle });
     setTab("frames");
     await loadCaptureTimeline({
       start_cycle: startCycle,
@@ -783,6 +861,7 @@ export default function UtracePage() {
     setRangeEnd(String(end));
     setSelectedFrame(null);
     setSelectedMarker(null);
+    setAnalysisSelection({ kind: "cycles", startCycle: start, endCycle: end });
     setTab("frames");
     await loadCaptureTimeline({
       start_cycle: start,
@@ -869,10 +948,10 @@ export default function UtracePage() {
                 ? `${frameTypeLabel(frame.frame_type)} #${frame.frame_number}`
                 : `#${frame.frame_number}`
             }
-            selection={chartNavigation()}
-            onSelectionChange={onChartNavigationChange}
-            onSelectionCommit={onChartNavigationChange}
-            onSelectionClear={onChartNavigationClear}
+            selection={chartSelection()}
+            onSelectionChange={onChartSelectionChange}
+            onSelectionCommit={onChartSelectionCommit}
+            onSelectionClear={clearAnalysisSelection}
             metric={frameMetric()}
             onMetricChange={setFrameMetric}
             height={300}
@@ -1101,6 +1180,48 @@ export default function UtracePage() {
             </nav>
 
             <main class="analyzer-workspace">
+            <Show when={analysisWindow().selection}>
+              {(selection) => {
+                const selectionLabel = () => {
+                  const value = selection();
+                  return value.kind === "frames"
+                    ? `Frames ${formatNumber(value.range.startFrame, 0)}–${formatNumber(value.range.endFrame, 0)}`
+                    : `Cycles ${formatNumber(value.startCycle, 0)}–${formatNumber(value.endCycle, 0)}`;
+                };
+                return (
+                  <section
+                    class="analysis-range-bar"
+                    aria-label="Shared analysis range"
+                    aria-live="polite"
+                    data-analysis-range
+                  >
+                    <div class="analysis-range-signal" aria-hidden="true" />
+                    <div class="analysis-range-copy">
+                      <span>
+                        Shared {selection().kind === "frames" ? "frame" : "cycle"} range
+                      </span>
+                      <strong>{selectionLabel()}</strong>
+                    </div>
+                    <div class="analysis-range-context">
+                      <span>
+                        {analysisWindow().frames.length} correlated{" "}
+                        {analysisWindow().frames.length === 1 ? "frame" : "frames"}
+                      </span>
+                      <Show when={analysisWindowDuration()}>
+                        {(duration) => <span>{duration()}</span>}
+                      </Show>
+                    </div>
+                    <button
+                      type="button"
+                      class="btn ghost compact"
+                      onClick={clearAnalysisSelection}
+                    >
+                      Clear range
+                    </button>
+                  </section>
+                );
+              }}
+            </Show>
             <Show when={tab() === "overview" && dash()}>
               <div class="panel-stack">
                 <FramePercentileTable
@@ -1149,10 +1270,10 @@ export default function UtracePage() {
                         ? `${frameTypeLabel(frame.frame_type)} #${frame.frame_number}`
                         : `#${frame.frame_number}`
                     }
-                    selection={chartNavigation()}
-                    onSelectionChange={onChartNavigationChange}
-                    onSelectionCommit={onChartNavigationChange}
-                    onSelectionClear={onChartNavigationClear}
+                    selection={chartSelection()}
+                    onSelectionChange={onChartSelectionChange}
+                    onSelectionCommit={onChartSelectionCommit}
+                    onSelectionClear={clearAnalysisSelection}
                     metric={frameMetric()}
                     onMetricChange={setFrameMetric}
                     height={300}
@@ -1213,6 +1334,7 @@ export default function UtracePage() {
                       end={timeline().end_cycle}
                       cycleFrequency={dashResult.dashboard.prologue?.cycle_frequency}
                       truncated={timeline().truncated}
+                      totalIntervalCount={timeline().interval_count}
                       intervals={cpuTimelineIntervals()}
                       empty="No CPU intervals match this capture range and filter."
                     />
