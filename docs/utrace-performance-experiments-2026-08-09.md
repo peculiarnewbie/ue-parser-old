@@ -32,6 +32,7 @@ also retains phase durations and medians for every repetition.
 | Raise Rayon cap from 16 to 24 | Finish median regressed from 1,943 to 2,283 ms; process-to-timeline regressed by 609 ms | Reverted. The metadata-stack discovery makes this capture's worker-count result inconclusive. |
 | Replay `MetadataStack` events in physical thread order during parallel CPU aggregation | The capture's 265 `ClearScope` and one `SaveStack` events had disabled the parallel path. Enabling their thread-local replay reduced native finish from 1,358 to 878 ms and the ten-sample browser CPU aggregation median from 933 to 541 ms. | Retained. Serial and parallel dashboard JSON were byte-for-byte equivalent after newline normalization (10,395,737 characters; SHA-256 `511049F5B9A7417E2A726194EEDECAD0FF4712058B51B4B00F4AEFF5C1429F54`). |
 | Resolve GPU event variants and fixed-field layouts once per UID | Nine native release samples reduced finish from 905 to 805 ms; the variant-only midpoint was 872 ms. Across two five-launch browser runs, normal dispatch moved from 744 ms before GPU routing to 731.5 ms with variant routing and 722.5 ms with cached layouts. | Retained. Required field existence, declared size, range, and payload bounds remain checked when each event is decoded. Dashboard JSON still matched the 10,395,737-character reference and SHA-256 exactly. |
+| Select bounded per-frame CPU and GPU rankings before allocating names | Native probes attributed 58–61 ms of provider finalization to frame correlation. Exact top-5/top-8 selection reduced that slice to 15–18 ms and the nine-sample native finish median from 805 to 783 ms. Two five-launch browser runs reduced provider finalization from 263.5 to 127.5 ms and finish from 1,684 to 1,649.5 ms. | Retained. A regression test compares bounded selection with the previous full-sort ordering, and the real dashboard length and SHA-256 remain exact. Cold file-to-dashboard and process-to-timeline medians were effectively flat in these samples. |
 
 ## Retained result
 
@@ -60,3 +61,13 @@ improvement, not as a demonstrated cold end-to-end browser win. Provider
 finalization is the next target, but the rejected experiments show that
 reducing passes or hash lookups is not sufficient by itself: locality and
 concurrent memory pressure must be measured explicitly.
+
+Provider-finalization probes then isolated CPU summary projection at roughly
+66–72 ms native and frame correlation at 58–61 ms; all other provider groups
+rounded to zero on this capture. Bounded ranking moved frame correlation to
+15–18 ms. Its combined ten-sample browser provider-finalization median was
+127.5 ms, down 136 ms (51.6%), while finish plus serialization moved to
+1,649.5 ms. The simultaneous dispatch and CPU-aggregation medians were noisier,
+so file-to-dashboard (3,366 ms) and process-to-timeline (5,465 ms) stayed flat.
+The next optimization target should therefore be CPU summary projection or a
+new dispatch sub-profile, not the already-small provider dashboards.

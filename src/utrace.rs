@@ -5666,23 +5666,29 @@ fn cap_gpu_frame_summaries(summaries: &mut Vec<GpuFrameSummary>, max_frames: usi
 fn gpu_frame_top_breadcrumbs(
     totals: &BTreeMap<String, (u64, u64)>,
 ) -> Vec<GpuFrameBreadcrumbSummary> {
-    let mut summaries = totals
-        .iter()
+    const LIMIT: usize = 8;
+    let mut candidates = totals.iter().collect::<Vec<_>>();
+    let compare = |left: &(&String, &(u64, u64)), right: &(&String, &(u64, u64))| {
+        right
+            .1
+            .1
+            .cmp(&left.1.1)
+            .then_with(|| right.1.0.cmp(&left.1.0))
+            .then_with(|| left.0.cmp(right.0))
+    };
+    if candidates.len() > LIMIT {
+        candidates.select_nth_unstable_by(LIMIT, compare);
+        candidates.truncate(LIMIT);
+    }
+    candidates.sort_unstable_by(compare);
+    candidates
+        .into_iter()
         .map(|(name, &(count, total_cycles))| GpuFrameBreadcrumbSummary {
             name: name.clone(),
             count,
             total_cycles,
         })
-        .collect::<Vec<_>>();
-    summaries.sort_by(|left, right| {
-        right
-            .total_cycles
-            .cmp(&left.total_cycles)
-            .then_with(|| right.count.cmp(&left.count))
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    summaries.truncate(8);
-    summaries
+        .collect()
 }
 
 fn gpu_queue_summaries(queues: BTreeMap<u32, GpuQueueState>) -> Vec<GpuQueueSummary> {
@@ -5922,10 +5928,7 @@ fn frame_correlation_dashboard(
                 gpu_breadcrumb_cycles: 0,
                 top_gpu_breadcrumbs: Vec::new(),
             });
-        frame.top_cpu_scopes = scope_summaries(totals, specs, cycle_frequency)
-            .into_iter()
-            .take(5)
-            .collect();
+        frame.top_cpu_scopes = top_scope_summaries(totals, specs, cycle_frequency, 5);
     }
     let mut breadcrumb_totals = BTreeMap::<u32, BTreeMap<String, (u64, u64)>>::new();
     for gpu_frame in gpu_frames {
@@ -8544,18 +8547,7 @@ fn scope_summaries(
     let mut scopes = totals
         .into_iter()
         .map(|(spec_id, (count, total_cycles))| {
-            let name = spec_by_id
-                .get(&spec_id)
-                .map(|spec| spec.name.clone())
-                .unwrap_or_else(|| format!("#{spec_id}"));
-            CpuScopeSummary {
-                spec_id,
-                name,
-                count,
-                total_cycles,
-                total_seconds: cycle_frequency
-                    .map(|frequency| total_cycles as f64 / frequency as f64),
-            }
+            cpu_scope_summary(spec_id, count, total_cycles, spec_by_id, cycle_frequency)
         })
         .collect::<Vec<_>>();
     scopes.sort_by(|left, right| {
@@ -8565,6 +8557,49 @@ fn scope_summaries(
             .then_with(|| left.spec_id.cmp(&right.spec_id))
     });
     scopes
+}
+
+fn top_scope_summaries(
+    totals: FxHashMap<u32, (u64, u64)>,
+    spec_by_id: &BTreeMap<u32, CpuScopeSpec>,
+    cycle_frequency: Option<u64>,
+    limit: usize,
+) -> Vec<CpuScopeSummary> {
+    let mut candidates = totals.into_iter().collect::<Vec<_>>();
+    let compare = |left: &(u32, (u64, u64)), right: &(u32, (u64, u64))| {
+        right.1.1.cmp(&left.1.1).then_with(|| left.0.cmp(&right.0))
+    };
+    if candidates.len() > limit {
+        candidates.select_nth_unstable_by(limit, compare);
+        candidates.truncate(limit);
+    }
+    candidates.sort_unstable_by(compare);
+    candidates
+        .into_iter()
+        .map(|(spec_id, (count, total_cycles))| {
+            cpu_scope_summary(spec_id, count, total_cycles, spec_by_id, cycle_frequency)
+        })
+        .collect()
+}
+
+fn cpu_scope_summary(
+    spec_id: u32,
+    count: u64,
+    total_cycles: u64,
+    spec_by_id: &BTreeMap<u32, CpuScopeSpec>,
+    cycle_frequency: Option<u64>,
+) -> CpuScopeSummary {
+    let name = spec_by_id
+        .get(&spec_id)
+        .map(|spec| spec.name.clone())
+        .unwrap_or_else(|| format!("#{spec_id}"));
+    CpuScopeSummary {
+        spec_id,
+        name,
+        count,
+        total_cycles,
+        total_seconds: cycle_frequency.map(|frequency| total_cycles as f64 / frequency as f64),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -11959,6 +11994,55 @@ mod tests {
         assert_eq!(dashboard.frames.len(), 2);
         assert_eq!(dashboard.frames[0].frame_number, 1);
         assert_eq!(dashboard.frames[1].frame_number, 2);
+    }
+
+    #[test]
+    fn bounded_frame_rankings_match_full_sort_order() {
+        let scope_totals = (0..12_u32)
+            .map(|spec_id| {
+                (
+                    spec_id,
+                    (u64::from(spec_id % 3 + 1), u64::from(11 - spec_id)),
+                )
+            })
+            .collect::<FxHashMap<_, _>>();
+        let expected_scopes = scope_summaries(scope_totals.clone(), &BTreeMap::new(), Some(10))
+            .into_iter()
+            .take(5)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            top_scope_summaries(scope_totals, &BTreeMap::new(), Some(10), 5),
+            expected_scopes
+        );
+
+        let breadcrumb_totals = (0..12_u32)
+            .map(|index| {
+                (
+                    format!("Breadcrumb {index:02}"),
+                    (u64::from(index % 4 + 1), u64::from((index * 7) % 11)),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut expected_breadcrumbs = breadcrumb_totals
+            .iter()
+            .map(|(name, &(count, total_cycles))| GpuFrameBreadcrumbSummary {
+                name: name.clone(),
+                count,
+                total_cycles,
+            })
+            .collect::<Vec<_>>();
+        expected_breadcrumbs.sort_by(|left, right| {
+            right
+                .total_cycles
+                .cmp(&left.total_cycles)
+                .then_with(|| right.count.cmp(&left.count))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        expected_breadcrumbs.truncate(8);
+        assert_eq!(
+            gpu_frame_top_breadcrumbs(&breadcrumb_totals),
+            expected_breadcrumbs
+        );
     }
 
     #[test]
