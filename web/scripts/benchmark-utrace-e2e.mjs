@@ -117,33 +117,43 @@ if (!values["browser-only"]) {
   };
 }
 
-const browserFirstTimelineMs =
-  browser.medians_ms.load_to_dashboard_paint +
-  browser.medians_ms.frame_to_timeline_paint;
+const browserApplication = browser.application_medians_ms;
+const browserDiagnostics = browser.diagnostic_medians_ms;
+const browserApplicationToFirstTimelineMs =
+  browserApplication.load_to_dashboard_paint +
+  browserApplication.timers_tab_paint +
+  browserApplication.frame_to_timeline_paint;
 const report = {
-  schema_version: 2,
+  schema_version: 3,
   status: "ok",
   trace: tracePath,
   repeat_count: repeatCount,
+  measurement_policy: {
+    primary_scope: "application",
+    excluded_from_comparison: [
+      "browser_process_launch",
+      "page_navigation_and_empty_app_paint",
+      "playwright_action_and_polling_intervals",
+      "unreal_process_to_timers_ready",
+    ],
+  },
   milestones: {
-    browser_launch_to_app_ready:
-      "Fresh Chromium launch request through process connection, page creation, navigation, visible file input, and two animation frames. The already-running web server is outside the sample.",
-    browser_app_ready_to_dashboard_paint:
-      "Painted empty application through automated file selection, trace analysis, state commit, and painted dashboard.",
-    browser_dashboard_to_first_timeline_paint:
-      "Painted dashboard through Timers navigation, worst-marker selection, retained query, state commit, and painted SVG timeline.",
-    browser_launch_to_dashboard_paint:
-      "Fresh Chromium launch request through application startup, file selection, trace analysis, state commit, and painted dashboard.",
-    browser_launch_to_first_timeline_paint:
-      "Fresh Chromium launch request through application startup, trace analysis, worst-frame timer query, state commit, and painted SVG timeline.",
+    browser_process_launch_diagnostic:
+      "Chromium launch request through process connection. Retained as a diagnostic and excluded from application comparisons.",
+    browser_page_startup_diagnostic:
+      "Connected Chromium through context/page creation, navigation, visible file input, and two animation frames. Retained as a diagnostic and excluded from application comparisons.",
     browser_load_to_dashboard_paint:
       "File selection through stream, WASM analysis, state commit, and two animation frames.",
-    browser_load_through_first_timeline_paint:
-      "Painted dashboard plus worst-frame timer query, state commit, and painted SVG timeline.",
+    browser_timers_tab_paint:
+      "Timers click handler through Solid mount and two animation frames. Includes chart and frame-table construction.",
+    browser_timeline_load:
+      "Worst-marker handler through retained query, state commit, and two animation frames for the SVG timeline.",
+    browser_application_through_first_timeline_paint:
+      "Sum of the in-page file-load, Timers-tab-paint, and timeline-load spans. Browser startup plus automation intervals between handlers are excluded.",
     unreal_analysis:
       "Unreal Insights' own 'Analysis has completed in' duration; excludes process startup.",
-    unreal_process_to_timers_ready:
-      "Process launch until the first Timers aggregated-stats completion log. This is a frontend-data-ready proxy, not a Slate paint event.",
+    unreal_process_to_timers_ready_diagnostic:
+      "Process launch until the first Timers aggregated-stats completion log. Retained as a diagnostic, not used for ratios, and not a Slate paint event.",
   },
   browser,
   unreal,
@@ -151,45 +161,42 @@ const report = {
     unreal == null
       ? null
       : {
-          browser_load_to_dashboard_over_unreal_analysis:
-            browser.medians_ms.load_to_dashboard_paint / unreal.medians_ms.analysis,
-          browser_launch_to_dashboard_over_unreal_process_to_timers_ready:
-            browser.medians_ms.browser_launch_to_dashboard_paint /
-            unreal.medians_ms.process_to_timers_ready,
-          browser_launch_through_first_timeline_over_unreal_process_to_timers_ready:
-            browser.medians_ms.browser_launch_to_timeline_paint /
-            unreal.medians_ms.process_to_timers_ready,
+          browser_finish_and_serialize_over_unreal_analysis:
+            browserApplication.wasm_finish_and_serialize / unreal.medians_ms.analysis,
+          browser_file_to_dashboard_over_unreal_analysis:
+            browserApplication.load_to_dashboard_paint / unreal.medians_ms.analysis,
         },
 };
 const reportPath = resolve(outputDirectory, "comparison.json");
 await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 
-console.log(`Browser dashboard paint median: ${formatMs(browser.medians_ms.load_to_dashboard_paint)}`);
-if (browser.medians_ms.wasm_finish_phases) {
+console.log(`Browser file → dashboard median: ${formatMs(browserApplication.load_to_dashboard_paint)}`);
+if (browserApplication.wasm_finish_phases) {
   console.log(
-    `  finish dispatch ${formatMs(browser.medians_ms.wasm_finish_phases.normal_event_dispatch)}, ` +
-      `CPU aggregation ${formatMs(browser.medians_ms.wasm_finish_phases.cpu_aggregation)}, ` +
-      `provider finalize ${formatMs(browser.medians_ms.wasm_finish_phases.provider_finalize)}`,
+    `  finish dispatch ${formatMs(browserApplication.wasm_finish_phases.normal_event_dispatch)}, ` +
+      `CPU aggregation ${formatMs(browserApplication.wasm_finish_phases.cpu_aggregation)}, ` +
+      `provider finalize ${formatMs(browserApplication.wasm_finish_phases.provider_finalize)}`,
   );
 }
-console.log(`Browser through first timeline paint: ${formatMs(browserFirstTimelineMs)}`);
-console.log(`Browser process launch median: ${formatMs(browser.medians_ms.browser_launch)}`);
 console.log(
-  `Browser process → app ready median: ${formatMs(browser.medians_ms.browser_launch_to_app_ready)}`,
+  `Browser Timers tab paint median: ${formatMs(browserApplication.timers_tab_paint)}`,
 );
 console.log(
-  `Browser app ready → dashboard median: ${formatMs(browser.medians_ms.app_ready_to_dashboard_paint)}`,
+  `Browser timeline query → paint median: ${formatMs(browserApplication.frame_to_timeline_paint)}`,
 );
 console.log(
-  `Browser dashboard → first timeline median: ${formatMs(browser.medians_ms.dashboard_to_timeline_paint)}`,
+  `Browser application through first timeline paint: ${formatMs(browserApplicationToFirstTimelineMs)}`,
 );
 console.log(
-  `Browser process → first timeline paint median: ${formatMs(browser.medians_ms.browser_launch_to_timeline_paint)}`,
+  `[diagnostic, excluded] Browser process launch: ${formatMs(browserDiagnostics.browser_process_launch)}`,
+);
+console.log(
+  `[diagnostic, excluded] Page navigation + empty paint: ${formatMs(browserDiagnostics.page_navigation_and_empty_app_paint)}`,
 );
 if (unreal) {
   console.log(`Unreal analysis median: ${formatMs(unreal.medians_ms.analysis)}`);
   console.log(
-    `Unreal process → Timers data median: ${formatMs(unreal.medians_ms.process_to_timers_ready)}`,
+    `[diagnostic, excluded] Unreal process → Timers data: ${formatMs(unreal.medians_ms.process_to_timers_ready)}`,
   );
 }
 console.log(`Report: ${reportPath}`);
@@ -282,23 +289,28 @@ function requireFile(path, label) {
 }
 
 function requireBrowserReport(value) {
-  if (value?.schema_version !== 2 || value?.status !== "ok") {
-    throw new Error("browser performance report is not a successful schema v2 report");
+  if (value?.schema_version !== 3 || value?.status !== "ok") {
+    throw new Error("browser performance report is not a successful schema v3 report");
   }
-  const requiredMedians = [
-    "browser_launch",
-    "app_navigation_and_paint",
-    "browser_launch_to_app_ready",
-    "app_ready_to_dashboard_paint",
-    "dashboard_to_timeline_paint",
-    "browser_launch_to_dashboard_paint",
-    "browser_launch_to_timeline_paint",
+  const requiredApplicationMedians = [
     "load_to_dashboard_paint",
+    "timers_tab_paint",
     "frame_to_timeline_paint",
   ];
-  for (const name of requiredMedians) {
-    if (!Number.isFinite(value.medians_ms?.[name])) {
-      throw new Error(`browser performance report is missing median: ${name}`);
+  for (const name of requiredApplicationMedians) {
+    if (!Number.isFinite(value.application_medians_ms?.[name])) {
+      throw new Error(`browser performance report is missing application median: ${name}`);
+    }
+  }
+  const requiredDiagnosticMedians = [
+    "browser_process_launch",
+    "page_navigation_and_empty_app_paint",
+    "dashboard_to_timers_tab_paint",
+    "timers_tab_to_timeline_paint",
+  ];
+  for (const name of requiredDiagnosticMedians) {
+    if (!Number.isFinite(value.diagnostic_medians_ms?.[name])) {
+      throw new Error(`browser performance report is missing diagnostic median: ${name}`);
     }
   }
   return value;

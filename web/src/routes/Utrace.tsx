@@ -403,6 +403,37 @@ export default function UtracePage() {
     ];
   });
 
+  const selectWorkbenchTab = (next: WorkbenchTab) => {
+    if (next !== "frames" || tab() === next) {
+      setTab(next);
+      return;
+    }
+    const paintSpan = beginUtraceSpan({
+      name: UTRACE_SPAN.timersTabPaint,
+      domain: "render",
+      attributes: {
+        "utrace.frame_count": visibleFrames().length,
+        "utrace.chart_frame_count": chartFrames().length,
+      },
+    });
+    setTab(next);
+    void afterNextPaint().then(
+      () => {
+        endUtraceSpan(paintSpan, {
+          attributes: {
+            "render.frame_row_count": document.querySelectorAll(
+              "[data-utrace-frame-row]",
+            ).length,
+            "render.svg_count": document.querySelectorAll(
+              "[data-utrace-timers-tab] svg",
+            ).length,
+          },
+        });
+      },
+      (error: unknown) => endUtraceSpan(paintSpan, { error }),
+    );
+  };
+
   const onFile = async (next: File) => {
     setBusy(true);
     cancelActiveLoad();
@@ -1058,7 +1089,7 @@ export default function UtracePage() {
                     type="button"
                     class="workbench-tab"
                     classList={{ active: tab() === item.id }}
-                    onClick={() => setTab(item.id)}
+                    onClick={() => selectWorkbenchTab(item.id)}
                   >
                     <span>{item.label}</span>
                     <Show when={item.badge}>
@@ -1076,12 +1107,17 @@ export default function UtracePage() {
                   frames={visibleFrames()}
                   cycleFrequency={dashResult.dashboard.prologue?.cycle_frequency}
                 />
-                <OverviewPanel dash={() => dash()!} window={analysisWindow} inventory={inventory} onOpenFrames={() => setTab("frames")} />
+                <OverviewPanel
+                  dash={() => dash()!}
+                  window={analysisWindow}
+                  inventory={inventory}
+                  onOpenFrames={() => selectWorkbenchTab("frames")}
+                />
               </div>
             </Show>
 
             <Show when={tab() === "frames"}>
-              <div class="panel-stack">
+              <div class="panel-stack" data-utrace-timers-tab>
                 <section class="panel frame-chart-panel">
                   <div class="chart-frame-head" style={{ "margin-bottom": "0.75rem" }}>
                     <div class="chart-frame-titles">

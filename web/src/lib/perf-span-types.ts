@@ -5,6 +5,7 @@ export const UTRACE_SPAN = {
   jsonDecode: "browser.json.decode",
   dashboardStateCommit: "browser.dashboard.state_commit",
   dashboardPaint: "browser.dashboard.paint",
+  timersTabPaint: "browser.timers_tab.paint",
   timelineLoad: "utrace.timeline.load",
   timelineStateCommit: "browser.timeline.state_commit",
   timelinePaint: "browser.timeline.paint",

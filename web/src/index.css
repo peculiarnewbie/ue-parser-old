@@ -749,6 +749,20 @@ th {
   font-size: 0.85rem;
 }
 
+.datatable-virtual-status {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  padding-top: 0.9rem;
+  font-size: 0.78rem;
+}
+
+.datatable-virtual-status p {
+  margin: 0;
+}
+
 .datatable-filter input:focus {
   outline: 1px solid var(--amber);
   border-color: rgba(226, 162, 58, 0.55);
@@ -871,6 +885,33 @@ th {
 
 .frame-browser-wrap {
   max-height: min(40vh, 360px);
+}
+
+.frame-browser-wrap .datatable {
+  table-layout: fixed;
+}
+
+.frame-browser-wrap .datatable tbody tr:not(.frame-virtual-spacer) {
+  height: 36px;
+}
+
+.frame-browser-wrap .datatable th:nth-child(1) {
+  width: 11%;
+}
+
+.frame-browser-wrap .datatable th:nth-child(2) {
+  width: 15%;
+}
+
+.frame-browser-wrap .datatable th:nth-child(3),
+.frame-browser-wrap .datatable th:nth-child(4),
+.frame-browser-wrap .datatable th:nth-child(5) {
+  width: 12%;
+}
+
+.frame-virtual-spacer td {
+  padding: 0;
+  border: 0;
 }
 
 .frame-summary h2 {

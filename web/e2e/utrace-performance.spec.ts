@@ -75,9 +75,24 @@ test.describe("UTrace browser performance", () => {
           .toBe(1);
         const dashboardReadyAt = performance.now();
 
+        const timersTabRequestedAt = performance.now();
         await page.getByRole("button", { name: /^Timers/ }).click();
         const worstMarker = page.getByRole("button", { name: /Worst marker/ });
         await expect(worstMarker).toBeEnabled();
+        await expect
+          .poll(async () =>
+            completedSpanCount(await browserSnapshot(page), UTRACE_SPAN.timersTabPaint),
+          )
+          .toBe(1);
+        const timersTabReadyAt = performance.now();
+        const frameRows = page.locator("[data-utrace-frame-row]");
+        await expect.poll(async () => frameRows.count()).toBeGreaterThan(0);
+        await expect.poll(async () => frameRows.count()).toBeLessThan(100);
+        await expect(
+          page.getByText(/[\d,]+ frames · scroll to browse the full capture/),
+        ).toBeVisible();
+
+        const markerRequestedAt = performance.now();
         await worstMarker.click();
         await expect(page.locator("[data-utrace-timeline-ready]")).toBeVisible();
         await expect(page.locator(".timer-bar").first()).toBeVisible();
@@ -108,19 +123,31 @@ test.describe("UTrace browser performance", () => {
 
         samples.push({
           run,
-          browser_launch_ms: roundMillis(browserConnectedAt - launchRequestedAt),
-          app_navigation_and_paint_ms: roundMillis(appReadyAt - browserConnectedAt),
-          browser_launch_to_app_ready_ms: roundMillis(appReadyAt - launchRequestedAt),
+          browser_process_launch_ms: roundMillis(browserConnectedAt - launchRequestedAt),
+          page_navigation_and_empty_app_paint_ms: roundMillis(
+            appReadyAt - browserConnectedAt,
+          ),
+          browser_process_to_app_ready_ms: roundMillis(appReadyAt - launchRequestedAt),
           app_ready_to_dashboard_paint_ms: roundMillis(dashboardReadyAt - appReadyAt),
+          dashboard_to_timers_tab_paint_ms: roundMillis(
+            timersTabReadyAt - timersTabRequestedAt,
+          ),
+          timers_tab_to_timeline_paint_ms: roundMillis(
+            timelineReadyAt - timersTabReadyAt,
+          ),
+          marker_request_to_timeline_paint_ms: roundMillis(
+            timelineReadyAt - markerRequestedAt,
+          ),
           dashboard_to_timeline_paint_ms: roundMillis(timelineReadyAt - dashboardReadyAt),
-          browser_launch_to_dashboard_paint_ms: roundMillis(
+          browser_process_to_dashboard_paint_ms: roundMillis(
             dashboardReadyAt - launchRequestedAt,
           ),
-          browser_launch_to_timeline_paint_ms: roundMillis(
+          browser_process_to_timeline_paint_ms: roundMillis(
             timelineReadyAt - launchRequestedAt,
           ),
           load_to_dashboard_paint_ms: onlyDuration(snapshot, UTRACE_SPAN.load),
           dashboard_paint_ms: onlyDuration(snapshot, UTRACE_SPAN.dashboardPaint),
+          timers_tab_paint_ms: onlyDuration(snapshot, UTRACE_SPAN.timersTabPaint),
           file_stream_ms: onlyDuration(snapshot, UTRACE_SPAN.fileStream),
           wasm_push_ms: summedDuration(snapshot, UTRACE_SPAN.sessionPush),
           wasm_finish_and_serialize_ms: onlyDuration(snapshot, UTRACE_SPAN.sessionFinish),
@@ -132,6 +159,40 @@ test.describe("UTrace browser performance", () => {
         });
 
         if (run === repeatCount) {
+          const frameScroller = page.locator(".frame-browser-wrap");
+          const frameCount = Number(
+            await frameScroller.getAttribute("data-utrace-frame-count"),
+          );
+          expect(frameCount).toBeGreaterThan(0);
+          await frameScroller.evaluate((element) => {
+            element.scrollTop = element.scrollHeight;
+          });
+          await expect
+            .poll(async () =>
+              frameRows.evaluateAll((elements) =>
+                Math.max(
+                  ...elements.map((element) =>
+                    Number(element.getAttribute("data-utrace-frame-virtual-index")),
+                  ),
+                ),
+              ),
+            )
+            .toBeGreaterThan(frameCount - 100);
+          await expect.poll(async () => frameRows.count()).toBeLessThan(100);
+          await frameScroller.evaluate((element) => {
+            element.scrollTop = 0;
+          });
+          await expect
+            .poll(async () =>
+              frameRows.evaluateAll((elements) =>
+                Math.min(
+                  ...elements.map((element) =>
+                    Number(element.getAttribute("data-utrace-frame-virtual-index")),
+                  ),
+                ),
+              ),
+            )
+            .toBe(0);
           lastChromeTrace = await page.evaluate(() =>
             (window as BenchmarkWindow).__UTRACE_BENCHMARK__.chromeTrace(),
           );
@@ -151,33 +212,23 @@ test.describe("UTrace browser performance", () => {
     if (!lastSnapshot) throw new Error("browser benchmark produced no samples");
     if (!lastChromeTrace) throw new Error("browser benchmark produced no Chrome trace");
     const result: BrowserPerformanceReport = {
-      schema_version: 2,
+      schema_version: 3,
       status: "ok",
       trace: tracePath!,
       repeat_count: repeatCount,
+      measurement_policy: {
+        primary_scope: "application",
+        excluded_from_primary: [
+          "browser_process_launch",
+          "page_navigation_and_empty_app_paint",
+          "playwright_action_and_polling_intervals",
+        ],
+      },
       samples,
-      medians_ms: {
-        browser_launch: median(samples.map((sample) => sample.browser_launch_ms)),
-        app_navigation_and_paint: median(
-          samples.map((sample) => sample.app_navigation_and_paint_ms),
-        ),
-        browser_launch_to_app_ready: median(
-          samples.map((sample) => sample.browser_launch_to_app_ready_ms),
-        ),
-        app_ready_to_dashboard_paint: median(
-          samples.map((sample) => sample.app_ready_to_dashboard_paint_ms),
-        ),
-        dashboard_to_timeline_paint: median(
-          samples.map((sample) => sample.dashboard_to_timeline_paint_ms),
-        ),
-        browser_launch_to_dashboard_paint: median(
-          samples.map((sample) => sample.browser_launch_to_dashboard_paint_ms),
-        ),
-        browser_launch_to_timeline_paint: median(
-          samples.map((sample) => sample.browser_launch_to_timeline_paint_ms),
-        ),
+      application_medians_ms: {
         load_to_dashboard_paint: median(samples.map((sample) => sample.load_to_dashboard_paint_ms)),
         dashboard_paint: median(samples.map((sample) => sample.dashboard_paint_ms)),
+        timers_tab_paint: median(samples.map((sample) => sample.timers_tab_paint_ms)),
         file_stream: median(samples.map((sample) => sample.file_stream_ms)),
         wasm_push: median(samples.map((sample) => sample.wasm_push_ms)),
         wasm_finish_and_serialize: median(
@@ -191,6 +242,38 @@ test.describe("UTrace browser performance", () => {
           samples.map((sample) => sample.timeline_query_and_serialize_ms),
         ),
         timeline_paint: median(samples.map((sample) => sample.timeline_paint_ms)),
+      },
+      diagnostic_medians_ms: {
+        browser_process_launch: median(
+          samples.map((sample) => sample.browser_process_launch_ms),
+        ),
+        page_navigation_and_empty_app_paint: median(
+          samples.map((sample) => sample.page_navigation_and_empty_app_paint_ms),
+        ),
+        browser_process_to_app_ready: median(
+          samples.map((sample) => sample.browser_process_to_app_ready_ms),
+        ),
+        app_ready_to_dashboard_paint: median(
+          samples.map((sample) => sample.app_ready_to_dashboard_paint_ms),
+        ),
+        dashboard_to_timers_tab_paint: median(
+          samples.map((sample) => sample.dashboard_to_timers_tab_paint_ms),
+        ),
+        timers_tab_to_timeline_paint: median(
+          samples.map((sample) => sample.timers_tab_to_timeline_paint_ms),
+        ),
+        marker_request_to_timeline_paint: median(
+          samples.map((sample) => sample.marker_request_to_timeline_paint_ms),
+        ),
+        dashboard_to_timeline_paint: median(
+          samples.map((sample) => sample.dashboard_to_timeline_paint_ms),
+        ),
+        browser_process_to_dashboard_paint: median(
+          samples.map((sample) => sample.browser_process_to_dashboard_paint_ms),
+        ),
+        browser_process_to_timeline_paint: median(
+          samples.map((sample) => sample.browser_process_to_timeline_paint_ms),
+        ),
       },
     };
     const reportPath = testInfo.outputPath("utrace-browser-performance.json");
@@ -225,15 +308,19 @@ test.describe("UTrace browser performance", () => {
 
 type BrowserPerformanceSample = {
   run: number;
-  browser_launch_ms: number;
-  app_navigation_and_paint_ms: number;
-  browser_launch_to_app_ready_ms: number;
+  browser_process_launch_ms: number;
+  page_navigation_and_empty_app_paint_ms: number;
+  browser_process_to_app_ready_ms: number;
   app_ready_to_dashboard_paint_ms: number;
+  dashboard_to_timers_tab_paint_ms: number;
+  timers_tab_to_timeline_paint_ms: number;
+  marker_request_to_timeline_paint_ms: number;
   dashboard_to_timeline_paint_ms: number;
-  browser_launch_to_dashboard_paint_ms: number;
-  browser_launch_to_timeline_paint_ms: number;
+  browser_process_to_dashboard_paint_ms: number;
+  browser_process_to_timeline_paint_ms: number;
   load_to_dashboard_paint_ms: number;
   dashboard_paint_ms: number;
+  timers_tab_paint_ms: number;
   file_stream_ms: number;
   wasm_push_ms: number;
   wasm_finish_and_serialize_ms: number;
@@ -251,21 +338,23 @@ type BrowserPerformanceSample = {
 };
 
 type BrowserPerformanceReport = {
-  schema_version: 2;
+  schema_version: 3;
   status: "ok";
   trace: string;
   repeat_count: number;
+  measurement_policy: {
+    primary_scope: "application";
+    excluded_from_primary: [
+      "browser_process_launch",
+      "page_navigation_and_empty_app_paint",
+      "playwright_action_and_polling_intervals",
+    ];
+  };
   samples: BrowserPerformanceSample[];
-  medians_ms: {
-    browser_launch: number;
-    app_navigation_and_paint: number;
-    browser_launch_to_app_ready: number;
-    app_ready_to_dashboard_paint: number;
-    dashboard_to_timeline_paint: number;
-    browser_launch_to_dashboard_paint: number;
-    browser_launch_to_timeline_paint: number;
+  application_medians_ms: {
     load_to_dashboard_paint: number;
     dashboard_paint: number;
+    timers_tab_paint: number;
     file_stream: number;
     wasm_push: number;
     wasm_finish_and_serialize: number;
@@ -273,6 +362,18 @@ type BrowserPerformanceReport = {
     frame_to_timeline_paint: number;
     timeline_query_and_serialize: number;
     timeline_paint: number;
+  };
+  diagnostic_medians_ms: {
+    browser_process_launch: number;
+    page_navigation_and_empty_app_paint: number;
+    browser_process_to_app_ready: number;
+    app_ready_to_dashboard_paint: number;
+    dashboard_to_timers_tab_paint: number;
+    timers_tab_to_timeline_paint: number;
+    marker_request_to_timeline_paint: number;
+    dashboard_to_timeline_paint: number;
+    browser_process_to_dashboard_paint: number;
+    browser_process_to_timeline_paint: number;
   };
 };
 

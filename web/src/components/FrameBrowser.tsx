@@ -6,8 +6,12 @@ import {
   type ColumnDef,
   type SortingState,
 } from "@tanstack/solid-table";
+import { createVirtualizer } from "@tanstack/solid-virtual";
 import { For, Show, createMemo, createSignal } from "solid-js";
 import type { CorrelatedFrameSummary } from "../lib/types";
+
+const FRAME_ROW_HEIGHT_PX = 36;
+const FRAME_ROW_OVERSCAN = 8;
 
 export type FrameRow = {
   frame_number: number;
@@ -69,6 +73,7 @@ export function FrameBrowser(props: FrameBrowserProps) {
   const [sorting, setSorting] = createSignal<SortingState>([
     { id: "cpu_s", desc: true },
   ]);
+  let tableContainer: HTMLDivElement | undefined;
 
   const data = createMemo(() =>
     toRows({ frames: props.frames, presentFrame: props.presentFrame }),
@@ -124,6 +129,22 @@ export function FrameBrowser(props: FrameBrowserProps) {
     getSortedRowModel: getSortedRowModel(),
   });
 
+  const rows = () => table.getRowModel().rows;
+  const rowVirtualizer = createVirtualizer<HTMLDivElement, HTMLTableRowElement>({
+    get count() {
+      return rows().length;
+    },
+    getScrollElement: () => tableContainer ?? null,
+    estimateSize: () => FRAME_ROW_HEIGHT_PX,
+    overscan: FRAME_ROW_OVERSCAN,
+  });
+  const virtualRows = () => rowVirtualizer.getVirtualItems();
+  const paddingTop = () => virtualRows()[0]?.start ?? 0;
+  const paddingBottom = () => {
+    const last = virtualRows().at(-1);
+    return last == null ? 0 : rowVirtualizer.getTotalSize() - last.end;
+  };
+
   return (
     <section class="panel">
       <header class="datatable-head">
@@ -136,7 +157,13 @@ export function FrameBrowser(props: FrameBrowserProps) {
           </p>
         </div>
       </header>
-      <div class="table-wrap datatable-wrap frame-browser-wrap">
+      <div
+        class="table-wrap datatable-wrap frame-browser-wrap"
+        data-utrace-frame-count={rows().length}
+        ref={(element) => {
+          tableContainer = element;
+        }}
+      >
         <table class="datatable">
           <thead>
             <For each={table.getHeaderGroups()}>
@@ -168,29 +195,51 @@ export function FrameBrowser(props: FrameBrowserProps) {
             </For>
           </thead>
           <tbody>
-            <For each={table.getRowModel().rows}>
-              {(row) => (
-                <tr
-                  classList={{
-                    clickable: true,
-                    selected: props.selectedFrame === row.original.frame_number,
-                    spike: row.original.spike,
-                  }}
-                  onClick={() => props.onSelect(row.original.frame_number)}
-                >
-                  <For each={row.getVisibleCells()}>
-                    {(cell) => (
-                      <td class="mono">
-                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                      </td>
-                    )}
-                  </For>
-                </tr>
-              )}
+            <Show when={paddingTop() > 0}>
+              <tr class="frame-virtual-spacer" aria-hidden="true">
+                <td colSpan={columns().length} style={{ height: `${paddingTop()}px` }} />
+              </tr>
+            </Show>
+            <For each={virtualRows()}>
+              {(virtualRow) => {
+                const row = () => rows()[virtualRow.index]!;
+                return (
+                  <tr
+                    data-utrace-frame-row
+                    data-utrace-frame-virtual-index={virtualRow.index}
+                    aria-rowindex={virtualRow.index + 2}
+                    classList={{
+                      clickable: true,
+                      selected: props.selectedFrame === row().original.frame_number,
+                      spike: row().original.spike,
+                    }}
+                    onClick={() => props.onSelect(row().original.frame_number)}
+                  >
+                    <For each={row().getVisibleCells()}>
+                      {(cell) => (
+                        <td class="mono">
+                          {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                        </td>
+                      )}
+                    </For>
+                  </tr>
+                );
+              }}
             </For>
+            <Show when={paddingBottom() > 0}>
+              <tr class="frame-virtual-spacer" aria-hidden="true">
+                <td colSpan={columns().length} style={{ height: `${paddingBottom()}px` }} />
+              </tr>
+            </Show>
           </tbody>
         </table>
       </div>
+      <footer class="datatable-virtual-status">
+        <p class="muted mono">
+          {data().length.toLocaleString()} frames · scroll to browse the full capture
+        </p>
+        <span class="muted">Visible rows render on demand</span>
+      </footer>
     </section>
   );
 }
