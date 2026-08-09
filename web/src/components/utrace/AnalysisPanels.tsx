@@ -1,6 +1,6 @@
 import { For, Show, createMemo, createSignal, type Accessor } from "solid-js";
 import type { ColumnDef } from "@tanstack/solid-table";
-import { DonutChart, HorizontalBars, LineSeriesChart } from "../Charts";
+import { CompositionBars, HorizontalBars, LineSeriesChart } from "../Charts";
 import { SortableTable, StatCard } from "./SortableTable";
 import {
   aggregateTopBreadcrumbs,
@@ -194,7 +194,7 @@ export function OverviewPanel(props: {
         <Show
           when={topGpu().length > 0}
           fallback={
-            <DonutChart
+            <CompositionBars
               title="Decoder coverage"
               subtitle="Declared event types by status"
               data={decodeCoverage()}
@@ -576,7 +576,7 @@ export function GpuPanel(props: {
       </Show>
       <Show when={props.gpuTimeline()}>
         {(timeline) => (
-          <section class="panel">
+          <section class="panel" data-utrace-gpu-timeline>
             <p class="eyebrow">GPU timeline</p>
             <h2>Frame {timeline().frame_number}</h2>
             <p class="muted datatable-meta">
@@ -767,7 +767,7 @@ export function MetricsPanel(props: { dash: Dash; window: WindowAcc }) {
           data={series()}
           xKey="time"
           height={260}
-          series={[{ key: "value", name: selected()!.name, class: "series-amber" }]}
+          series={[{ key: "value", name: selected()!.name }]}
         />
       </Show>
 
@@ -1656,7 +1656,7 @@ export function CapturePanel(props: {
       </div>
 
       <div class="chart-grid">
-        <DonutChart title="Decode coverage" data={decodeCoverage()} />
+        <CompositionBars title="Decode coverage" data={decodeCoverage()} />
         <HorizontalBars
           title="Hottest observed events"
           data={inventoryEvents()

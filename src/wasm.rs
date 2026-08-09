@@ -11,11 +11,98 @@ use crate::utrace_session::MAX_INPUT_BYTES;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
+use crate::utrace_session::ProgressiveFinishPhase;
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = performance, js_name = now)]
+    fn performance_now() -> f64;
+}
+
 #[cfg(feature = "wasm-uasset")]
 const MAX_UASSET_BYTES: usize = 256 * 1024 * 1024;
 #[cfg(feature = "wasm-uasset")]
 const UASSET_SCHEMA_VERSION: u32 = 6;
 const UTRACE_SCHEMA_VERSION: u32 = 2;
+const FINISH_PROFILE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WasmFinishPhase {
+    TransportFinalize,
+    Inventory,
+    EventRegistry,
+    ImportantEvents,
+    ProviderImportantEvents,
+    NormalEventDispatch,
+    CpuAggregation,
+    ProviderFinalize,
+    CpuTimelineFinalize,
+    GpuTimelineFinalize,
+    OutputConstruction,
+    JsonSerialize,
+}
+
+impl From<ProgressiveFinishPhase> for WasmFinishPhase {
+    fn from(value: ProgressiveFinishPhase) -> Self {
+        match value {
+            ProgressiveFinishPhase::TransportFinalize => Self::TransportFinalize,
+            ProgressiveFinishPhase::Inventory => Self::Inventory,
+            ProgressiveFinishPhase::EventRegistry => Self::EventRegistry,
+            ProgressiveFinishPhase::ImportantEvents => Self::ImportantEvents,
+            ProgressiveFinishPhase::ProviderImportantEvents => Self::ProviderImportantEvents,
+            ProgressiveFinishPhase::NormalEventDispatch => Self::NormalEventDispatch,
+            ProgressiveFinishPhase::CpuAggregation => Self::CpuAggregation,
+            ProgressiveFinishPhase::ProviderFinalize => Self::ProviderFinalize,
+            ProgressiveFinishPhase::CpuTimelineFinalize => Self::CpuTimelineFinalize,
+            ProgressiveFinishPhase::GpuTimelineFinalize => Self::GpuTimelineFinalize,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WasmFinishPhaseTiming {
+    phase: WasmFinishPhase,
+    started_ms: f64,
+    duration_ms: f64,
+}
+
+#[derive(Serialize)]
+struct WasmFinishProfile {
+    schema_version: u32,
+    phases: Vec<WasmFinishPhaseTiming>,
+}
+
+struct WasmFinishProfileBuilder {
+    cursor_ms: f64,
+    phases: Vec<WasmFinishPhaseTiming>,
+}
+
+impl WasmFinishProfileBuilder {
+    fn new() -> Self {
+        Self {
+            cursor_ms: performance_now(),
+            phases: Vec::with_capacity(12),
+        }
+    }
+
+    fn complete(&mut self, phase: WasmFinishPhase) {
+        let completed_ms = performance_now();
+        self.phases.push(WasmFinishPhaseTiming {
+            phase,
+            started_ms: self.cursor_ms,
+            duration_ms: (completed_ms - self.cursor_ms).max(0.0),
+        });
+        self.cursor_ms = completed_ms;
+    }
+
+    fn finish(self) -> WasmFinishProfile {
+        WasmFinishProfile {
+            schema_version: FINISH_PROFILE_SCHEMA_VERSION,
+            phases: self.phases,
+        }
+    }
+}
 
 #[cfg(feature = "wasm-uasset")]
 #[derive(Serialize)]
@@ -295,6 +382,7 @@ pub struct ProgressiveUtraceSession {
     last_frame_revision: u64,
     timeline_index: Option<crate::utrace::CpuMonotonicTimelineIndex>,
     gpu_timeline_index: Option<crate::utrace::GpuTimelineMemoryIndex>,
+    finish_profile: Option<WasmFinishProfile>,
 }
 
 #[wasm_bindgen]
@@ -326,6 +414,7 @@ impl ProgressiveUtraceSession {
             last_frame_revision: 0,
             timeline_index: None,
             gpu_timeline_index: None,
+            finish_profile: None,
         })
     }
 
@@ -381,8 +470,11 @@ impl ProgressiveUtraceSession {
             .take()
             .ok_or_else(|| JsValue::from_str("session already finished"))?;
         let progress = session.complete_progress(Some(self.total_bytes));
+        let mut finish_profile = WasmFinishProfileBuilder::new();
         let (dashboard, inventory, timeline_index, gpu_timeline_index) = session
-            .finish_with_inventory_and_monotonic_timeline_index()
+            .finish_with_inventory_and_monotonic_timeline_index_profiled(&mut |phase| {
+                finish_profile.complete(phase.into());
+            })
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let timeline_index_info = timeline_index.info().clone();
         self.timeline_index = Some(timeline_index);
@@ -405,7 +497,19 @@ impl ProgressiveUtraceSession {
             }),
             timeline_index: timeline_index_info,
         };
-        json(&event)
+        finish_profile.complete(WasmFinishPhase::OutputConstruction);
+        let output = json(&event);
+        finish_profile.complete(WasmFinishPhase::JsonSerialize);
+        self.finish_profile = Some(finish_profile.finish());
+        output
+    }
+
+    pub fn finish_profile(&self) -> Result<String, JsValue> {
+        json(
+            self.finish_profile
+                .as_ref()
+                .ok_or_else(|| JsValue::from_str("finish profile is not ready"))?,
+        )
     }
 
     pub fn analyzing(&mut self) -> Result<String, JsValue> {

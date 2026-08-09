@@ -1,6 +1,6 @@
 import { For, Show, createMemo, createSignal } from "solid-js";
 import { DropZone } from "../components/DropZone";
-import { DonutChart, HorizontalBars } from "../components/Charts";
+import { CompositionBars, HorizontalBars } from "../components/Charts";
 import { DataAssetView } from "../components/DataAssetView";
 import { DataTableView } from "../components/DataTableView";
 import { ParseRequestError, formatParseTiming, type ParseTiming } from "../lib/api";
@@ -141,7 +141,7 @@ export default function UassetPage() {
             </div>
 
             <div class="chart-grid">
-              <DonutChart
+              <CompositionBars
                 title="Decoded export kinds"
                 subtitle="Count of successfully decoded assets by adapter kind"
                 data={kindCounts()}

@@ -1,25 +1,15 @@
-import {
-  Axis,
-  AxisCrosshair,
-  AxisGrid,
-  AxisLabel,
-  AxisMark,
-  AxisTooltip,
-  Bar,
-  Brush,
-  type BrushProps,
-  type BrushRange,
-  Chart,
-  Legend,
-  Line,
-  Pie,
-} from "peculiar-charts";
+import { barX, colorLegend, defineChart, lineY } from "@tanstack/charts";
+import { tooltip } from "@tanstack/charts/tooltip";
+import { Chart } from "@tanstack/solid-charts";
+import { max } from "d3-array";
+import { scaleBand, scaleLinear, scaleOrdinal, scalePoint } from "d3-scale";
 import { For, Show, createMemo, createSignal, type JSX } from "solid-js";
 import { cyclesToMs } from "../lib/analysis-range";
 import { downsampleMinMax } from "../lib/chart-downsampling";
 import {
   brushForFrameSelection,
   frameSelectionFromBrush,
+  type BrushRange,
   type FrameSelection,
 } from "../lib/frame-selection";
 import type { FrameTimingSummary } from "../lib/types";
@@ -33,6 +23,8 @@ type ChartFrameProps = {
   hasData: boolean;
   actions?: JSX.Element;
 };
+
+const CHART_COLORS = ["#e1aa4e", "#8aaec4", "#7dbf8b", "#e07060", "#b59ad8"];
 
 export function ChartFrame(props: ChartFrameProps) {
   return (
@@ -68,109 +60,156 @@ export function HorizontalBars(props: {
   data: NamedValue[];
   valueLabel?: string;
 }) {
-  const data = () => props.data.slice(0, 12);
+  const data = createMemo(() => props.data.slice(0, 12));
+  const definition = createMemo(() => {
+    const rows = data();
+    const maximum = max(rows, (row) => row.value) ?? 1;
+    return defineChart(
+      {
+        marks: [
+          barX(rows, {
+            x: "value",
+            y: "name",
+            key: "name",
+            fill: CHART_COLORS[0],
+            radius: 3,
+            inset: 2,
+          }),
+        ],
+        x: {
+          scale: scaleLinear().domain([0, maximum]).nice(),
+          grid: true,
+          axis: { ticks: { count: 5, format: formatCompact } },
+        },
+        y: {
+          scale: scaleBand<string>()
+            .domain(rows.map((row) => row.name))
+            .paddingInner(0.18)
+            .paddingOuter(0.08),
+          reverse: true,
+          axis: {
+            ticks: { format: (value) => truncate(String(value), 28) },
+            tickLabels: { thin: false },
+          },
+        },
+      },
+      {
+        tooltip: {
+          use: tooltip,
+          format: (point) =>
+            `${props.valueLabel ?? "value"}: ${formatNumber(Number(point.xValue))}`,
+        },
+      },
+    );
+  });
+
   return (
     <ChartFrame title={props.title} subtitle={props.subtitle} hasData={data().length > 0}>
-      <Chart data={data()} barConfig={{ bandGap: "18%", barGap: "8%" }}>
-        <Axis axis="y" position="left" dataKey="name" type="band" tickCount={data().length}>
-          <AxisLabel class="tick-label" format={(value) => truncate(String(value), 28)} />
-        </Axis>
-        <Axis axis="x" position="bottom" type="linear">
-          <AxisGrid class="grid-line" />
-          <AxisMark class="tick-mark" />
-          <AxisLabel class="tick-label" />
-          <AxisCrosshair class="crosshair" />
-          <AxisTooltip>
-            {(payload) => (
-              <div class="pc-tooltip">
-                <div class="pc-tooltip-title">{String(payload.label ?? "")}</div>
-                <For each={payload.series}>
-                  {(item) => (
-                    <div class="pc-tooltip-row">
-                      <span>{props.valueLabel ?? item.name}</span>
-                      <strong>{formatNumber(Number(item.value))}</strong>
-                    </div>
-                  )}
-                </For>
-              </div>
-            )}
-          </AxisTooltip>
-        </Axis>
-        <Bar dataKey="value" class="series-amber-fill" layout="horizontal" rx={2} />
-      </Chart>
+      <Chart
+        definition={definition()}
+        height={260}
+        ariaLabel={`${props.title}. Horizontal comparison of ${data().length} values.`}
+      />
     </ChartFrame>
   );
 }
+
+type LineDatum = {
+  x: string;
+  series: string;
+  value: number;
+  key: string;
+};
 
 export function LineSeriesChart(props: {
   title: string;
   subtitle?: string;
   data: Record<string, string | number>[];
   xKey: string;
-  series: { key: string; class: string; name: string }[];
+  series: { key: string; name: string }[];
   height?: number;
 }) {
+  const rows = createMemo((): LineDatum[] =>
+    props.data.flatMap((datum, datumIndex) =>
+      props.series.flatMap((series) => {
+        const value = Number(datum[series.key]);
+        if (!Number.isFinite(value)) return [];
+        const x = String(datum[props.xKey] ?? datumIndex);
+        return [{ x, series: series.name, value, key: `${series.key}:${x}:${datumIndex}` }];
+      }),
+    ),
+  );
+  const definition = createMemo(() => {
+    const chartRows = rows();
+    const labels = [...new Set(chartRows.map((row) => row.x))];
+    const seriesNames = props.series.map((series) => series.name);
+    return defineChart(
+      {
+        marks: [
+          lineY(chartRows, {
+            x: "x",
+            y: "value",
+            z: "series",
+            color: "series",
+            key: "key",
+            strokeWidth: 2,
+            points: chartRows.length < 160,
+          }),
+        ],
+        x: {
+          scale: scalePoint<string>().domain(labels).padding(0.25),
+          axis: { ticks: { count: 8 }, tickLabels: { thin: { priority: "ends" } } },
+        },
+        y: {
+          scale: scaleLinear()
+            .domain([0, max(chartRows, (row) => row.value) ?? 1])
+            .nice(),
+          grid: true,
+          axis: { ticks: { count: 5, format: formatCompact } },
+        },
+        color: {
+          scale: scaleOrdinal(seriesNames, CHART_COLORS.slice(0, seriesNames.length)),
+          legend: colorLegend({ label: "Series", placement: "top" }),
+        },
+      },
+      {
+        tooltip: {
+          use: tooltip,
+          format: (point) => formatNumber(Number(point.yValue)),
+        },
+      },
+    );
+  });
+
   return (
     <ChartFrame
       title={props.title}
       subtitle={props.subtitle}
-      hasData={props.data.length > 0}
+      hasData={rows().length > 0}
       height={props.height ?? 280}
     >
-      <Chart data={props.data}>
-        <Legend class="pc-legend" />
-        <Axis axis="y" position="left" type="linear">
-          <AxisGrid class="grid-line" />
-          <AxisMark class="tick-mark" />
-          <AxisLabel class="tick-label" format={(v) => formatCompact(Number(v))} />
-        </Axis>
-        <Axis axis="x" position="bottom" dataKey={props.xKey} type="point" tickCount={8}>
-          <AxisMark class="tick-mark" />
-          <AxisLabel class="tick-label" />
-          <AxisCrosshair class="crosshair" />
-          <AxisTooltip>
-            {(payload) => (
-              <div class="pc-tooltip">
-                <div class="pc-tooltip-title">{String(payload.label ?? "")}</div>
-                <For each={payload.series}>
-                  {(item) => (
-                    <div class="pc-tooltip-row">
-                      <span>{item.name}</span>
-                      <strong>{formatNumber(Number(item.value))}</strong>
-                    </div>
-                  )}
-                </For>
-              </div>
-            )}
-          </AxisTooltip>
-        </Axis>
-        <For each={props.series}>
-          {(series) => (
-            <Line
-              dataKey={series.key}
-              name={series.name}
-              class={series.class}
-              stroke-width={2}
-            />
-          )}
-        </For>
-      </Chart>
+      <Chart
+        definition={definition()}
+        height={props.height ?? 280}
+        ariaLabel={`${props.title}. ${props.series.length} time series.`}
+      />
     </ChartFrame>
   );
 }
 
-export function DonutChart(props: {
+/** Ranked bars make trace-provider composition easier to compare than angles. */
+export function CompositionBars(props: {
   title: string;
   subtitle?: string;
   data: NamedValue[];
 }) {
   return (
-    <ChartFrame title={props.title} subtitle={props.subtitle} hasData={props.data.length > 0}>
-      <Chart data={props.data}>
-        <Legend class="pc-legend" />
-        <Pie dataKey="value" nameKey="name" innerRadius="55%" padAngle={0.04} />
-      </Chart>
-    </ChartFrame>
+    <HorizontalBars
+      title={props.title}
+      subtitle={props.subtitle}
+      data={[...props.data].sort((left, right) => right.value - left.value)}
+      valueLabel="count"
+    />
   );
 }
 
@@ -188,6 +227,21 @@ export type FramePoint = {
   gpu_submitted_work: number;
   begin_cycle: number;
   end_cycle: number;
+};
+
+type FrameSeriesDatum = {
+  index: number;
+  frame: string;
+  frame_number: number;
+  series: string;
+  value: number;
+  key: string;
+};
+
+type FrameSeries = {
+  key: "frame_ms" | "gpu_submitted_work_ms" | "gpu_submitted_work";
+  name: string;
+  color: string;
 };
 
 const METRIC_OPTIONS: { id: FrameYMetric; label: string }[] = [
@@ -261,19 +315,16 @@ export function FrameCostBrushChart(props: {
     }),
   );
 
-  const series = createMemo(() => {
+  const series = createMemo((): FrameSeries[] => {
     switch (metric()) {
       case "frame_ms":
-        return [
-          { key: "frame_ms", name: "Frame marker ms", class: "series-amber", yAxisId: "y" },
-        ];
+        return [{ key: "frame_ms", name: "Frame marker ms", color: CHART_COLORS[0] }];
       case "gpu_submitted_work_ms":
         return [
           {
             key: "gpu_submitted_work_ms",
             name: "GPU submitted work ms",
-            class: "series-steel",
-            yAxisId: "y",
+            color: CHART_COLORS[1],
           },
         ];
       case "gpu_submitted_work_cycles":
@@ -281,30 +332,24 @@ export function FrameCostBrushChart(props: {
           {
             key: "gpu_submitted_work",
             name: "GPU submitted work cycles",
-            class: "series-steel",
-            yAxisId: "y",
+            color: CHART_COLORS[1],
           },
         ];
       case "frame_gpu_ms":
       default:
         return [
-          { key: "frame_ms", name: "Frame marker ms", class: "series-amber", yAxisId: "y" },
+          { key: "frame_ms", name: "Frame marker ms", color: CHART_COLORS[0] },
           {
             key: canConvertGpu() ? "gpu_submitted_work_ms" : "gpu_submitted_work",
             name: canConvertGpu()
               ? "GPU submitted work ms"
               : "GPU submitted work cycles",
-            class: "series-steel",
-            yAxisId: canConvertGpu() ? "y" : "gpu",
+            color: CHART_COLORS[1],
           },
         ];
     }
   });
-
-  const dualAxis = createMemo(
-    () => metric() === "frame_gpu_ms" && !canConvertGpu(),
-  );
-
+  const dualUnits = createMemo(() => metric() === "frame_gpu_ms" && !canConvertGpu());
   const subtitle = createMemo(() => {
     if (metric() === "gpu_submitted_work_ms" || metric() === "gpu_submitted_work_cycles") {
       return "GPU submitted work is the sum of overlapping GPU intervals whose CPU submit time fell in the marker — not Insights GPU frame time.";
@@ -312,23 +357,46 @@ export function FrameCostBrushChart(props: {
     if (metric() === "frame_gpu_ms" && canConvertGpu()) {
       return "Frame marker ms is BeginFrame→EndFrame. GPU submitted work is a sum of scopes, not GPU frame duration.";
     }
-    if (dualAxis()) {
-      return "Drag the navigator to zoom this chart. GPU uses a second axis because this capture has no cycle frequency.";
+    if (dualUnits()) {
+      return "The capture has no cycle frequency, so milliseconds and GPU cycles are shown as aligned small multiples instead of a misleading dual axis.";
     }
-    return "BeginFrame→EndFrame marker duration (Insights Frames track). Drag the navigator to zoom; it does not change the CPU query range.";
+    return "BeginFrame→EndFrame marker duration (Insights Frames track). Use the range controls to focus this chart without changing the CPU query range.";
   });
 
-  // peculiar-charts BrushProps intersects SVG <g> onChange; narrow to the brush callbacks.
-  const brushHandlers = {
-    onChange: (range: BrushRange) =>
-      props.onSelectionChange?.(
-        frameSelectionFromBrush({ frameNumbers: frameNumbers(), brush: range }),
-      ),
-    onDragEnd: (range: BrushRange) =>
-      props.onSelectionCommit?.(
-        frameSelectionFromBrush({ frameNumbers: frameNumbers(), brush: range }),
-      ),
-  } as Pick<BrushProps, "onChange" | "onDragEnd">;
+  const rowsFor = (selectedSeries: readonly FrameSeries[]) =>
+    points().flatMap((point, index) =>
+      selectedSeries.map((item) => ({
+        index,
+        frame: point.frame,
+        frame_number: point.frame_number,
+        series: item.name,
+        value: point[item.key],
+        key: `${item.key}:${point.frame_number}:${index}`,
+      })),
+    );
+
+  const primarySeries = createMemo(() => (dualUnits() ? series().slice(0, 1) : series()));
+  const primaryRows = createMemo(() => rowsFor(primarySeries()));
+  const primaryDefinition = createMemo(() =>
+    createFrameDefinition(primaryRows(), primarySeries(), points()),
+  );
+  const secondarySeries = createMemo(() => (dualUnits() ? series().slice(1) : []));
+  const secondaryRows = createMemo(() => rowsFor(secondarySeries()));
+  const secondaryDefinition = createMemo(() =>
+    createFrameDefinition(secondaryRows(), secondarySeries(), points()),
+  );
+
+  const changeRange = (edge: "start" | "end", nextIndex: number, commit: boolean) => {
+    const current = brush();
+    if (!current) return;
+    const next: BrushRange =
+      edge === "start"
+        ? { startIndex: Math.min(nextIndex, current.endIndex), endIndex: current.endIndex }
+        : { startIndex: current.startIndex, endIndex: Math.max(nextIndex, current.startIndex) };
+    const selection = frameSelectionFromBrush({ frameNumbers: frameNumbers(), brush: next });
+    if (commit) props.onSelectionCommit?.(selection);
+    else props.onSelectionChange?.(selection);
+  };
 
   return (
     <ChartFrame
@@ -337,93 +405,136 @@ export function FrameCostBrushChart(props: {
       hasData={points().length > 0}
       height={props.height ?? 340}
       actions={
-        <div class="chart-metric-controls">
-          <label class="chart-metric-select">
-            <span>Y metric</span>
-            <select
-              value={metric()}
-              onChange={(event) =>
-                setMetric(event.currentTarget.value as FrameYMetric)
-              }
-            >
-              <For each={METRIC_OPTIONS}>
-                {(option) => <option value={option.id}>{option.label}</option>}
-              </For>
-            </select>
-          </label>
-          <Show when={props.selection}>
-            <button
-              type="button"
-              class="btn ghost compact"
-              onClick={() => props.onSelectionClear?.()}
-            >
-              Clear brush
-            </button>
-          </Show>
-        </div>
+        <label class="chart-metric-select">
+          <span>Y metric</span>
+          <select
+            value={metric()}
+            onChange={(event) => setMetric(event.currentTarget.value as FrameYMetric)}
+          >
+            <For each={METRIC_OPTIONS}>
+              {(option) => <option value={option.id}>{option.label}</option>}
+            </For>
+          </select>
+        </label>
       }
     >
-      <Chart data={points()} class="frame-cost-chart">
-        <Legend class="pc-legend" />
-        <Axis axis="y" axisId="y" position="left" type="linear">
-          <AxisGrid class="grid-line" />
-          <AxisMark class="tick-mark" />
-          <AxisLabel class="tick-label" format={(v) => formatCompact(Number(v))} />
-        </Axis>
-        <Show when={dualAxis()}>
-          <Axis axis="y" axisId="gpu" position="right" type="linear">
-            <AxisMark class="tick-mark" />
-            <AxisLabel class="tick-label" format={(v) => formatCompact(Number(v))} />
-          </Axis>
-        </Show>
-        <Axis axis="x" position="bottom" dataKey="frame" type="point" tickCount={10}>
-          <AxisMark class="tick-mark" />
-          <AxisLabel class="tick-label" />
-          <AxisCrosshair class="crosshair" />
-          <AxisTooltip>
-            {(payload) => (
-              <div class="pc-tooltip">
-                <div class="pc-tooltip-title">Marker {String(payload.label ?? "")}</div>
-                <For each={payload.series}>
-                  {(item) => (
-                    <div class="pc-tooltip-row">
-                      <span>{item.name}</span>
-                      <strong>{formatNumber(Number(item.value))}</strong>
-                    </div>
-                  )}
-                </For>
-              </div>
-            )}
-          </AxisTooltip>
-        </Axis>
-        <For each={series()}>
-          {(item) => (
-            <Line
-              dataKey={item.key}
-              name={item.name}
-              class={item.class}
-              yAxisId={item.yAxisId}
-              stroke-width={2}
-            />
-          )}
-        </For>
-        <Brush
-          class="pc-brush"
-          height={44}
-          gap={8}
-          handleWidth={6}
-          startIndex={brush()?.startIndex}
-          endIndex={brush()?.endIndex}
-          {...brushHandlers}
-        >
-          <Line
-            dataKey={series()[0]?.key ?? "frame_ms"}
-            class="series-amber"
-            stroke-width={1}
+      <div class="frame-chart-stack">
+        <Chart
+          definition={primaryDefinition()}
+          height={dualUnits() ? 190 : props.height ?? 300}
+          ariaLabel="Frame marker timing across the capture"
+        />
+        <Show when={dualUnits()}>
+          <Chart
+            definition={secondaryDefinition()}
+            height={150}
+            ariaLabel="GPU submitted work cycles across the capture"
           />
-        </Brush>
-      </Chart>
+        </Show>
+        <Show when={brush()} keyed>
+          {(range) => (
+            <div class="chart-range-editor" aria-label="Visible frame range">
+              <label>
+                <span>Range start</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={Math.max(0, frameNumbers().length - 1)}
+                  value={range.startIndex}
+                  onInput={(event) =>
+                    changeRange("start", Number(event.currentTarget.value), false)
+                  }
+                  onChange={(event) =>
+                    changeRange("start", Number(event.currentTarget.value), true)
+                  }
+                />
+                <output>{points()[range.startIndex]?.frame ?? "—"}</output>
+              </label>
+              <label>
+                <span>Range end</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={Math.max(0, frameNumbers().length - 1)}
+                  value={range.endIndex}
+                  onInput={(event) =>
+                    changeRange("end", Number(event.currentTarget.value), false)
+                  }
+                  onChange={(event) =>
+                    changeRange("end", Number(event.currentTarget.value), true)
+                  }
+                />
+                <output>{points()[range.endIndex]?.frame ?? "—"}</output>
+              </label>
+              <button
+                type="button"
+                class="btn ghost compact"
+                disabled={!props.selection}
+                onClick={() => props.onSelectionClear?.()}
+              >
+                Full capture
+              </button>
+            </div>
+          )}
+        </Show>
+      </div>
     </ChartFrame>
+  );
+}
+
+function createFrameDefinition(
+  rows: FrameSeriesDatum[],
+  series: readonly FrameSeries[],
+  points: readonly FramePoint[],
+) {
+  const upperIndex = Math.max(1, points.length - 1);
+  const labels = points.map((point) => point.frame);
+  const names = series.map((item) => item.name);
+  return defineChart(
+    {
+      marks: [
+        lineY(rows, {
+          x: "index",
+          y: "value",
+          z: "series",
+          color: "series",
+          key: "key",
+          strokeWidth: 2,
+          points: rows.length < 160,
+        }),
+      ],
+      x: {
+        scale: scaleLinear().domain([0, upperIndex]),
+        axis: {
+          ticks: {
+            count: 8,
+            format: (value) => labels[Math.round(Number(value))] ?? "",
+          },
+          tickLabels: { thin: { priority: "ends" } },
+        },
+      },
+      y: {
+        scale: scaleLinear()
+          .domain([0, max(rows, (row) => row.value) ?? 1])
+          .nice(),
+        grid: true,
+        axis: { ticks: { count: 5, format: formatCompact } },
+      },
+      color: {
+        scale: scaleOrdinal(
+          names,
+          series.map((item) => item.color),
+        ),
+        legend: colorLegend({ placement: "top" }),
+      },
+    },
+    {
+      tooltip: {
+        use: tooltip,
+        format: (point) => `${formatNumber(Number(point.yValue))}`,
+        formatGroup: (focused) => focused[0]?.datum.frame ?? "Frame",
+      },
+    },
   );
 }
 
@@ -455,8 +566,8 @@ function frameMetricValues(
   }
 }
 
-function truncate(value: string, max: number): string {
-  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+function truncate(value: string, maximum: number): string {
+  return value.length > maximum ? `${value.slice(0, maximum - 1)}…` : value;
 }
 
 function formatNumber(value: number): string {

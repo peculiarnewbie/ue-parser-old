@@ -1,4 +1,7 @@
-import type { BrushRange } from "peculiar-charts";
+export type BrushRange = {
+  startIndex: number;
+  endIndex: number;
+};
 
 /** A capture-stable selection, independent of whichever points a chart renders. */
 export type FrameSelection = {
@@ -31,8 +34,8 @@ export function brushForFrameSelection({
   selection: FrameSelection | null | undefined;
 }): BrushRange | undefined {
   if (frameNumbers.length === 0) return undefined;
-  // Controlled full-range keeps peculiar-charts' brush pinned as the series
-  // grows. Leaving indexes undefined freezes the zoom at the first mount length.
+  // A controlled full range keeps the semantic range editor pinned as the
+  // progressive series grows.
   if (!selection) {
     return { startIndex: 0, endIndex: frameNumbers.length - 1 };
   }

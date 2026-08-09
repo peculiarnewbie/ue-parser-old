@@ -3396,6 +3396,7 @@ pub(super) fn dashboard_from_decoded_with_timeline_index(
         timeline_index_builder.take(),
         None,
         None,
+        None,
     )?;
     let timeline_index = timeline_index_request.map(|(request, source)| TimelineIndexBuild {
         output: request.output.clone(),
@@ -3444,6 +3445,7 @@ pub(super) fn dashboard_from_decoded_with_memory_timeline_index(
         Some(builder),
         Some(gpu_builder),
         None,
+        None,
     )?;
     let index = builder
         .ok_or_else(|| {
@@ -3462,12 +3464,13 @@ pub(super) fn dashboard_from_decoded_with_memory_timeline_index(
     Ok((dashboard, index, gpu_index))
 }
 
-pub(super) fn dashboard_from_decoded_with_monotonic_timeline_index(
+pub(crate) fn dashboard_from_decoded_with_monotonic_timeline_index_profiled(
     header: TraceHeader,
     decoded: DecodedStreams,
     options: DashboardOptions,
     source: SourceIdentity,
     builder: CpuMonotonicTimelineBuilder,
+    phase_complete: &mut dyn FnMut(crate::utrace_session::ProgressiveFinishPhase),
 ) -> Result<
     (
         TraceDashboard,
@@ -3490,13 +3493,16 @@ pub(super) fn dashboard_from_decoded_with_monotonic_timeline_index(
         None,
         Some(gpu_builder),
         Some(builder),
+        Some(phase_complete),
     )?;
     let index = monotonic_timeline_builder
         .expect("monotonic timeline builder was supplied")
         .finish(source, cycle_frequency);
+    phase_complete(crate::utrace_session::ProgressiveFinishPhase::CpuTimelineFinalize);
     let gpu_index = gpu_index_builder
         .expect("GPU memory timeline builder was supplied")
         .finish();
+    phase_complete(crate::utrace_session::ProgressiveFinishPhase::GpuTimelineFinalize);
     Ok((dashboard, index, gpu_index))
 }
 
@@ -3515,9 +3521,18 @@ fn dashboard_from_decoded_with_timeline_builder(
     mut timeline_index_builder: Option<CpuTimelineIndexBuilder>,
     mut gpu_timeline_index_builder: Option<GpuTimelineIndexBuilder>,
     mut monotonic_timeline_builder: Option<CpuMonotonicTimelineBuilder>,
+    mut phase_complete: Option<&mut dyn FnMut(crate::utrace_session::ProgressiveFinishPhase)>,
 ) -> Result<DashboardTimelineBuild, TraceError> {
     let events = read_event_registry(&header, &decoded.streams)?;
+    notify_finish_phase(
+        &mut phase_complete,
+        crate::utrace_session::ProgressiveFinishPhase::EventRegistry,
+    );
     let decoded_importants = read_known_important_events(&header, &decoded.streams, &events)?;
+    notify_finish_phase(
+        &mut phase_complete,
+        crate::utrace_session::ProgressiveFinishPhase::ImportantEvents,
+    );
     let cycle_frequency = decoded_importants
         .prologue
         .as_ref()
@@ -3543,7 +3558,7 @@ fn dashboard_from_decoded_with_timeline_builder(
             &decoded_importants,
             decoded.summary.sync_count,
             DashboardDecodeOptions::full(options, decoded.serial_dispatch_hint),
-            DashboardTimelineSinks {
+            DashboardDecodeHooks {
                 cpu: cpu_timeline_sink
                     .as_mut()
                     .map(|sink| sink as &mut dyn CpuTimelineSink),
@@ -3554,6 +3569,7 @@ fn dashboard_from_decoded_with_timeline_builder(
                     .as_mut()
                     .map(|sink| sink as &mut dyn CpuTimelineCatalogSink),
                 monotonic_events: None,
+                phase_complete: phase_complete.take(),
             },
         )?
     };
@@ -3597,6 +3613,15 @@ fn dashboard_from_decoded_with_timeline_builder(
         monotonic_timeline_builder,
         cycle_frequency,
     })
+}
+
+fn notify_finish_phase(
+    observer: &mut Option<&mut dyn FnMut(crate::utrace_session::ProgressiveFinishPhase)>,
+    phase: crate::utrace_session::ProgressiveFinishPhase,
+) {
+    if let Some(observer) = observer.as_mut() {
+        (**observer)(phase);
+    }
 }
 
 fn trace_error_from_timeline_index_error(error: TimelineIndexError) -> TraceError {
@@ -3655,11 +3680,12 @@ pub fn build_cpu_timeline_index_with_source_identity(
         &decoded_importants,
         decoded.summary.sync_count,
         DashboardDecodeOptions::cpu_timeline_only(decoded.serial_dispatch_hint),
-        DashboardTimelineSinks {
+        DashboardDecodeHooks {
             cpu: Some(&mut index),
             gpu: None,
             monotonic_cpu: None,
             monotonic_events: None,
+            phase_complete: None,
         },
     )
     .map_err(trace_error_to_timeline_index_error)?;
@@ -3799,7 +3825,8 @@ fn read_known_important_events(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 enum DashboardEventKind {
-    Unknown = 0,
+    Ignored = 0,
+    Unmodeled,
     CpuProfilerMetadata,
     CpuProfilerEventBatchV3,
     CpuProfilerEndThread,
@@ -3826,8 +3853,11 @@ enum DashboardEventKind {
     SlateTraceAddWidget,
 }
 
-fn derive_dashboard_event_kind(logger: &str, event: &str) -> DashboardEventKind {
-    match (logger, event) {
+fn derive_dashboard_event_kind(event: &EventTypeInfo) -> DashboardEventKind {
+    if decode_status_for(event) == DecodeStatus::Raw {
+        return DashboardEventKind::Unmodeled;
+    }
+    match (event.logger.as_str(), event.event.as_str()) {
         ("CpuProfiler", "Metadata") => DashboardEventKind::CpuProfilerMetadata,
         ("CpuProfiler", "EventBatchV3") => DashboardEventKind::CpuProfilerEventBatchV3,
         ("CpuProfiler", "EndThread") => DashboardEventKind::CpuProfilerEndThread,
@@ -3862,24 +3892,25 @@ fn derive_dashboard_event_kind(logger: &str, event: &str) -> DashboardEventKind 
         ("LLM", "TagValue") => DashboardEventKind::LlmTagValue,
         ("MetadataStack", _) => DashboardEventKind::MetadataStack,
         ("SlateTrace", "AddWidget") => DashboardEventKind::SlateTraceAddWidget,
-        _ => DashboardEventKind::Unknown,
+        _ => DashboardEventKind::Ignored,
     }
 }
 
 fn dashboard_event_kinds(events: &[EventTypeInfo]) -> Vec<DashboardEventKind> {
     let max_uid = events.iter().map(|event| event.uid).max().unwrap_or(0);
-    let mut kinds = vec![DashboardEventKind::Unknown; usize::from(max_uid) + 1];
+    let mut kinds = vec![DashboardEventKind::Ignored; usize::from(max_uid) + 1];
     for event in events {
-        kinds[usize::from(event.uid)] = derive_dashboard_event_kind(&event.logger, &event.event);
+        kinds[usize::from(event.uid)] = derive_dashboard_event_kind(event);
     }
     kinds
 }
 
-struct DashboardTimelineSinks<'a> {
-    cpu: Option<&'a mut dyn CpuTimelineSink>,
-    gpu: Option<&'a mut dyn GpuTimelineSink>,
-    monotonic_cpu: Option<&'a mut dyn CpuTimelineCatalogSink>,
-    monotonic_events: Option<&'a mut dyn CpuMonotonicTimelineSink>,
+struct DashboardDecodeHooks<'sinks, 'observer> {
+    cpu: Option<&'sinks mut dyn CpuTimelineSink>,
+    gpu: Option<&'sinks mut dyn GpuTimelineSink>,
+    monotonic_cpu: Option<&'sinks mut dyn CpuTimelineCatalogSink>,
+    monotonic_events: Option<&'sinks mut dyn CpuMonotonicTimelineSink>,
+    phase_complete: Option<&'observer mut dyn FnMut(crate::utrace_session::ProgressiveFinishPhase)>,
 }
 
 fn read_dashboard_events(
@@ -3889,19 +3920,36 @@ fn read_dashboard_events(
     importants: &DecodedImportantEvents,
     sync_count: u64,
     decode_options: DashboardDecodeOptions,
-    timeline_sinks: DashboardTimelineSinks<'_>,
+    hooks: DashboardDecodeHooks<'_, '_>,
 ) -> Result<DecodedDashboardEvents, TraceError> {
-    if header.protocol < 5 {
-        return Ok(DecodedDashboardEvents::default());
-    }
-    let options = decode_options.dashboard;
-    let decode_scope = decode_options.scope;
-    let DashboardTimelineSinks {
+    let DashboardDecodeHooks {
         cpu: mut cpu_timeline_sink,
         gpu: gpu_timeline_index_sink,
         monotonic_cpu: mut monotonic_cpu_catalog_sink,
         monotonic_events: mut monotonic_cpu_timeline_sink,
-    } = timeline_sinks;
+        mut phase_complete,
+    } = hooks;
+    if header.protocol < 5 {
+        notify_finish_phase(
+            &mut phase_complete,
+            crate::utrace_session::ProgressiveFinishPhase::ProviderImportantEvents,
+        );
+        notify_finish_phase(
+            &mut phase_complete,
+            crate::utrace_session::ProgressiveFinishPhase::NormalEventDispatch,
+        );
+        notify_finish_phase(
+            &mut phase_complete,
+            crate::utrace_session::ProgressiveFinishPhase::CpuAggregation,
+        );
+        notify_finish_phase(
+            &mut phase_complete,
+            crate::utrace_session::ProgressiveFinishPhase::ProviderFinalize,
+        );
+        return Ok(DecodedDashboardEvents::default());
+    }
+    let options = decode_options.dashboard;
+    let decode_scope = decode_options.scope;
 
     let registry = events
         .iter()
@@ -3985,7 +4033,11 @@ fn read_dashboard_events(
             if !decode_scope.includes_important_event(event) {
                 continue;
             }
-            if decode_status_for(event) == DecodeStatus::Raw {
+            let kind = event_kinds
+                .get(usize::from(raw_event.uid))
+                .copied()
+                .unwrap_or(DashboardEventKind::Ignored);
+            if kind == DashboardEventKind::Unmodeled {
                 unmodeled_events.entry(event.uid).or_default().record(
                     event,
                     raw_event.data,
@@ -4230,6 +4282,10 @@ fn read_dashboard_events(
         }
     }
 
+    notify_finish_phase(
+        &mut phase_complete,
+        crate::utrace_session::ProgressiveFinishPhase::ProviderImportantEvents,
+    );
     let known_scope_ids = dense_cpu_scope_ids(&spec_by_id);
     let mut gpu_timeline_sink = match (gpu_timeline_collector.as_mut(), gpu_timeline_index_sink) {
         (Some(collector), Some(index)) => Some(GpuTimelineSinks::Both(GpuTimelineFanout::new(
@@ -4268,7 +4324,11 @@ fn read_dashboard_events(
             if !decode_scope.includes_normal_event(event) {
                 return Ok(());
             }
-            if decode_status_for(event) == DecodeStatus::Raw {
+            let kind = event_kinds
+                .get(usize::from(raw_event.uid))
+                .copied()
+                .unwrap_or(DashboardEventKind::Ignored);
+            if kind == DashboardEventKind::Unmodeled {
                 unmodeled_events.entry(event.uid).or_default().record(
                     event,
                     raw_event.data,
@@ -4276,10 +4336,6 @@ fn read_dashboard_events(
                 )?;
                 return Ok(());
             }
-            let kind = event_kinds
-                .get(usize::from(raw_event.uid))
-                .copied()
-                .unwrap_or(DashboardEventKind::Unknown);
             match kind {
                 DashboardEventKind::CpuProfilerMetadata => {
                     let mut record = decode_cpu_metadata_record(event, raw_event.data, 0)?;
@@ -4517,12 +4573,16 @@ fn read_dashboard_events(
                         .or_default()
                         .record(widget.cycle);
                 }
-                DashboardEventKind::Unknown => {}
+                DashboardEventKind::Ignored | DashboardEventKind::Unmodeled => {}
             }
             Ok(())
         },
     )?;
     decoded.dispatch = Some(dispatch_summary);
+    notify_finish_phase(
+        &mut phase_complete,
+        crate::utrace_session::ProgressiveFinishPhase::NormalEventDispatch,
+    );
 
     #[cfg(feature = "utrace-parallel")]
     if parallel_cpu_candidate {
@@ -4570,6 +4630,10 @@ fn read_dashboard_events(
         cpu_batch_thread_states.clear();
         metadata_stack_contexts.clear();
     }
+    notify_finish_phase(
+        &mut phase_complete,
+        crate::utrace_session::ProgressiveFinishPhase::CpuAggregation,
+    );
 
     decoded.cpu.batches.unterminated_scopes =
         decoded.cpu.batches.unterminated_scopes.saturating_add(
@@ -4695,6 +4759,10 @@ fn read_dashboard_events(
     decoded.unmodeled = unmodeled_trace_dashboard(unmodeled_events, &registry);
     decoded.session = session;
     decoded.frames.sort_by_key(|frame| frame.cycle);
+    notify_finish_phase(
+        &mut phase_complete,
+        crate::utrace_session::ProgressiveFinishPhase::ProviderFinalize,
+    );
     Ok(decoded)
 }
 
@@ -13577,9 +13645,19 @@ mod tests {
         // Anything not in the table is raw.
         let unknown = test_event_type(0, "NoSuchLogger", "NoSuchEvent", &[]);
         assert_eq!(decode_status_for(&unknown), DecodeStatus::Raw);
+        assert_eq!(
+            derive_dashboard_event_kind(&unknown),
+            DashboardEventKind::Unmodeled
+        );
         // Dynamic Cpu logger events are decoded generically rather than listed individually.
         let cpu = test_event_type(0, "Cpu", "Frame", &[]);
         assert_eq!(decode_status_for(&cpu), DecodeStatus::Partial);
+        assert_eq!(derive_dashboard_event_kind(&cpu), DashboardEventKind::Cpu);
+        let important_only = test_event_type(0, "$Trace", "NewTrace", &[]);
+        assert_eq!(
+            derive_dashboard_event_kind(&important_only),
+            DashboardEventKind::Ignored
+        );
     }
 
     #[test]

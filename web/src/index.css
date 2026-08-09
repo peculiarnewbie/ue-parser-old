@@ -183,6 +183,20 @@ code,
   font-family: var(--font-mono);
   font-size: 0.8rem;
   font-weight: 500;
+  cursor: pointer;
+  transition:
+    transform 140ms cubic-bezier(0.23, 1, 0.32, 1),
+    border-color 160ms ease,
+    background 160ms ease;
+}
+
+.btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .btn.primary {
@@ -259,6 +273,26 @@ code,
   margin: 0.55rem auto 0;
   max-width: 34rem;
   color: var(--muted);
+}
+
+.dropzone.compact {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  width: fit-content;
+  margin: 0 0 0.7rem auto;
+  padding: 0.45rem 0.7rem;
+  border-style: solid;
+  text-align: left;
+}
+
+.dropzone.compact .dropzone-kicker {
+  margin: 0;
+}
+
+.dropzone-compact-label {
+  color: var(--muted);
+  font-size: 0.72rem;
 }
 
 .banner {
@@ -439,26 +473,47 @@ code,
   letter-spacing: 0;
 }
 
-.frame-cost-chart {
-  overflow: visible;
+.frame-chart-stack {
+  display: grid;
+  gap: 0.55rem;
 }
 
-[data-pc-brush-bg] {
-  fill: rgba(255, 255, 255, 0.04);
+.chart-range-editor {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) minmax(12rem, 1fr) auto;
+  gap: 0.75rem;
+  align-items: end;
+  padding: 0.7rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #191d20;
 }
 
-[data-pc-brush-slide] {
-  fill: rgba(226, 162, 58, 0.22);
+.chart-range-editor label {
+  display: grid;
+  grid-template-columns: auto minmax(8rem, 1fr) auto;
+  gap: 0.55rem;
+  align-items: center;
+  color: var(--muted);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 
-[data-pc-brush-handle] {
-  fill: var(--amber);
-  stroke: rgba(16, 18, 20, 0.85);
-  stroke-width: 1;
+.chart-range-editor input {
+  min-width: 0;
+  accent-color: var(--amber);
+  cursor: ew-resize;
 }
 
-.pc-brush {
-  color: var(--amber);
+.chart-range-editor output {
+  min-width: 5.5rem;
+  overflow: hidden;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .toggle-group {
@@ -1748,78 +1803,54 @@ th {
   }
 }
 
-/* peculiar-charts hooks — unstyled SVG, we own the look */
-.series-amber {
-  stroke: var(--amber);
-  fill: none;
-  color: var(--amber);
-}
-
-.series-steel {
-  stroke: var(--steel);
-  fill: none;
-  color: var(--steel);
-}
-
-.series-amber-fill {
-  stroke: var(--amber);
-  fill: var(--amber);
-  color: var(--amber);
-}
-
-.series-steel-fill {
-  stroke: var(--steel);
-  fill: var(--steel);
-  color: var(--steel);
-}
-
-.grid-line {
-  stroke: rgba(232, 236, 239, 0.08);
-}
-
-.tick-mark {
-  stroke: rgba(232, 236, 239, 0.28);
-}
-
-.tick-label {
-  fill: var(--muted);
-  font-size: 10px;
-  font-family: var(--font-mono);
-}
-
-.crosshair {
-  stroke: rgba(226, 162, 58, 0.55);
-  stroke-dasharray: 3 3;
-}
-
-.pc-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-  margin-bottom: 0.35rem;
+/* TanStack Charts inherits this utility palette through currentColor and vars. */
+.ts-chart-host {
   color: var(--muted);
-  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  --ts-chart-1: var(--amber);
+  --ts-chart-2: var(--steel);
+  --ts-chart-3: var(--ok);
+  --ts-chart-4: var(--danger);
+  --ts-chart-5: #b59ad8;
+  --ts-chart-6: #79b8ae;
+  --ts-chart-focus-fill: var(--bg-panel);
+  --ts-chart-crosshair-marker-fill: var(--bg-panel);
+  --ts-chart-crosshair-label-halo: var(--bg-panel);
 }
 
-.pc-tooltip {
+.ts-chart-surface > svg {
+  display: block;
+  overflow: visible;
+}
+
+.ts-chart-tooltip {
+  z-index: 20;
+  max-width: 24rem;
   padding: 0.55rem 0.7rem;
   border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(16, 18, 20, 0.94);
-  box-shadow: var(--shadow);
+  border-radius: 6px;
+  background: rgba(16, 18, 20, 0.97);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.38);
   color: var(--ink);
-  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
 }
 
-.pc-tooltip-title {
-  margin-bottom: 0.35rem;
-  color: var(--muted);
+.frame-chart-panel > .chart-frame {
+  padding: 0;
+  border: 0;
+  background: transparent;
 }
 
-.pc-tooltip-row {
-  display: flex;
-  justify-content: space-between;
-  gap: 1rem;
+@media (max-width: 900px) {
+  .chart-range-editor {
+    grid-template-columns: 1fr;
+  }
+
+  .dropzone.compact {
+    width: 100%;
+    margin-left: 0;
+  }
 }
 
 @keyframes rise {

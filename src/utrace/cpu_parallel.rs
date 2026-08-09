@@ -161,7 +161,7 @@ pub(super) fn aggregate_serial_fallback(
                 .event_kinds
                 .get(usize::from(raw_event.uid))
                 .copied()
-                .unwrap_or(DashboardEventKind::Unknown)
+                .unwrap_or(DashboardEventKind::Ignored)
             {
                 DashboardEventKind::CpuProfilerMetadata => {
                     let mut record = decode_cpu_metadata_record(event, raw_event.data, 0)?;
@@ -246,7 +246,7 @@ fn aggregate_thread(
                 .event_kinds
                 .get(usize::from(raw_event.uid))
                 .copied()
-                .unwrap_or(DashboardEventKind::Unknown);
+                .unwrap_or(DashboardEventKind::Ignored);
             if kind != DashboardEventKind::CpuProfilerEventBatchV3 {
                 return Ok(());
             }

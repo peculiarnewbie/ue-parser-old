@@ -12,11 +12,10 @@ use crate::utrace::{
     ProgressiveCpuTimelineDecoder, SourceFingerprint, ThreadPacketSummary, TimelineIndexBuild,
     TimelineIndexRequest, TraceDashboard, TraceError, TraceErrorKind, TraceHeader, TraceInventory,
     TracePrologue, TraceThreadInfo, dashboard_from_decoded,
-    dashboard_from_decoded_with_memory_timeline_index,
-    dashboard_from_decoded_with_monotonic_timeline_index,
-    dashboard_from_decoded_with_timeline_index, decode_frame_marker, decode_known_scope_cycle,
-    decode_new_event, decode_new_trace, decode_thread_info, decompress_lz4_into_stream,
-    inventory_from_observations, parse_protocol5_normal_event, read_u32_field, read_u64_field,
+    dashboard_from_decoded_with_memory_timeline_index, dashboard_from_decoded_with_timeline_index,
+    decode_frame_marker, decode_known_scope_cycle, decode_new_event, decode_new_trace,
+    decode_thread_info, decompress_lz4_into_stream, inventory_from_observations,
+    parse_protocol5_normal_event, read_u32_field, read_u64_field,
 };
 use crate::utrace_dispatch::SerialDispatchPreparation;
 use crate::utrace_progress::{
@@ -31,6 +30,20 @@ const MAX_BOOTSTRAP_THREADS: usize = 4096;
 const MAX_PROGRESSIVE_GPU_QUEUES: usize = 64;
 const MAX_PROGRESSIVE_OPEN_GPU_WORK_PER_QUEUE: usize = 256;
 const MAX_PENDING_PROGRESSIVE_GPU_WORK: usize = 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProgressiveFinishPhase {
+    TransportFinalize,
+    Inventory,
+    EventRegistry,
+    ImportantEvents,
+    ProviderImportantEvents,
+    NormalEventDispatch,
+    CpuAggregation,
+    ProviderFinalize,
+    CpuTimelineFinalize,
+    GpuTimelineFinalize,
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ProgressiveGpuOpenWork {
@@ -244,14 +257,31 @@ impl ProgressiveDashboardSession {
         ),
         TraceError,
     > {
+        self.finish_with_inventory_and_monotonic_timeline_index_profiled(&mut |_| {})
+    }
+
+    pub(crate) fn finish_with_inventory_and_monotonic_timeline_index_profiled(
+        self,
+        phase_complete: &mut dyn FnMut(ProgressiveFinishPhase),
+    ) -> Result<
+        (
+            TraceDashboard,
+            TraceInventory,
+            crate::utrace::CpuMonotonicTimelineIndex,
+            GpuTimelineMemoryIndex,
+        ),
+        TraceError,
+    > {
         let options = self.options;
         let source_identity = self.source_fingerprint.finish();
         let frame_timing = self.frame_timing_dashboard();
         let (header, decoded, inventory_observations, progressive_cpu_timeline) =
             self.finish_decoding()?;
+        phase_complete(ProgressiveFinishPhase::TransportFinalize);
         let inventory = inventory_from_observations(header.clone(), inventory_observations)?;
+        phase_complete(ProgressiveFinishPhase::Inventory);
         let (mut dashboard, timeline_index, gpu_timeline_index) =
-            dashboard_from_decoded_with_monotonic_timeline_index(
+            crate::utrace::dashboard_from_decoded_with_monotonic_timeline_index_profiled(
                 header,
                 decoded,
                 options,
@@ -264,6 +294,7 @@ impl ProgressiveDashboardSession {
                         "eager CPU timeline was not enabled for this session",
                     )
                 })?,
+                phase_complete,
             )?;
         dashboard.frame_timing = Some(frame_timing);
         Ok((dashboard, inventory, timeline_index, gpu_timeline_index))

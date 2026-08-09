@@ -13,8 +13,9 @@ Insights by itself.
 
 - Machine: the Windows/Ryzen development host used for this repository.
 - Native probe: release `utrace_memory_probe <trace> monotonic`.
-- Browser-equivalent worker count: `RAYON_NUM_THREADS=8`; the web worker caps
-  its Rayon pool at eight workers.
+- Browser-equivalent worker count for this historical run:
+  `RAYON_NUM_THREADS=8`. The browser cap was raised to 16 after the dedicated
+  8/16/24 browser sweep on 2026-08-09.
 - Peak memory: `PeakWorkingSet64`, sampled every 100 ms. The sampler and cold
   filesystem/cache state noticeably perturb wall time, so those runs are used
   for memory, not the primary timing comparison.
@@ -169,9 +170,10 @@ Worker-count sweep:
 | 8 | 6,395 | 11,672 |
 | 16 | 6,251 | 11,582 |
 
-Eight workers are close to the knee. Sixteen workers gained only ~144 ms in
-this sweep, so the browser cap remains eight rather than consuming twice as
-many workers.
+Eight workers appeared close to the knee in this native sweep. A later
+production-browser sweep found 16 to be the better cap on the same 32-thread
+host and found 24 to regress sharply; see
+`utrace-performance-experiments-2026-08-09.md`.
 
 Peak-working-set runs measured approximately 1,683 MiB for the serial path and
 1,749 MiB for the eight-worker path: about 66 MiB more. The instrumented
@@ -193,7 +195,8 @@ bulk-memory, imported shared memory, and TLS exports produced a working build.
 The retained web changes:
 
 - Build with `utrace-wasm-threads` and `wasm-bindgen-rayon`.
-- Initialize up to eight Rayon workers inside the existing WASM worker.
+- Initialize a bounded Rayon pool inside the existing WASM worker (eight in
+  this historical run; 16 after the 2026-08-09 browser sweep).
 - Serve COOP `same-origin` and COEP `require-corp` in Vite dev/preview.
 - Configure a 4 GiB maximum shared memory because this trace already peaks near
   1.75 GiB natively.

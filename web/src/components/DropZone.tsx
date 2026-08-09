@@ -1,10 +1,11 @@
-import { createSignal, type JSX } from "solid-js";
+import { Show, createSignal, type JSX } from "solid-js";
 
 type DropZoneProps = {
   accept: string;
   label: string;
   hint: string;
   busy?: boolean;
+  compact?: boolean;
   onFile: (file: File) => void | Promise<void>;
 };
 
@@ -27,7 +28,7 @@ export function DropZone(props: DropZoneProps) {
   return (
     <div
       class="dropzone"
-      classList={{ dragging: dragging(), busy: !!props.busy }}
+      classList={{ dragging: dragging(), busy: !!props.busy, compact: !!props.compact }}
       onDragEnter={(event) => {
         event.preventDefault();
         setDragging(true);
@@ -57,9 +58,19 @@ export function DropZone(props: DropZoneProps) {
           await takeFile(file);
         }}
       />
-      <p class="dropzone-kicker">{props.busy ? "Parsing…" : "Drop file"}</p>
-      <h2 class="dropzone-label">{props.label}</h2>
-      <p class="dropzone-hint">{props.hint}</p>
+      <Show
+        when={props.compact}
+        fallback={
+          <>
+            <p class="dropzone-kicker">{props.busy ? "Parsing…" : "Drop file"}</p>
+            <h2 class="dropzone-label">{props.label}</h2>
+            <p class="dropzone-hint">{props.hint}</p>
+          </>
+        }
+      >
+        <p class="dropzone-kicker">{props.busy ? "Working…" : "New capture"}</p>
+        <span class="dropzone-compact-label">Drop or choose another .utrace</span>
+      </Show>
     </div>
   );
 }

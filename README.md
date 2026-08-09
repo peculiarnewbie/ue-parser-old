@@ -71,6 +71,19 @@ npm install
 npm run dev
 ```
 
+The web viewer also has a real-capture Playwright benchmark and an optional
+Unreal Insights comparison runner. Every repetition uses a fresh browser process
+and measures launch-to-app, launch-to-dashboard, and launch-to-timeline paint in
+addition to the detailed parser and renderer spans:
+
+```text
+cd web
+node scripts/benchmark-utrace-e2e.mjs --input C:\traces\capture.utrace --repeat 3
+```
+
+The measurement contract, artifacts, caveats, and current baseline are in
+[`docs/utrace-e2e-performance.md`](docs/utrace-e2e-performance.md).
+
 ## Shared byte-reader dependency
 
 `Cargo.toml` pins the shared UE Shed reader dependency to an exact Git

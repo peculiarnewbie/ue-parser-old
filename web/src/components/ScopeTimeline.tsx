@@ -226,7 +226,7 @@ export function ScopeTimeline(props: ScopeTimelineProps) {
   };
 
   return (
-    <section class="panel timeline-panel timer-panel">
+    <section class="panel timeline-panel timer-panel" data-utrace-timeline-ready>
       <header class="timer-head">
         <div>
           <p class="eyebrow">Timer workbench</p>

@@ -42,6 +42,13 @@ import {
   formatParseTiming,
   type ParseTiming,
 } from "../lib/api";
+import { UTRACE_SPAN } from "../lib/perf-span-types";
+import {
+  afterNextPaint,
+  beginUtraceSpan,
+  endUtraceSpan,
+  resetUtraceTelemetry,
+} from "../lib/perf-spans";
 import {
   cancelWasmParsing,
   parseUtraceProgressWithWasm,
@@ -401,6 +408,21 @@ export default function UtracePage() {
     cancelActiveLoad();
     invalidateDetailRequests();
     cancelWasmParsing();
+    resetUtraceTelemetry();
+    const loadSpan = beginUtraceSpan({
+      name: UTRACE_SPAN.load,
+      domain: "browser",
+      attributes: {
+        "utrace.filename": next.name,
+        "utrace.file_bytes": next.size,
+      },
+    });
+    let loadSpanEnded = false;
+    const endLoadSpan = (input: { error?: unknown } = {}) => {
+      if (loadSpanEnded) return;
+      loadSpanEnded = true;
+      endUtraceSpan(loadSpan, input);
+    };
     const abortController = new AbortController();
     loadAbort = abortController;
     setError(null);
@@ -435,10 +457,11 @@ export default function UtracePage() {
     const wallStarted = performance.now();
     try {
       let latestSequence = -1;
-      const dashResult = await parseUtraceProgressWithWasm(
-        next,
-        { max_frames: BROWSER_ALL_FRAMES },
-        (event) => {
+      const dashResult = await parseUtraceProgressWithWasm({
+        file: next,
+        options: { max_frames: BROWSER_ALL_FRAMES },
+        parentSpan: loadSpan,
+        onEvent: (event) => {
           if (loadAbort !== abortController) return;
           if (event.sequence <= latestSequence) return;
           latestSequence = event.sequence;
@@ -454,16 +477,43 @@ export default function UtracePage() {
             setInventory(event.inventory);
           }
         },
-        abortController.signal,
-      );
-      if (loadAbort !== abortController) return;
+        signal: abortController.signal,
+      });
+      if (loadAbort !== abortController) {
+        endLoadSpan();
+        return;
+      }
+      const stateSpan = beginUtraceSpan({
+        name: UTRACE_SPAN.dashboardStateCommit,
+        domain: "browser",
+        parent: loadSpan,
+      });
       setDashboard(dashResult.data);
       setTimelineSessionId(dashResult.sessionId);
       setLoadTiming({
         dashboard: dashResult.timing,
         wall_ms: Math.round(performance.now() - wallStarted),
       });
+      endUtraceSpan(stateSpan);
+
+      const paintSpan = beginUtraceSpan({
+        name: UTRACE_SPAN.dashboardPaint,
+        domain: "render",
+        parent: loadSpan,
+      });
+      await afterNextPaint();
+      const paintedWallMs = Math.round(performance.now() - wallStarted);
+      setLoadTiming({ dashboard: dashResult.timing, wall_ms: paintedWallMs });
+      await afterNextPaint();
+      endUtraceSpan(paintSpan, {
+        attributes: {
+          "utrace.frame_count": dashResult.data.dashboard.frame_timing?.total_frame_count ?? 0,
+          "render.svg_count": document.querySelectorAll("svg").length,
+        },
+      });
+      endLoadSpan();
     } catch (err) {
+      endLoadSpan({ error: err });
       if (loadAbort !== abortController) return;
       setDashboard(null);
       setInventory(null);
@@ -489,20 +539,62 @@ export default function UtracePage() {
     },
   ) => {
     const request = ++timelineRequest;
+    const querySpan = beginUtraceSpan({
+      name: UTRACE_SPAN.timelineLoad,
+      domain: "browser",
+      attributes: {
+        "utrace.start_cycle": query.start_cycle,
+        "utrace.end_cycle": query.end_cycle,
+        "utrace.thread_id": query.thread,
+        "utrace.search": query.search,
+      },
+    });
+    let querySpanEnded = false;
+    const endQuerySpan = (input: { error?: unknown } = {}) => {
+      if (querySpanEnded) return;
+      querySpanEnded = true;
+      endUtraceSpan(querySpan, input);
+    };
     setTimelineBusy(true);
     setError(null);
     try {
       const sessionId = timelineSessionId();
       if (!sessionId) throw new Error("timeline index is not ready");
-      const detail = await queryUtraceTimelineWithWasm(sessionId, {
-        ...query,
-        limit: 2500,
+      const detail = await queryUtraceTimelineWithWasm({
+        sessionId,
+        options: { ...query, limit: 2500 },
+        parentSpan: querySpan,
       });
-      if (request !== timelineRequest) return;
+      if (request !== timelineRequest) {
+        endQuerySpan();
+        return;
+      }
+      const stateSpan = beginUtraceSpan({
+        name: UTRACE_SPAN.timelineStateCommit,
+        domain: "browser",
+        parent: querySpan,
+      });
       setTimelineDetail(detail.data);
       setTimelineTiming(detail.timing);
       if (detail.sessionId) setTimelineSessionId(detail.sessionId);
+      endUtraceSpan(stateSpan);
+
+      const paintSpan = beginUtraceSpan({
+        name: UTRACE_SPAN.timelinePaint,
+        domain: "render",
+        parent: querySpan,
+      });
+      await afterNextPaint();
+      endUtraceSpan(paintSpan, {
+        attributes: {
+          "utrace.interval_count": detail.data.timeline.interval_count,
+          "utrace.returned_intervals": detail.data.timeline.intervals.length,
+          "render.timeline_bar_count": document.querySelectorAll(".timer-bar").length,
+        },
+      });
+      endQuerySpan();
     } catch (err) {
+      endQuerySpan({ error: err });
       if (request !== timelineRequest) return;
       setTimelineDetail(null);
       setTimelineTiming(null);
@@ -518,22 +610,57 @@ export default function UtracePage() {
 
   const loadGpuFrameTimeline = async (frameNumber: number) => {
     const request = ++gpuRequest;
+    const querySpan = beginUtraceSpan({
+      name: UTRACE_SPAN.gpuTimelineLoad,
+      domain: "browser",
+      attributes: { "utrace.frame_number": frameNumber },
+    });
+    let querySpanEnded = false;
+    const endQuerySpan = (input: { error?: unknown } = {}) => {
+      if (querySpanEnded) return;
+      querySpanEnded = true;
+      endUtraceSpan(querySpan, input);
+    };
     setGpuBusy(true);
     setError(null);
     try {
       const sessionId = timelineSessionId();
       if (!sessionId) throw new Error("GPU timeline index is not ready");
-      const detail = await queryUtraceGpuTimelineWithWasm(sessionId, {
-        frame_number: frameNumber,
-        limit: 2500,
+      const detail = await queryUtraceGpuTimelineWithWasm({
+        sessionId,
+        options: { frame_number: frameNumber, limit: 2500 },
+        parentSpan: querySpan,
       });
-      if (request !== gpuRequest) return;
+      if (request !== gpuRequest) {
+        endQuerySpan();
+        return;
+      }
+      const stateSpan = beginUtraceSpan({
+        name: UTRACE_SPAN.gpuTimelineStateCommit,
+        domain: "browser",
+        parent: querySpan,
+      });
       setGpuTimeline(detail.data.timeline);
       setGpuTiming(detail.timing);
+      endUtraceSpan(stateSpan);
       if (detail.data.timeline.interval_count === 0) {
         setError(`No GPU timeline retained for frame ${frameNumber}.`);
       }
+      const paintSpan = beginUtraceSpan({
+        name: UTRACE_SPAN.gpuTimelinePaint,
+        domain: "render",
+        parent: querySpan,
+      });
+      await afterNextPaint();
+      endUtraceSpan(paintSpan, {
+        attributes: {
+          "utrace.interval_count": detail.data.timeline.interval_count,
+          "render.gpu_row_count": document.querySelectorAll("[data-utrace-gpu-timeline] tbody tr").length,
+        },
+      });
+      endQuerySpan();
     } catch (err) {
+      endQuerySpan({ error: err });
       if (request !== gpuRequest) return;
       setGpuTimeline(null);
       setGpuTiming(null);
@@ -650,20 +777,23 @@ export default function UtracePage() {
 
   return (
     <section class="page page-wide">
-      <header class="page-head analyzer-intro">
-        <p class="eyebrow">Trace analysis</p>
-        <h1>Inspect frame timing and trace events.</h1>
-        <p class="lede">
-          Open an Unreal trace to inspect frame timing, CPU scopes, GPU events,
-          allocations, and tasks.
-        </p>
-      </header>
+      <Show when={!dashboard()}>
+        <header class="page-head analyzer-intro">
+          <p class="eyebrow">Trace analysis</p>
+          <h1>Find the frame. Follow the work.</h1>
+          <p class="lede">
+            Start with frame outliers, then move into CPU, GPU, allocation, and task
+            evidence without uploading the capture.
+          </p>
+        </header>
+      </Show>
 
       <DropZone
         accept=".utrace"
         label="Drop a .utrace"
         hint="Frame timing appears while the browser reads the capture. CPU ranges then query the in-browser index without another upload."
         busy={busy() || timelineBusy() || gpuBusy()}
+        compact={!!dashboard()}
         onFile={onFile}
       />
 
@@ -674,7 +804,9 @@ export default function UtracePage() {
         </div>
       </Show>
 
-      <Show when={(dash()?.frame_timing?.frames ?? liveFrameTiming()).length > 0}>
+      <Show
+        when={!dashboard() && (dash()?.frame_timing?.frames ?? liveFrameTiming()).length > 0}
+      >
         <section class="panel">
           <div class="chart-frame-head" style={{ "margin-bottom": "0.75rem" }}>
             <div class="chart-frame-titles">
@@ -767,7 +899,7 @@ export default function UtracePage() {
       <Show when={dashboard()} keyed>
         {(dashResult) => (
           <>
-            <div class="capture-bar">
+            <div class="capture-bar" data-utrace-dashboard-ready>
               <div class="capture-identity">
                 <span class={`capture-state status-${dashResult.status}`} />
                 <div>
@@ -950,6 +1082,48 @@ export default function UtracePage() {
 
             <Show when={tab() === "frames"}>
               <div class="panel-stack">
+                <section class="panel frame-chart-panel">
+                  <div class="chart-frame-head" style={{ "margin-bottom": "0.75rem" }}>
+                    <div class="chart-frame-titles">
+                      <p class="eyebrow">Capture navigator</p>
+                    </div>
+                    <div class="chart-metric-controls">
+                      <label class="chart-metric-select">
+                        <span>Frame type</span>
+                        <select
+                          value={frameTypeFilter()}
+                          onChange={(event) =>
+                            setFrameTypeFilter(
+                              event.currentTarget.value as TraceFrameTypeFilter,
+                            )
+                          }
+                        >
+                          <option value="game">Game (Insights default)</option>
+                          <option value="rendering">Rendering</option>
+                          <option value="all">All types mixed</option>
+                        </select>
+                      </label>
+                    </div>
+                  </div>
+                  <FrameCostBrushChart
+                    frames={chartFrames()}
+                    cycleFrequency={dashResult.dashboard.prologue?.cycle_frequency}
+                    frameLabel={(frame) =>
+                      frameTypeFilter() === "all"
+                        ? `${frameTypeLabel(frame.frame_type)} #${frame.frame_number}`
+                        : `#${frame.frame_number}`
+                    }
+                    selection={chartNavigation()}
+                    onSelectionChange={onChartNavigationChange}
+                    onSelectionCommit={onChartNavigationChange}
+                    onSelectionClear={onChartNavigationClear}
+                    metric={frameMetric()}
+                    onMetricChange={setFrameMetric}
+                    height={300}
+                    renderPointBudget={LIVE_FRAME_RENDER_POINT_BUDGET}
+                  />
+                </section>
+
                 <section class="triage-strip timer-triage" aria-label="Performance triage summary">
                   <div class="triage-primary">
                     <span>Markers over {frameBudgetMs().toFixed(2)} ms</span>

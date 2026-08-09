@@ -1,5 +1,8 @@
 /target
 /web/src/generated/
+/web/playwright-report/
+/web/test-results/
+/web/benchmark-results/
 /packages/utrace-parser-wasm/dist/
 !Cargo.lock
 tests/fixtures/*
