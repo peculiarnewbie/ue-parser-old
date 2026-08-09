@@ -4554,10 +4554,6 @@ fn read_dashboard_events(
                     );
                 }
                 DashboardEventKind::MetadataStack => {
-                    #[cfg(feature = "utrace-parallel")]
-                    if parallel_cpu_candidate {
-                        parallel_cpu_unsupported = true;
-                    }
                     decode_metadata_stack_event(event, raw_event.data, &mut metadata_stack, 0)?;
                     apply_metadata_stack_event_to_cpu_context(
                         event,

@@ -247,6 +247,27 @@ fn aggregate_thread(
                 .get(usize::from(raw_event.uid))
                 .copied()
                 .unwrap_or(DashboardEventKind::Ignored);
+            if kind == DashboardEventKind::MetadataStack {
+                let event = inputs
+                    .events_by_uid
+                    .get(usize::from(raw_event.uid))
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| {
+                        TraceError::new(
+                            TraceErrorKind::MalformedData,
+                            0,
+                            "MetadataStack",
+                            "parallel metadata-stack event type was not registered",
+                        )
+                    })?;
+                return apply_metadata_stack_event_to_cpu_context(
+                    event,
+                    raw_event.data,
+                    &mut metadata_stack_context,
+                    0,
+                );
+            }
             if kind != DashboardEventKind::CpuProfilerEventBatchV3 {
                 return Ok(());
             }
@@ -380,5 +401,221 @@ fn merge_frame_bounds(target: &mut FxHashMap<u32, (u64, u64)>, source: FxHashMap
         let bounds = target.entry(frame).or_insert((begin, end));
         bounds.0 = bounds.0.min(begin);
         bounds.1 = bounds.1.max(end);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event_type(
+        uid: u16,
+        logger: &str,
+        event: &str,
+        maybe_has_aux: bool,
+        fields: Vec<FieldInfo>,
+    ) -> EventTypeInfo {
+        EventTypeInfo {
+            uid,
+            logger: logger.to_owned(),
+            event: event.to_owned(),
+            flags: EventFlags {
+                maybe_has_aux,
+                no_sync: true,
+                ..EventFlags::default()
+            },
+            fields,
+        }
+    }
+
+    fn id_field() -> FieldInfo {
+        FieldInfo {
+            name: "Id".to_owned(),
+            offset: 0,
+            size: 4,
+            family: FieldFamily::Regular,
+            type_name: "uint32".to_owned(),
+            ref_uid: None,
+        }
+    }
+
+    fn encode_uid(uid: u16) -> Vec<u8> {
+        let shifted = uid << 1;
+        if shifted < 128 {
+            vec![shifted as u8]
+        } else {
+            vec![(shifted as u8) | 1, (shifted >> 8) as u8]
+        }
+    }
+
+    fn push_fixed_event(stream: &mut Vec<u8>, uid: u16, data: &[u8]) {
+        stream.extend(encode_uid(uid));
+        stream.extend_from_slice(data);
+    }
+
+    fn push_batch(stream: &mut Vec<u8>, uid: u16, data: &[u8]) {
+        stream.extend(encode_uid(uid));
+        let pack = 2_u32 | (u32::try_from(data.len()).unwrap() << 13);
+        stream.extend_from_slice(&pack.to_le_bytes());
+        stream.extend_from_slice(data);
+        stream.extend(encode_uid(3));
+    }
+
+    fn push_varint(bytes: &mut Vec<u8>, mut value: u64) {
+        while value >= 0x80 {
+            bytes.push(((value & 0x7f) as u8) | 0x80);
+            value >>= 7;
+        }
+        bytes.push(value as u8);
+    }
+
+    #[test]
+    fn parallel_replay_applies_metadata_stack_events_in_thread_order() {
+        let batch_uid = 16;
+        let save_uid = 17;
+        let clear_uid = 18;
+        let restore_uid = 19;
+        let events = vec![
+            event_type(
+                batch_uid,
+                "CpuProfiler",
+                "EventBatchV3",
+                true,
+                vec![FieldInfo {
+                    name: "Data".to_owned(),
+                    offset: 0,
+                    size: 0,
+                    family: FieldFamily::Regular,
+                    type_name: "array".to_owned(),
+                    ref_uid: None,
+                }],
+            ),
+            event_type(
+                save_uid,
+                "MetadataStack",
+                "SaveStack",
+                false,
+                vec![id_field()],
+            ),
+            event_type(clear_uid, "MetadataStack", "ClearScope", false, Vec::new()),
+            event_type(
+                restore_uid,
+                "MetadataStack",
+                "RestoreStack",
+                false,
+                vec![id_field()],
+            ),
+        ];
+        let registry = events
+            .iter()
+            .map(|event| (event.uid, event))
+            .collect::<BTreeMap<_, _>>();
+        let mut events_by_uid = vec![None; usize::from(restore_uid) + 1];
+        for event in &events {
+            events_by_uid[usize::from(event.uid)] = Some(event);
+        }
+        let event_kinds = dashboard_event_kinds(&events);
+
+        let mut enter_metadata = Vec::new();
+        push_varint(&mut enter_metadata, (10 << 2) | 0b01);
+        push_varint(&mut enter_metadata, (42 << 1) | 1);
+        let mut leave_metadata = Vec::new();
+        push_varint(&mut leave_metadata, 20 << 2);
+        let mut plain_scope = Vec::new();
+        push_varint(&mut plain_scope, (30 << 2) | 0b01);
+        push_varint(&mut plain_scope, 1 << 1);
+        push_varint(&mut plain_scope, 40 << 2);
+
+        let stack_id = 123_u32.to_le_bytes();
+        let mut stream = Vec::new();
+        push_batch(&mut stream, batch_uid, &enter_metadata);
+        push_fixed_event(&mut stream, save_uid, &stack_id);
+        push_batch(&mut stream, batch_uid, &leave_metadata);
+        push_fixed_event(&mut stream, clear_uid, &[]);
+        push_fixed_event(&mut stream, restore_uid, &stack_id);
+        push_batch(&mut stream, batch_uid, &plain_scope);
+
+        let streams = [(2_u16, stream)].into_iter().collect::<BTreeMap<_, _>>();
+        let specs = [(
+            1_u32,
+            CpuScopeSpec {
+                id: 1,
+                name: "PlainScope".to_owned(),
+                file: None,
+                line: None,
+            },
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let metadata = [(
+            42_u32,
+            CpuMetadataRecord {
+                metadata_id: 42,
+                spec_id: 7,
+                name: "Frame".to_owned(),
+                rendered_name: Some("Frame 366401".to_owned()),
+                metadata_bytes: 0,
+                decoded_metadata_bytes: 0,
+                skipped_metadata_bytes: 0,
+                decode_failed: false,
+                values: Vec::new(),
+                strings: Vec::new(),
+            },
+        )]
+        .into_iter()
+        .collect::<FxHashMap<_, _>>();
+        let introductions = [(42_u32, 1_u32)].into_iter().collect::<FxHashMap<_, _>>();
+        let batch_contexts = [(
+            2_u16,
+            vec![
+                BatchContext {
+                    generation: 1,
+                    order: 0,
+                },
+                BatchContext {
+                    generation: 1,
+                    order: 1,
+                },
+                BatchContext {
+                    generation: 1,
+                    order: 2,
+                },
+            ],
+        )]
+        .into_iter()
+        .collect::<FxHashMap<_, _>>();
+
+        let aggregate = aggregate(ParallelCpuInputs {
+            streams: &streams,
+            registry: &registry,
+            events_by_uid: &events_by_uid,
+            event_kinds: &event_kinds,
+            specs: &specs,
+            metadata: &metadata,
+            metadata_introductions: &introductions,
+            batch_contexts: &batch_contexts,
+            known_scope_ids: None,
+            cycle_frequency: None,
+            prologue_start_cycle: None,
+        })
+        .unwrap();
+
+        assert_eq!(aggregate.batches.count, 3);
+        assert_eq!(aggregate.batches.intervals, 2);
+        assert_eq!(aggregate.batches.metadata_scopes, 1);
+        assert_eq!(aggregate.batches.restored_metadata_scopes, 1);
+        assert_eq!(aggregate.scope_totals[&1], (1, 10));
+        assert_eq!(aggregate.metadata_scope_totals[&7], (2, 20));
+        assert_eq!(aggregate.frame_scope_totals[&366401][&1], (1, 10));
+        assert_eq!(aggregate.frame_cycle_bounds[&366401], (30, 40));
+        assert_eq!(aggregate.thread_scope_totals[&2][&1], (1, 10));
+        assert_eq!(aggregate.metadata_interval_state.samples.len(), 2);
+        assert!(
+            aggregate
+                .metadata_interval_state
+                .samples
+                .iter()
+                .any(|sample| sample.attribution == CpuMetadataAttribution::RestoredStack)
+        );
     }
 }
