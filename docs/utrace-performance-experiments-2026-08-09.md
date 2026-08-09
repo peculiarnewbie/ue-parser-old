@@ -34,6 +34,7 @@ also retains phase durations and medians for every repetition.
 | Resolve GPU event variants and fixed-field layouts once per UID | Nine native release samples reduced finish from 905 to 805 ms; the variant-only midpoint was 872 ms. Across two five-launch browser runs, normal dispatch moved from 744 ms before GPU routing to 731.5 ms with variant routing and 722.5 ms with cached layouts. | Retained. Required field existence, declared size, range, and payload bounds remain checked when each event is decoded. Dashboard JSON still matched the 10,395,737-character reference and SHA-256 exactly. |
 | Select bounded per-frame CPU and GPU rankings before allocating names | Native probes attributed 58–61 ms of provider finalization to frame correlation. Exact top-5/top-8 selection reduced that slice to 15–18 ms and the nine-sample native finish median from 805 to 783 ms. Two five-launch browser runs reduced provider finalization from 263.5 to 127.5 ms and finish from 1,684 to 1,649.5 ms. | Retained. A regression test compares bounded selection with the previous full-sort ordering, and the real dashboard length and SHA-256 remain exact. Cold file-to-dashboard and process-to-timeline medians were effectively flat in these samples. |
 | Bound and fuse CPU metadata projection | On 152,903 metadata records, bounded global/per-spec strings and rendered scopes reduced native metadata projection from roughly 55 to 49 ms. Fusing global strings, per-spec summaries, and scalar counters into one record pass moved it to 32 ms and total CPU provider projection from about 64 to 42 ms. | Retained. Two five-launch browser runs reduced provider finalization from 127.5 to 88 ms, finish from 1,649.5 to 1,526 ms, file-to-dashboard from 3,366 to 3,274 ms, and process-to-timeline from 5,465 to 5,342 ms. Ordering-equivalence tests and the real-trace SHA-256 remained exact. |
+| Cache decoded GPU breadcrumb metadata by spec and exact payload | Sampled native dispatch attributed roughly 153–166 ms to breadcrumb begins. The trace had 94,896 metadata-bearing begins but only 3,667 distinct `(spec, payload fingerprint)` values, implying about 96% reuse. Three independent five-launch browser runs measured 625, 683, and 712 ms dispatch medians; their combined 675 ms median is 81 ms (10.7%) below the prior 756 ms checkpoint. | Retained with a 4,096-entry and 2 MiB copied-key cap. Exact payload equality, not the exploratory fingerprint, controls reuse. The first calm run reduced finish from 1,518 to 1,494 ms and file-to-dashboard from 3,273 to 3,207 ms; later runs had simultaneous CPU-aggregation and timeline-render contention, so no broader end-to-end claim is made. Cache reuse/cap tests and the real dashboard length and SHA-256 remain exact. |
 
 ## Retained result
 
@@ -80,3 +81,22 @@ browser samples, provider finalization reached 88 ms, finish plus serialization
 1,526 ms, file-to-dashboard 3,274 ms, and process-to-timeline 5,342 ms. Normal
 dispatch is again the dominant finish phase; further work should add sub-phase
 attribution there before changing more event decoders.
+
+The dispatch sub-profile attributed roughly 153–166 ms of native work to GPU
+breadcrumb begins and 41–43 ms to ends. Metadata fingerprinting then found
+94,896 metadata-bearing begins collapsing to 3,667 distinct spec/payload
+fingerprints, with one value reused 7,776 times. The retained cache uses exact
+payload bytes and shares the decoded CBOR values, extracted strings, hex
+prefix, and rendered name. It stops retaining new entries after 4,096 values
+or 2 MiB of copied keys and is dropped before parallel CPU aggregation.
+
+Across three five-launch browser confirmations, dispatch medians were 625,
+683, and 712 ms. Their combined 675 ms median is 81 ms (10.7%) below the prior
+756 ms checkpoint. The first, relatively calm run also moved finish from 1,518
+to 1,494 ms and file-to-dashboard from 3,273 to 3,207 ms. The other two runs
+showed machine-wide contention: CPU aggregation, provider finalization, and the
+independent post-dashboard timeline leg all rose together. Accordingly, the
+cache is retained as a repeatable dispatch improvement, not recorded as a new
+cold launch-to-timeline baseline. The dashboard remains 10,395,737 characters
+with SHA-256
+`511049F5B9A7417E2A726194EEDECAD0FF4712058B51B4B00F4AEFF5C1429F54`.

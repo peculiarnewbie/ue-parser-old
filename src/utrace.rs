@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::rc::Rc;
 
 use rustc_hash::FxHashMap;
 use serde::Serialize;
@@ -4095,6 +4096,7 @@ fn read_dashboard_events(
     let mut gpu_queues = BTreeMap::<u32, GpuQueueState>::new();
     let mut gpu_breadcrumb_specs = BTreeMap::<u32, GpuBreadcrumbSpec>::new();
     let mut gpu_breadcrumb_totals = BTreeMap::<u32, GpuBreadcrumbTotal>::new();
+    let mut gpu_breadcrumb_metadata_cache = GpuBreadcrumbMetadataCache::default();
     let mut counter_specs = BTreeMap::<u16, CounterSpec>::new();
     let mut counter_states = BTreeMap::<u16, CounterState>::new();
     let mut unresolved_counter_samples = 0_u64;
@@ -4562,6 +4564,7 @@ fn read_dashboard_events(
                         specs: &gpu_breadcrumb_specs,
                         queues: &mut gpu_queues,
                         breadcrumb_totals: &mut gpu_breadcrumb_totals,
+                        metadata_cache: &mut gpu_breadcrumb_metadata_cache,
                         submission_latency_samples: &mut submission_latency_samples,
                         timeline: gpu_timeline_sink
                             .as_mut()
@@ -4692,6 +4695,9 @@ fn read_dashboard_events(
         },
     )?;
     decoded.dispatch = Some(dispatch_summary);
+    // Cached details are only useful during serial GPU dispatch. Release them
+    // before the parallel CPU aggregation pass starts.
+    drop(gpu_breadcrumb_metadata_cache);
     notify_finish_phase(
         &mut phase_complete,
         crate::utrace_session::ProgressiveFinishPhase::NormalEventDispatch,
@@ -4901,9 +4907,7 @@ struct GpuOpenWork {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-struct GpuOpenBreadcrumb {
-    spec_id: u32,
-    gpu_timestamp_top: u64,
+struct GpuBreadcrumbDetails {
     metadata_bytes: usize,
     decoded_metadata_bytes: usize,
     skipped_metadata_bytes: usize,
@@ -4912,6 +4916,86 @@ struct GpuOpenBreadcrumb {
     metadata_strings: Vec<String>,
     metadata_values: Vec<MetadataValue>,
     rendered_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct GpuOpenBreadcrumb {
+    spec_id: u32,
+    gpu_timestamp_top: u64,
+    details: Rc<GpuBreadcrumbDetails>,
+}
+
+const MAX_GPU_BREADCRUMB_METADATA_CACHE_ENTRIES: usize = 4_096;
+const MAX_GPU_BREADCRUMB_METADATA_CACHE_KEY_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Default)]
+struct GpuBreadcrumbMetadataCache {
+    by_spec: FxHashMap<u32, FxHashMap<Vec<u8>, Rc<GpuBreadcrumbDetails>>>,
+    entries: usize,
+    key_bytes: usize,
+}
+
+impl GpuBreadcrumbMetadataCache {
+    fn resolve(
+        &mut self,
+        spec_id: u32,
+        spec: Option<&GpuBreadcrumbSpec>,
+        metadata: &[u8],
+    ) -> Rc<GpuBreadcrumbDetails> {
+        if let Some(details) = self
+            .by_spec
+            .get(&spec_id)
+            .and_then(|by_metadata| by_metadata.get(metadata))
+        {
+            return Rc::clone(details);
+        }
+
+        let metadata_report = decode_cbor_report(metadata);
+        let mut metadata_strings = metadata_report
+            .values
+            .iter()
+            .flat_map(metadata_value_strings)
+            .collect::<Vec<_>>();
+        metadata_strings.sort();
+        metadata_strings.dedup();
+        let rendered_name = spec.and_then(|spec| {
+            render_metadata_name_parts(
+                &spec.name,
+                spec.name_format.as_deref(),
+                &metadata_report.values,
+            )
+        });
+        let details = Rc::new(GpuBreadcrumbDetails {
+            metadata_bytes: metadata.len(),
+            decoded_metadata_bytes: metadata_report.consumed_bytes,
+            skipped_metadata_bytes: metadata_report.skipped_bytes,
+            decode_failed: metadata_report.failed_reads > 0,
+            metadata_hex_prefix: if metadata.is_empty() {
+                String::new()
+            } else {
+                hex_prefix(metadata, 32)
+            },
+            metadata_strings,
+            metadata_values: metadata_report.values,
+            rendered_name,
+        });
+
+        let Some(next_key_bytes) = self.key_bytes.checked_add(metadata.len()) else {
+            return details;
+        };
+        if self.entries >= MAX_GPU_BREADCRUMB_METADATA_CACHE_ENTRIES
+            || next_key_bytes > MAX_GPU_BREADCRUMB_METADATA_CACHE_KEY_BYTES
+        {
+            return details;
+        }
+        self.by_spec
+            .entry(spec_id)
+            .or_default()
+            .insert(metadata.to_vec(), Rc::clone(&details));
+        self.entries += 1;
+        self.key_bytes = next_key_bytes;
+        details
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -5058,6 +5142,7 @@ struct GpuNormalEventState<'a> {
     specs: &'a BTreeMap<u32, GpuBreadcrumbSpec>,
     queues: &'a mut BTreeMap<u32, GpuQueueState>,
     breadcrumb_totals: &'a mut BTreeMap<u32, GpuBreadcrumbTotal>,
+    metadata_cache: &'a mut GpuBreadcrumbMetadataCache,
     submission_latency_samples: &'a mut Vec<GpuSubmissionLatencySample>,
     timeline: Option<&'a mut dyn GpuTimelineSink>,
 }
@@ -5072,6 +5157,7 @@ fn decode_gpu_normal_event(
     let specs = state.specs;
     let queues = &mut *state.queues;
     let breadcrumb_totals = &mut *state.breadcrumb_totals;
+    let metadata_cache = &mut *state.metadata_cache;
     let submission_latency_samples = &mut *state.submission_latency_samples;
     let mut timeline = state.timeline.as_deref_mut();
     match route {
@@ -5109,42 +5195,16 @@ fn decode_gpu_normal_event(
                 return Ok(());
             }
             let metadata = read_aux_bytes(event, data, "Metadata", base_offset)?;
-            let metadata_bytes = metadata.as_ref().map_or(0, |bytes| bytes.len());
-            let metadata_report = metadata
-                .as_ref()
-                .map(|bytes| decode_cbor_report(bytes))
-                .unwrap_or_default();
-            let metadata_hex_prefix = metadata
-                .as_ref()
-                .map(|bytes| hex_prefix(bytes, 32))
-                .unwrap_or_default();
-            let mut metadata_strings = metadata_report
-                .values
-                .iter()
-                .flat_map(metadata_value_strings)
-                .collect::<Vec<_>>();
-            metadata_strings.sort();
-            metadata_strings.dedup();
-            let spec = specs.get(&spec_id);
-            let rendered_name = spec.and_then(|spec| {
-                render_metadata_name_parts(
-                    &spec.name,
-                    spec.name_format.as_deref(),
-                    &metadata_report.values,
-                )
-            });
+            let details = metadata_cache.resolve(
+                spec_id,
+                specs.get(&spec_id),
+                metadata.as_deref().unwrap_or_default(),
+            );
             let queue = queues.entry(queue_id).or_default();
             queue.open_breadcrumbs.push(GpuOpenBreadcrumb {
                 spec_id,
                 gpu_timestamp_top,
-                metadata_bytes,
-                decoded_metadata_bytes: metadata_report.consumed_bytes,
-                skipped_metadata_bytes: metadata_report.skipped_bytes,
-                decode_failed: metadata_report.failed_reads > 0,
-                metadata_hex_prefix,
-                metadata_strings,
-                metadata_values: metadata_report.values,
-                rendered_name,
+                details,
             });
             update_min_max(
                 &mut queue.min_gpu_timestamp,
@@ -5180,6 +5240,7 @@ fn decode_gpu_normal_event(
                 queue.unmatched_breadcrumb_ends += 1;
                 return Ok(());
             };
+            let details = &begin.details;
             if gpu_timestamp_bop < begin.gpu_timestamp_top {
                 queue.negative_breadcrumb_durations += 1;
                 // Insights still closes the interval; count the anomaly but do not
@@ -5191,7 +5252,7 @@ fn decode_gpu_normal_event(
                     begin.gpu_timestamp_top,
                     gpu_timestamp_bop,
                     duration,
-                    begin.rendered_name.as_deref(),
+                    details.rendered_name.as_deref(),
                 );
                 if let Some(timeline) = timeline.as_deref_mut() {
                     record_gpu_timeline_interval(
@@ -5204,7 +5265,7 @@ fn decode_gpu_normal_event(
                         gpu_timestamp_bop,
                         duration,
                         || {
-                            begin
+                            details
                                 .rendered_name
                                 .clone()
                                 .or_else(|| specs.get(&begin.spec_id).map(|spec| spec.name.clone()))
@@ -5214,11 +5275,11 @@ fn decode_gpu_normal_event(
                 }
                 let total = breadcrumb_totals.entry(begin.spec_id).or_default();
                 total.count += 1;
-                if begin.metadata_bytes > 0 {
+                if details.metadata_bytes > 0 {
                     total.metadata_events += 1;
                     total.metadata_bytes = total
                         .metadata_bytes
-                        .saturating_add(u64::try_from(begin.metadata_bytes).unwrap());
+                        .saturating_add(u64::try_from(details.metadata_bytes).unwrap());
                 }
                 return Ok(());
             }
@@ -5230,7 +5291,7 @@ fn decode_gpu_normal_event(
                 begin.gpu_timestamp_top,
                 gpu_timestamp_bop,
                 duration,
-                begin.rendered_name.as_deref(),
+                details.rendered_name.as_deref(),
             );
             if let Some(timeline) = timeline {
                 record_gpu_timeline_interval(
@@ -5243,7 +5304,7 @@ fn decode_gpu_normal_event(
                     gpu_timestamp_bop,
                     duration,
                     || {
-                        begin
+                        details
                             .rendered_name
                             .clone()
                             .or_else(|| specs.get(&begin.spec_id).map(|spec| spec.name.clone()))
@@ -5251,57 +5312,59 @@ fn decode_gpu_normal_event(
                     },
                 );
             }
-            if begin.metadata_bytes > 0 {
+            if details.metadata_bytes > 0 {
                 queue.breadcrumb_metadata_count += 1;
                 queue.breadcrumb_metadata_bytes = queue
                     .breadcrumb_metadata_bytes
-                    .saturating_add(u64::try_from(begin.metadata_bytes).unwrap());
+                    .saturating_add(u64::try_from(details.metadata_bytes).unwrap());
                 queue.breadcrumb_decoded_metadata_bytes = queue
                     .breadcrumb_decoded_metadata_bytes
-                    .saturating_add(u64::try_from(begin.decoded_metadata_bytes).unwrap());
+                    .saturating_add(u64::try_from(details.decoded_metadata_bytes).unwrap());
                 queue.breadcrumb_undecoded_metadata_bytes = queue
                     .breadcrumb_undecoded_metadata_bytes
-                    .saturating_add(u64::try_from(begin.skipped_metadata_bytes).unwrap());
-                if begin.decode_failed {
+                    .saturating_add(u64::try_from(details.skipped_metadata_bytes).unwrap());
+                if details.decode_failed {
                     queue.breadcrumb_decode_failed_events += 1;
                 }
                 if queue.breadcrumb_metadata_hex_prefix.is_empty() {
-                    queue.breadcrumb_metadata_hex_prefix = begin.metadata_hex_prefix.clone();
+                    queue.breadcrumb_metadata_hex_prefix = details.metadata_hex_prefix.clone();
                 }
                 queue
                     .breadcrumb_metadata_strings
-                    .extend(begin.metadata_strings.iter().cloned());
+                    .extend(details.metadata_strings.iter().cloned());
             }
             let total = breadcrumb_totals.entry(begin.spec_id).or_default();
             total.count += 1;
             total.total_cycles = total.total_cycles.saturating_add(duration);
-            if begin.metadata_bytes > 0 {
+            if details.metadata_bytes > 0 {
                 total.metadata_events += 1;
                 total.metadata_bytes = total
                     .metadata_bytes
-                    .saturating_add(u64::try_from(begin.metadata_bytes).unwrap());
+                    .saturating_add(u64::try_from(details.metadata_bytes).unwrap());
                 total.decoded_metadata_bytes = total
                     .decoded_metadata_bytes
-                    .saturating_add(u64::try_from(begin.decoded_metadata_bytes).unwrap());
+                    .saturating_add(u64::try_from(details.decoded_metadata_bytes).unwrap());
                 total.undecoded_metadata_bytes = total
                     .undecoded_metadata_bytes
-                    .saturating_add(u64::try_from(begin.skipped_metadata_bytes).unwrap());
-                if begin.decode_failed {
+                    .saturating_add(u64::try_from(details.skipped_metadata_bytes).unwrap());
+                if details.decode_failed {
                     total.decode_failed_events += 1;
                 }
                 if total.metadata_hex_prefix.is_empty() {
-                    total.metadata_hex_prefix = begin.metadata_hex_prefix;
+                    total.metadata_hex_prefix = details.metadata_hex_prefix.clone();
                 }
-                total.metadata_strings.extend(begin.metadata_strings);
+                total
+                    .metadata_strings
+                    .extend(details.metadata_strings.iter().cloned());
                 if total.sample.is_none() {
                     if let Some(spec) = specs.get(&begin.spec_id) {
                         total.sample = Some(GpuBreadcrumbMetadataSample {
                             spec_id: begin.spec_id,
                             name: spec.name.clone(),
-                            rendered_name: begin.rendered_name,
+                            rendered_name: details.rendered_name.clone(),
                             fields: metadata_sample_fields(
                                 &spec.field_names,
-                                &begin.metadata_values,
+                                &details.metadata_values,
                             ),
                         });
                     }
@@ -12016,6 +12079,50 @@ mod tests {
         assert_eq!(total_frame_count, 121);
         assert!(truncated);
         assert_eq!(frames.len(), 120);
+    }
+
+    #[test]
+    fn gpu_breadcrumb_metadata_cache_reuses_only_matching_spec_payloads() {
+        let mut cache = GpuBreadcrumbMetadataCache::default();
+        let spec = GpuBreadcrumbSpec {
+            spec_id: 7,
+            name: "Frame".to_owned(),
+            ..GpuBreadcrumbSpec::default()
+        };
+        let metadata = [0x61, b'x'];
+
+        let first = cache.resolve(spec.spec_id, Some(&spec), &metadata);
+        let repeated = cache.resolve(spec.spec_id, Some(&spec), &metadata);
+        let other_spec = cache.resolve(spec.spec_id + 1, None, &metadata);
+        let other_payload = cache.resolve(spec.spec_id, Some(&spec), &[0x61, b'y']);
+
+        assert!(Rc::ptr_eq(&first, &repeated));
+        assert!(!Rc::ptr_eq(&first, &other_spec));
+        assert!(!Rc::ptr_eq(&first, &other_payload));
+        assert_eq!(cache.entries, 3);
+        assert_eq!(cache.key_bytes, metadata.len() * 3);
+    }
+
+    #[test]
+    fn gpu_breadcrumb_metadata_cache_stops_at_both_resource_caps() {
+        let metadata = [0x01];
+        let mut entry_limited = GpuBreadcrumbMetadataCache {
+            entries: MAX_GPU_BREADCRUMB_METADATA_CACHE_ENTRIES,
+            ..GpuBreadcrumbMetadataCache::default()
+        };
+        let first = entry_limited.resolve(1, None, &metadata);
+        let repeated = entry_limited.resolve(1, None, &metadata);
+        assert!(!Rc::ptr_eq(&first, &repeated));
+        assert!(entry_limited.by_spec.is_empty());
+
+        let mut byte_limited = GpuBreadcrumbMetadataCache {
+            key_bytes: MAX_GPU_BREADCRUMB_METADATA_CACHE_KEY_BYTES,
+            ..GpuBreadcrumbMetadataCache::default()
+        };
+        let first = byte_limited.resolve(1, None, &metadata);
+        let repeated = byte_limited.resolve(1, None, &metadata);
+        assert!(!Rc::ptr_eq(&first, &repeated));
+        assert!(byte_limited.by_spec.is_empty());
     }
 
     #[test]
