@@ -31,6 +31,7 @@ also retains phase durations and medians for every repetition.
 | Raise Rayon cap from 8 to 16 on a 32-logical-CPU host | Five-run finish median 1,943 ms in the sweep and 1,912 ms in the final confirmation | The cap remains 16, but the later metadata-stack discovery showed that this capture still selected the serial CPU fallback. Do not interpret this sweep as evidence about Rayon scaling. |
 | Raise Rayon cap from 16 to 24 | Finish median regressed from 1,943 to 2,283 ms; process-to-timeline regressed by 609 ms | Reverted. The metadata-stack discovery makes this capture's worker-count result inconclusive. |
 | Replay `MetadataStack` events in physical thread order during parallel CPU aggregation | The capture's 265 `ClearScope` and one `SaveStack` events had disabled the parallel path. Enabling their thread-local replay reduced native finish from 1,358 to 878 ms and the ten-sample browser CPU aggregation median from 933 to 541 ms. | Retained. Serial and parallel dashboard JSON were byte-for-byte equivalent after newline normalization (10,395,737 characters; SHA-256 `511049F5B9A7417E2A726194EEDECAD0FF4712058B51B4B00F4AEFF5C1429F54`). |
+| Resolve GPU event variants and fixed-field layouts once per UID | Nine native release samples reduced finish from 905 to 805 ms; the variant-only midpoint was 872 ms. Across two five-launch browser runs, normal dispatch moved from 744 ms before GPU routing to 731.5 ms with variant routing and 722.5 ms with cached layouts. | Retained. Required field existence, declared size, range, and payload bounds remain checked when each event is decoded. Dashboard JSON still matched the 10,395,737-character reference and SHA-256 exactly. |
 
 ## Retained result
 
@@ -45,9 +46,17 @@ most 16 Rayon workers, measured:
 | File selection → dashboard paint | 3,710 ms | 3,607 ms | 3,362 ms | -245 ms (-6.8%) |
 | Chromium launch → first timer paint | 5,893 ms | 5,789 ms | 5,243 ms | -546 ms (-9.4%) |
 
-Final finish medians were 744 ms normal dispatch, 541 ms CPU aggregation,
-246 ms provider finalization, and 1,666 ms for finish plus serialization. CPU
-aggregation is no longer the largest finish phase. Normal dispatch and provider
-finalization are the next targets, but the rejected experiments show that
+At the metadata-stack checkpoint, finish medians were 744 ms normal dispatch,
+541 ms CPU aggregation, 246 ms provider finalization, and 1,666 ms for finish
+plus serialization. CPU aggregation was no longer the largest finish phase.
+
+The subsequent GPU route and fixed-layout optimization reduced the combined
+ten-sample normal-dispatch median to 722.5 ms. Its current ten-sample full
+finish median was 1,684 ms, however, because CPU aggregation and provider
+finalization varied independently between runs. File-to-dashboard and
+process-to-timeline medians likewise measured 3,379 and 5,467 ms. Treat this as
+a repeatable 21.5 ms dispatch improvement and a 100 ms native finish
+improvement, not as a demonstrated cold end-to-end browser win. Provider
+finalization is the next target, but the rejected experiments show that
 reducing passes or hash lookups is not sufficient by itself: locality and
 concurrent memory pressure must be measured explicitly.

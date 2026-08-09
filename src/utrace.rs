@@ -3823,9 +3823,8 @@ fn read_known_important_events(
 /// Hot-path route for normal-stream dashboard events. Resolved once per UID at
 /// registry build time so the dispatch loop does not string-compare every event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
 enum DashboardEventKind {
-    Ignored = 0,
+    Ignored,
     Unmodeled,
     CpuProfilerMetadata,
     CpuProfilerEventBatchV3,
@@ -3834,7 +3833,7 @@ enum DashboardEventKind {
     MiscEndFrame,
     Misc,
     Cpu,
-    GpuProfiler,
+    GpuProfiler(GpuNormalEventRoute),
     Counters,
     StatsEventBatch2,
     CsvProfilerStat,
@@ -3853,6 +3852,67 @@ enum DashboardEventKind {
     SlateTraceAddWidget,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FixedFieldLayout {
+    offset: u16,
+    size: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuNormalEventRoute {
+    FrameBoundary {
+        queue_id: Option<FixedFieldLayout>,
+        frame_number: Option<FixedFieldLayout>,
+    },
+    BeginBreadcrumb {
+        spec_id: Option<FixedFieldLayout>,
+        queue_id: Option<FixedFieldLayout>,
+        gpu_timestamp_top: Option<FixedFieldLayout>,
+    },
+    EndBreadcrumb {
+        queue_id: Option<FixedFieldLayout>,
+        gpu_timestamp_bop: Option<FixedFieldLayout>,
+    },
+    BeginWork {
+        queue_id: Option<FixedFieldLayout>,
+        gpu_timestamp_top: Option<FixedFieldLayout>,
+        cpu_timestamp: Option<FixedFieldLayout>,
+    },
+    EndWork {
+        queue_id: Option<FixedFieldLayout>,
+        gpu_timestamp_bop: Option<FixedFieldLayout>,
+    },
+    Wait {
+        queue_id: Option<FixedFieldLayout>,
+        start_time: Option<FixedFieldLayout>,
+        end_time: Option<FixedFieldLayout>,
+    },
+    Stats {
+        queue_id: Option<FixedFieldLayout>,
+        num_draws: Option<FixedFieldLayout>,
+        num_primitives: Option<FixedFieldLayout>,
+    },
+    SignalFence {
+        queue_id: Option<FixedFieldLayout>,
+        cpu_timestamp: Option<FixedFieldLayout>,
+    },
+    WaitFence {
+        queue_id: Option<FixedFieldLayout>,
+        cpu_timestamp: Option<FixedFieldLayout>,
+    },
+}
+
+fn fixed_field_layout(event: &EventTypeInfo, name: &str) -> Option<FixedFieldLayout> {
+    event
+        .fields
+        .iter()
+        .find(|field| field.name == name)
+        .map(|field| FixedFieldLayout {
+            offset: field.offset,
+            size: field.size,
+        })
+}
+
 fn derive_dashboard_event_kind(event: &EventTypeInfo) -> DashboardEventKind {
     if decode_status_for(event) == DecodeStatus::Raw {
         return DashboardEventKind::Unmodeled;
@@ -3865,7 +3925,64 @@ fn derive_dashboard_event_kind(event: &EventTypeInfo) -> DashboardEventKind {
         ("Misc", "EndFrame") => DashboardEventKind::MiscEndFrame,
         ("Misc", _) => DashboardEventKind::Misc,
         ("Cpu", _) => DashboardEventKind::Cpu,
-        ("GpuProfiler", _) => DashboardEventKind::GpuProfiler,
+        ("GpuProfiler", "EventFrameBoundary") => {
+            DashboardEventKind::GpuProfiler(GpuNormalEventRoute::FrameBoundary {
+                queue_id: fixed_field_layout(event, "QueueId"),
+                frame_number: fixed_field_layout(event, "FrameNumber"),
+            })
+        }
+        ("GpuProfiler", "EventBeginBreadcrumb") => {
+            DashboardEventKind::GpuProfiler(GpuNormalEventRoute::BeginBreadcrumb {
+                spec_id: fixed_field_layout(event, "SpecId"),
+                queue_id: fixed_field_layout(event, "QueueId"),
+                gpu_timestamp_top: fixed_field_layout(event, "GPUTimestampTOP"),
+            })
+        }
+        ("GpuProfiler", "EventEndBreadcrumb") => {
+            DashboardEventKind::GpuProfiler(GpuNormalEventRoute::EndBreadcrumb {
+                queue_id: fixed_field_layout(event, "QueueId"),
+                gpu_timestamp_bop: fixed_field_layout(event, "GPUTimestampBOP"),
+            })
+        }
+        ("GpuProfiler", "EventBeginWork") => {
+            DashboardEventKind::GpuProfiler(GpuNormalEventRoute::BeginWork {
+                queue_id: fixed_field_layout(event, "QueueId"),
+                gpu_timestamp_top: fixed_field_layout(event, "GPUTimestampTOP"),
+                cpu_timestamp: fixed_field_layout(event, "CPUTimestamp"),
+            })
+        }
+        ("GpuProfiler", "EventEndWork") => {
+            DashboardEventKind::GpuProfiler(GpuNormalEventRoute::EndWork {
+                queue_id: fixed_field_layout(event, "QueueId"),
+                gpu_timestamp_bop: fixed_field_layout(event, "GPUTimestampBOP"),
+            })
+        }
+        ("GpuProfiler", "EventWait") => {
+            DashboardEventKind::GpuProfiler(GpuNormalEventRoute::Wait {
+                queue_id: fixed_field_layout(event, "QueueId"),
+                start_time: fixed_field_layout(event, "StartTime"),
+                end_time: fixed_field_layout(event, "EndTime"),
+            })
+        }
+        ("GpuProfiler", "EventStats") => {
+            DashboardEventKind::GpuProfiler(GpuNormalEventRoute::Stats {
+                queue_id: fixed_field_layout(event, "QueueId"),
+                num_draws: fixed_field_layout(event, "NumDraws"),
+                num_primitives: fixed_field_layout(event, "NumPrimitives"),
+            })
+        }
+        ("GpuProfiler", "SignalFence") => {
+            DashboardEventKind::GpuProfiler(GpuNormalEventRoute::SignalFence {
+                queue_id: fixed_field_layout(event, "QueueId"),
+                cpu_timestamp: fixed_field_layout(event, "CPUTimestamp"),
+            })
+        }
+        ("GpuProfiler", "WaitFence") => {
+            DashboardEventKind::GpuProfiler(GpuNormalEventRoute::WaitFence {
+                queue_id: fixed_field_layout(event, "QueueId"),
+                cpu_timestamp: fixed_field_layout(event, "CPUTimestamp"),
+            })
+        }
         ("Counters", _) => DashboardEventKind::Counters,
         ("Stats", "EventBatch2") => DashboardEventKind::StatsEventBatch2,
         ("CsvProfiler", "BeginStat" | "EndStat" | "CustomStatInt" | "CustomStatFloat") => {
@@ -4440,7 +4557,7 @@ fn read_dashboard_events(
                         .or_default()
                         .record(event, raw_event.data, thread_id)?;
                 }
-                DashboardEventKind::GpuProfiler => {
+                DashboardEventKind::GpuProfiler(gpu_kind) => {
                     let mut gpu_state = GpuNormalEventState {
                         specs: &gpu_breadcrumb_specs,
                         queues: &mut gpu_queues,
@@ -4450,7 +4567,7 @@ fn read_dashboard_events(
                             .as_mut()
                             .map(|sink| sink as &mut dyn GpuTimelineSink),
                     };
-                    decode_gpu_normal_event(event, raw_event.data, &mut gpu_state, 0)?;
+                    decode_gpu_normal_event(gpu_kind, event, raw_event.data, &mut gpu_state, 0)?;
                 }
                 DashboardEventKind::Counters => {
                     decode_counter_value(
@@ -4946,6 +5063,7 @@ struct GpuNormalEventState<'a> {
 }
 
 fn decode_gpu_normal_event(
+    route: GpuNormalEventRoute,
     event: &EventTypeInfo,
     data: &[u8],
     state: &mut GpuNormalEventState<'_>,
@@ -4956,20 +5074,36 @@ fn decode_gpu_normal_event(
     let breadcrumb_totals = &mut *state.breadcrumb_totals;
     let submission_latency_samples = &mut *state.submission_latency_samples;
     let mut timeline = state.timeline.as_deref_mut();
-    match event.event.as_str() {
-        "EventFrameBoundary" => {
-            let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
-            let frame_number = read_u32_field(event, data, "FrameNumber", base_offset)?;
+    match route {
+        GpuNormalEventRoute::FrameBoundary {
+            queue_id,
+            frame_number,
+        } => {
+            let queue_id =
+                read_u32_field_with_layout(event, data, "QueueId", base_offset, queue_id)?;
+            let frame_number =
+                read_u32_field_with_layout(event, data, "FrameNumber", base_offset, frame_number)?;
             let queue = queues.entry(queue_id).or_default();
             queue.current_frame = Some(frame_number);
             queue.frame_boundary_count += 1;
             queue.last_frame_number = Some(frame_number);
             queue.frames.entry(frame_number).or_default().boundary_count += 1;
         }
-        "EventBeginBreadcrumb" => {
-            let spec_id = read_u32_field(event, data, "SpecId", base_offset)?;
-            let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
-            let gpu_timestamp_top = read_u64_field(event, data, "GPUTimestampTOP", base_offset)?;
+        GpuNormalEventRoute::BeginBreadcrumb {
+            spec_id,
+            queue_id,
+            gpu_timestamp_top,
+        } => {
+            let spec_id = read_u32_field_with_layout(event, data, "SpecId", base_offset, spec_id)?;
+            let queue_id =
+                read_u32_field_with_layout(event, data, "QueueId", base_offset, queue_id)?;
+            let gpu_timestamp_top = read_u64_field_with_layout(
+                event,
+                data,
+                "GPUTimestampTOP",
+                base_offset,
+                gpu_timestamp_top,
+            )?;
             // Insights ignores events whose timestamp could not be determined.
             if gpu_timestamp_top == 0 {
                 return Ok(());
@@ -5018,9 +5152,19 @@ fn decode_gpu_normal_event(
                 gpu_timestamp_top,
             );
         }
-        "EventEndBreadcrumb" => {
-            let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
-            let gpu_timestamp_bop = read_u64_field(event, data, "GPUTimestampBOP", base_offset)?;
+        GpuNormalEventRoute::EndBreadcrumb {
+            queue_id,
+            gpu_timestamp_bop,
+        } => {
+            let queue_id =
+                read_u32_field_with_layout(event, data, "QueueId", base_offset, queue_id)?;
+            let gpu_timestamp_bop = read_u64_field_with_layout(
+                event,
+                data,
+                "GPUTimestampBOP",
+                base_offset,
+                gpu_timestamp_bop,
+            )?;
             let queue = queues.entry(queue_id).or_default();
             // Insights ignores events whose timestamp could not be determined
             // before touching the open stack, leaving the begin unterminated.
@@ -5164,10 +5308,27 @@ fn decode_gpu_normal_event(
                 }
             }
         }
-        "EventBeginWork" => {
-            let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
-            let gpu_timestamp_top = read_u64_field(event, data, "GPUTimestampTOP", base_offset)?;
-            let cpu_timestamp = read_u64_field(event, data, "CPUTimestamp", base_offset)?;
+        GpuNormalEventRoute::BeginWork {
+            queue_id,
+            gpu_timestamp_top,
+            cpu_timestamp,
+        } => {
+            let queue_id =
+                read_u32_field_with_layout(event, data, "QueueId", base_offset, queue_id)?;
+            let gpu_timestamp_top = read_u64_field_with_layout(
+                event,
+                data,
+                "GPUTimestampTOP",
+                base_offset,
+                gpu_timestamp_top,
+            )?;
+            let cpu_timestamp = read_u64_field_with_layout(
+                event,
+                data,
+                "CPUTimestamp",
+                base_offset,
+                cpu_timestamp,
+            )?;
             let queue = queues.entry(queue_id).or_default();
             queue.open_work.push(GpuOpenWork {
                 gpu_timestamp_top,
@@ -5194,9 +5355,19 @@ fn decode_gpu_normal_event(
                 cpu_timestamp,
             );
         }
-        "EventEndWork" => {
-            let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
-            let gpu_timestamp_bop = read_u64_field(event, data, "GPUTimestampBOP", base_offset)?;
+        GpuNormalEventRoute::EndWork {
+            queue_id,
+            gpu_timestamp_bop,
+        } => {
+            let queue_id =
+                read_u32_field_with_layout(event, data, "QueueId", base_offset, queue_id)?;
+            let gpu_timestamp_bop = read_u64_field_with_layout(
+                event,
+                data,
+                "GPUTimestampBOP",
+                base_offset,
+                gpu_timestamp_bop,
+            )?;
             let queue = queues.entry(queue_id).or_default();
             update_min_max(
                 &mut queue.min_gpu_timestamp,
@@ -5229,10 +5400,17 @@ fn decode_gpu_normal_event(
                 );
             }
         }
-        "EventWait" => {
-            let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
-            let start_time = read_u64_field(event, data, "StartTime", base_offset)?;
-            let end_time = read_u64_field(event, data, "EndTime", base_offset)?;
+        GpuNormalEventRoute::Wait {
+            queue_id,
+            start_time,
+            end_time,
+        } => {
+            let queue_id =
+                read_u32_field_with_layout(event, data, "QueueId", base_offset, queue_id)?;
+            let start_time =
+                read_u64_field_with_layout(event, data, "StartTime", base_offset, start_time)?;
+            let end_time =
+                read_u64_field_with_layout(event, data, "EndTime", base_offset, end_time)?;
             let queue = queues.entry(queue_id).or_default();
             update_min_max(
                 &mut queue.min_gpu_timestamp,
@@ -5251,19 +5429,45 @@ fn decode_gpu_normal_event(
                 record_gpu_frame_wait(queue, start_time, end_time, duration);
             }
         }
-        "EventStats" => {
-            let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
+        GpuNormalEventRoute::Stats {
+            queue_id,
+            num_draws,
+            num_primitives,
+        } => {
+            let queue_id =
+                read_u32_field_with_layout(event, data, "QueueId", base_offset, queue_id)?;
             let queue = queues.entry(queue_id).or_default();
-            let draw_count = u64::from(read_u32_field(event, data, "NumDraws", base_offset)?);
-            let primitive_count =
-                u64::from(read_u32_field(event, data, "NumPrimitives", base_offset)?);
+            let draw_count = u64::from(read_u32_field_with_layout(
+                event,
+                data,
+                "NumDraws",
+                base_offset,
+                num_draws,
+            )?);
+            let primitive_count = u64::from(read_u32_field_with_layout(
+                event,
+                data,
+                "NumPrimitives",
+                base_offset,
+                num_primitives,
+            )?);
             queue.draw_count = queue.draw_count.saturating_add(draw_count);
             queue.primitive_count = queue.primitive_count.saturating_add(primitive_count);
             record_gpu_frame_stats(queue, draw_count, primitive_count);
         }
-        "SignalFence" => {
-            let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
-            let cpu_timestamp = read_u64_field(event, data, "CPUTimestamp", base_offset)?;
+        GpuNormalEventRoute::SignalFence {
+            queue_id,
+            cpu_timestamp,
+        } => {
+            let queue_id =
+                read_u32_field_with_layout(event, data, "QueueId", base_offset, queue_id)?;
+            let cpu_timestamp = read_u64_field_with_layout(
+                event,
+                data,
+                "CPUTimestamp",
+                base_offset,
+                cpu_timestamp,
+            )?;
             let queue = queues.entry(queue_id).or_default();
             queue.signal_fence_count += 1;
             record_gpu_frame_signal_fence(queue);
@@ -5273,9 +5477,19 @@ fn decode_gpu_normal_event(
                 cpu_timestamp,
             );
         }
-        "WaitFence" => {
-            let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
-            let cpu_timestamp = read_u64_field(event, data, "CPUTimestamp", base_offset)?;
+        GpuNormalEventRoute::WaitFence {
+            queue_id,
+            cpu_timestamp,
+        } => {
+            let queue_id =
+                read_u32_field_with_layout(event, data, "QueueId", base_offset, queue_id)?;
+            let cpu_timestamp = read_u64_field_with_layout(
+                event,
+                data,
+                "CPUTimestamp",
+                base_offset,
+                cpu_timestamp,
+            )?;
             let queue = queues.entry(queue_id).or_default();
             queue.wait_fence_count += 1;
             record_gpu_frame_wait_fence(queue);
@@ -5285,7 +5499,6 @@ fn decode_gpu_normal_event(
                 cpu_timestamp,
             );
         }
-        _ => {}
     }
     Ok(())
 }
@@ -10277,6 +10490,20 @@ pub(crate) fn read_u32_field(
     ))
 }
 
+fn read_u32_field_with_layout(
+    event: &EventTypeInfo,
+    data: &[u8],
+    name: &str,
+    base_offset: u64,
+    layout: Option<FixedFieldLayout>,
+) -> Result<u32, TraceError> {
+    Ok(u32::from_le_bytes(
+        fixed_field_bytes_with_layout(event, data, name, 4, base_offset, layout)?
+            .try_into()
+            .expect("fixed field length was checked"),
+    ))
+}
+
 fn read_optional_u32_field(
     event: &EventTypeInfo,
     data: &[u8],
@@ -10337,6 +10564,20 @@ pub(crate) fn read_u64_field(
 ) -> Result<u64, TraceError> {
     Ok(u64::from_le_bytes(
         fixed_field_bytes(event, data, name, 8, base_offset)?
+            .try_into()
+            .expect("fixed field length was checked"),
+    ))
+}
+
+fn read_u64_field_with_layout(
+    event: &EventTypeInfo,
+    data: &[u8],
+    name: &str,
+    base_offset: u64,
+    layout: Option<FixedFieldLayout>,
+) -> Result<u64, TraceError> {
+    Ok(u64::from_le_bytes(
+        fixed_field_bytes_with_layout(event, data, name, 8, base_offset, layout)?
             .try_into()
             .expect("fixed field length was checked"),
     ))
@@ -10408,6 +10649,46 @@ pub(crate) fn fixed_field_bytes<'a>(
     base_offset: u64,
 ) -> Result<&'a [u8], TraceError> {
     let field = find_field(event, name)?;
+    fixed_field_bytes_at_layout(
+        event,
+        data,
+        name,
+        expected_size,
+        base_offset,
+        FixedFieldLayout {
+            offset: field.offset,
+            size: field.size,
+        },
+    )
+}
+
+fn fixed_field_bytes_with_layout<'a>(
+    event: &EventTypeInfo,
+    data: &'a [u8],
+    name: &str,
+    expected_size: usize,
+    base_offset: u64,
+    layout: Option<FixedFieldLayout>,
+) -> Result<&'a [u8], TraceError> {
+    let field = layout.ok_or_else(|| {
+        TraceError::new(
+            TraceErrorKind::MalformedData,
+            0,
+            format!("{}.{}", event.event, name),
+            "declared event is missing required field",
+        )
+    })?;
+    fixed_field_bytes_at_layout(event, data, name, expected_size, base_offset, field)
+}
+
+fn fixed_field_bytes_at_layout<'a>(
+    event: &EventTypeInfo,
+    data: &'a [u8],
+    name: &str,
+    expected_size: usize,
+    base_offset: u64,
+    field: FixedFieldLayout,
+) -> Result<&'a [u8], TraceError> {
     if usize::from(field.size) != expected_size {
         return Err(TraceError::new(
             TraceErrorKind::MalformedData,
@@ -13653,6 +13934,44 @@ mod tests {
         assert_eq!(
             derive_dashboard_event_kind(&important_only),
             DashboardEventKind::Ignored
+        );
+    }
+
+    #[test]
+    fn gpu_dashboard_route_caches_fixed_field_layouts() {
+        let event = test_event_type(
+            7,
+            "GpuProfiler",
+            "EventStats",
+            &[
+                regular_field(0, 4, UINT32, "QueueId"),
+                regular_field(4, 4, UINT32, "NumDraws"),
+                regular_field(8, 4, UINT32, "NumPrimitives"),
+            ],
+        );
+
+        assert_eq!(
+            derive_dashboard_event_kind(&event),
+            DashboardEventKind::GpuProfiler(GpuNormalEventRoute::Stats {
+                queue_id: Some(FixedFieldLayout { offset: 0, size: 4 }),
+                num_draws: Some(FixedFieldLayout { offset: 4, size: 4 }),
+                num_primitives: Some(FixedFieldLayout { offset: 8, size: 4 }),
+            })
+        );
+
+        let missing = test_event_type(
+            8,
+            "GpuProfiler",
+            "EventStats",
+            &[regular_field(0, 4, UINT32, "QueueId")],
+        );
+        assert_eq!(
+            derive_dashboard_event_kind(&missing),
+            DashboardEventKind::GpuProfiler(GpuNormalEventRoute::Stats {
+                queue_id: Some(FixedFieldLayout { offset: 0, size: 4 }),
+                num_draws: None,
+                num_primitives: None,
+            })
         );
     }
 
