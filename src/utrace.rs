@@ -9541,21 +9541,26 @@ fn cpu_metadata_dashboard(
     field_names.sort();
     field_names.dedup();
 
-    let mut strings = records
-        .values()
-        .flat_map(|record| record.strings.iter().cloned())
-        .collect::<Vec<_>>();
-    strings.sort();
-    strings.dedup();
-    strings.truncate(40);
+    let projection = cpu_metadata_projection(specs, records, &totals);
 
-    let spec_summaries = cpu_metadata_spec_summaries(specs, records, &totals);
-    let samples = spec_summaries
+    let samples = projection
+        .spec_summaries
         .iter()
         .filter_map(|summary| summary.sample.clone())
         .collect();
     let rendered_scopes =
         cpu_metadata_rendered_scope_summaries(specs, interval_state.rendered_scope_totals);
+    let CpuMetadataProjection {
+        strings,
+        spec_summaries,
+        metadata_bytes,
+        decoded_records,
+        decoded_values,
+        decoded_metadata_bytes,
+        undecoded_records,
+        decode_failed_records,
+        undecoded_metadata_bytes,
+    } = projection;
 
     CpuMetadataDashboard {
         specs: u64::try_from(specs.len()).unwrap(),
@@ -9572,43 +9577,16 @@ fn cpu_metadata_dashboard(
             .sum(),
         field_names,
         records: u64::try_from(records.len()).unwrap(),
-        metadata_bytes: records
-            .values()
-            .map(|record| u64::try_from(record.metadata_bytes).unwrap())
-            .sum(),
+        metadata_bytes,
         scopes: total_metadata_scopes,
         resolved_scopes,
         unresolved_scopes: total_metadata_scopes.saturating_sub(resolved_scopes),
-        decoded_records: records
-            .values()
-            .filter(|record| !record.values.is_empty())
-            .count()
-            .try_into()
-            .unwrap(),
-        decoded_values: records
-            .values()
-            .map(|record| u64::try_from(record.values.len()).unwrap())
-            .sum(),
-        decoded_metadata_bytes: records
-            .values()
-            .map(|record| u64::try_from(record.decoded_metadata_bytes).unwrap())
-            .sum(),
-        undecoded_records: records
-            .values()
-            .filter(|record| record.values.is_empty() && record.metadata_bytes > 0)
-            .count()
-            .try_into()
-            .unwrap(),
-        decode_failed_records: records
-            .values()
-            .filter(|record| record.decode_failed)
-            .count()
-            .try_into()
-            .unwrap(),
-        undecoded_metadata_bytes: records
-            .values()
-            .map(|record| u64::try_from(record.skipped_metadata_bytes).unwrap())
-            .sum(),
+        decoded_records,
+        decoded_values,
+        decoded_metadata_bytes,
+        undecoded_records,
+        decode_failed_records,
+        undecoded_metadata_bytes,
         strings,
         samples,
         spec_summaries,
@@ -9622,7 +9600,23 @@ fn cpu_metadata_rendered_scope_summaries(
     specs: &BTreeMap<u32, CpuMetadataSpec>,
     totals: BTreeMap<(u32, String), (u64, u64)>,
 ) -> Vec<CpuMetadataRenderedScopeSummary> {
-    let mut summaries = totals
+    const LIMIT: usize = 40;
+    let mut candidates = totals.into_iter().collect::<Vec<_>>();
+    let compare = |left: &((u32, String), (u64, u64)), right: &((u32, String), (u64, u64))| {
+        right
+            .1
+            .1
+            .cmp(&left.1.1)
+            .then_with(|| right.1.0.cmp(&left.1.0))
+            .then_with(|| left.0.0.cmp(&right.0.0))
+            .then_with(|| left.0.1.cmp(&right.0.1))
+    };
+    if candidates.len() > LIMIT {
+        candidates.select_nth_unstable_by(LIMIT, compare);
+        candidates.truncate(LIMIT);
+    }
+    candidates.sort_unstable_by(compare);
+    candidates
         .into_iter()
         .map(
             |((spec_id, rendered_name), (count, total_cycles))| CpuMetadataRenderedScopeSummary {
@@ -9636,17 +9630,24 @@ fn cpu_metadata_rendered_scope_summaries(
                 total_cycles,
             },
         )
-        .collect::<Vec<_>>();
-    summaries.sort_by(|left, right| {
-        right
-            .total_cycles
-            .cmp(&left.total_cycles)
-            .then_with(|| right.count.cmp(&left.count))
-            .then_with(|| left.spec_id.cmp(&right.spec_id))
-            .then_with(|| left.rendered_name.cmp(&right.rendered_name))
-    });
-    summaries.truncate(40);
-    summaries
+        .collect()
+}
+
+fn insert_bounded_string(values: &mut BTreeSet<String>, value: &str, limit: usize) {
+    if limit == 0 || values.contains(value) {
+        return;
+    }
+    if values.len() >= limit
+        && values
+            .last()
+            .is_some_and(|largest| value >= largest.as_str())
+    {
+        return;
+    }
+    values.insert(value.to_owned());
+    if values.len() > limit {
+        values.pop_last();
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -9666,29 +9667,66 @@ struct CpuMetadataSpecState {
     sample: Option<CpuMetadataSample>,
 }
 
-fn cpu_metadata_spec_summaries(
+struct CpuMetadataProjection {
+    strings: Vec<String>,
+    spec_summaries: Vec<CpuMetadataSpecSummary>,
+    metadata_bytes: u64,
+    decoded_records: u64,
+    decoded_values: u64,
+    decoded_metadata_bytes: u64,
+    undecoded_records: u64,
+    decode_failed_records: u64,
+    undecoded_metadata_bytes: u64,
+}
+
+fn cpu_metadata_projection(
     specs: &BTreeMap<u32, CpuMetadataSpec>,
     records: &FxHashMap<u32, CpuMetadataRecord>,
     totals: &FxHashMap<u32, (u64, u64)>,
-) -> Vec<CpuMetadataSpecSummary> {
+) -> CpuMetadataProjection {
     let mut states = BTreeMap::<u32, CpuMetadataSpecState>::new();
+    let mut strings = BTreeSet::new();
+    let mut metadata_bytes = 0_u64;
+    let mut decoded_records = 0_u64;
+    let mut decoded_values = 0_u64;
+    let mut decoded_metadata_bytes = 0_u64;
+    let mut undecoded_records = 0_u64;
+    let mut decode_failed_records = 0_u64;
+    let mut undecoded_metadata_bytes = 0_u64;
 
     for record in records.values() {
+        let record_metadata_bytes = u64::try_from(record.metadata_bytes).unwrap();
+        let record_decoded_values = u64::try_from(record.values.len()).unwrap();
+        let record_decoded_bytes = u64::try_from(record.decoded_metadata_bytes).unwrap();
+        let record_undecoded_bytes = u64::try_from(record.skipped_metadata_bytes).unwrap();
+        metadata_bytes = metadata_bytes.saturating_add(record_metadata_bytes);
+        decoded_values = decoded_values.saturating_add(record_decoded_values);
+        decoded_metadata_bytes = decoded_metadata_bytes.saturating_add(record_decoded_bytes);
+        undecoded_metadata_bytes = undecoded_metadata_bytes.saturating_add(record_undecoded_bytes);
+        if record.values.is_empty() && record.metadata_bytes > 0 {
+            undecoded_records += 1;
+        }
+        if record.decode_failed {
+            decode_failed_records += 1;
+        }
+        if !record.values.is_empty() {
+            decoded_records += 1;
+        }
+        for value in &record.strings {
+            insert_bounded_string(&mut strings, value, 40);
+        }
+
         let spec = specs.get(&record.spec_id);
         let state = states.entry(record.spec_id).or_default();
         state.records += 1;
-        state.metadata_bytes = state
-            .metadata_bytes
-            .saturating_add(u64::try_from(record.metadata_bytes).unwrap());
-        state.decoded_values = state
-            .decoded_values
-            .saturating_add(u64::try_from(record.values.len()).unwrap());
+        state.metadata_bytes = state.metadata_bytes.saturating_add(record_metadata_bytes);
+        state.decoded_values = state.decoded_values.saturating_add(record_decoded_values);
         state.decoded_metadata_bytes = state
             .decoded_metadata_bytes
-            .saturating_add(u64::try_from(record.decoded_metadata_bytes).unwrap());
+            .saturating_add(record_decoded_bytes);
         state.undecoded_metadata_bytes = state
             .undecoded_metadata_bytes
-            .saturating_add(u64::try_from(record.skipped_metadata_bytes).unwrap());
+            .saturating_add(record_undecoded_bytes);
         if record.values.is_empty() && record.metadata_bytes > 0 {
             state.undecoded_records += 1;
         }
@@ -9704,11 +9742,13 @@ fn cpu_metadata_spec_summaries(
             {
                 state.sample = Some(cpu_metadata_sample(spec, record));
             }
-            if let Some(rendered_name) = record.rendered_name.clone() {
-                state.rendered_names.insert(rendered_name);
+            if let Some(rendered_name) = record.rendered_name.as_deref() {
+                insert_bounded_string(&mut state.rendered_names, rendered_name, 8);
             }
         }
-        state.strings.extend(record.strings.iter().cloned());
+        for value in &record.strings {
+            insert_bounded_string(&mut state.strings, value, 8);
+        }
     }
 
     for (&spec_id, &(scopes, total_cycles)) in totals {
@@ -9717,7 +9757,7 @@ fn cpu_metadata_spec_summaries(
         state.total_cycles = total_cycles;
     }
 
-    let mut summaries = states
+    let mut spec_summaries = states
         .into_iter()
         .map(|(spec_id, state)| {
             let mut strings = state.strings.into_iter().collect::<Vec<_>>();
@@ -9747,7 +9787,7 @@ fn cpu_metadata_spec_summaries(
         })
         .collect::<Vec<_>>();
 
-    summaries.sort_by(|left, right| {
+    spec_summaries.sort_by(|left, right| {
         right
             .total_cycles
             .cmp(&left.total_cycles)
@@ -9756,8 +9796,18 @@ fn cpu_metadata_spec_summaries(
             .then_with(|| right.metadata_bytes.cmp(&left.metadata_bytes))
             .then_with(|| left.spec_id.cmp(&right.spec_id))
     });
-    summaries.truncate(40);
-    summaries
+    spec_summaries.truncate(40);
+    CpuMetadataProjection {
+        strings: strings.into_iter().collect(),
+        spec_summaries,
+        metadata_bytes,
+        decoded_records,
+        decoded_values,
+        decoded_metadata_bytes,
+        undecoded_records,
+        decode_failed_records,
+        undecoded_metadata_bytes,
+    }
 }
 
 fn cpu_metadata_sample(
@@ -12042,6 +12092,58 @@ mod tests {
         assert_eq!(
             gpu_frame_top_breadcrumbs(&breadcrumb_totals),
             expected_breadcrumbs
+        );
+    }
+
+    #[test]
+    fn bounded_metadata_rankings_match_full_sort_order() {
+        let input = ["zeta", "beta", "alpha", "delta", "beta", "gamma"];
+        let mut bounded = BTreeSet::new();
+        for value in input {
+            insert_bounded_string(&mut bounded, value, 4);
+        }
+        let mut expected = input.into_iter().collect::<BTreeSet<_>>();
+        while expected.len() > 4 {
+            expected.pop_last();
+        }
+        assert_eq!(
+            bounded.into_iter().collect::<Vec<_>>(),
+            expected.into_iter().map(str::to_owned).collect::<Vec<_>>()
+        );
+
+        let rendered_totals = (0..60_u32)
+            .map(|index| {
+                (
+                    (index % 3, format!("Frame {index:02}")),
+                    (u64::from(index % 5), u64::from((index * 11) % 47)),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut expected = rendered_totals
+            .clone()
+            .into_iter()
+            .map(|((spec_id, rendered_name), (count, total_cycles))| {
+                CpuMetadataRenderedScopeSummary {
+                    spec_id,
+                    name: format!("#{spec_id}"),
+                    rendered_name,
+                    count,
+                    total_cycles,
+                }
+            })
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| {
+            right
+                .total_cycles
+                .cmp(&left.total_cycles)
+                .then_with(|| right.count.cmp(&left.count))
+                .then_with(|| left.spec_id.cmp(&right.spec_id))
+                .then_with(|| left.rendered_name.cmp(&right.rendered_name))
+        });
+        expected.truncate(40);
+        assert_eq!(
+            cpu_metadata_rendered_scope_summaries(&BTreeMap::new(), rendered_totals),
+            expected
         );
     }
 

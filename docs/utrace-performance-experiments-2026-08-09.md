@@ -33,6 +33,7 @@ also retains phase durations and medians for every repetition.
 | Replay `MetadataStack` events in physical thread order during parallel CPU aggregation | The capture's 265 `ClearScope` and one `SaveStack` events had disabled the parallel path. Enabling their thread-local replay reduced native finish from 1,358 to 878 ms and the ten-sample browser CPU aggregation median from 933 to 541 ms. | Retained. Serial and parallel dashboard JSON were byte-for-byte equivalent after newline normalization (10,395,737 characters; SHA-256 `511049F5B9A7417E2A726194EEDECAD0FF4712058B51B4B00F4AEFF5C1429F54`). |
 | Resolve GPU event variants and fixed-field layouts once per UID | Nine native release samples reduced finish from 905 to 805 ms; the variant-only midpoint was 872 ms. Across two five-launch browser runs, normal dispatch moved from 744 ms before GPU routing to 731.5 ms with variant routing and 722.5 ms with cached layouts. | Retained. Required field existence, declared size, range, and payload bounds remain checked when each event is decoded. Dashboard JSON still matched the 10,395,737-character reference and SHA-256 exactly. |
 | Select bounded per-frame CPU and GPU rankings before allocating names | Native probes attributed 58–61 ms of provider finalization to frame correlation. Exact top-5/top-8 selection reduced that slice to 15–18 ms and the nine-sample native finish median from 805 to 783 ms. Two five-launch browser runs reduced provider finalization from 263.5 to 127.5 ms and finish from 1,684 to 1,649.5 ms. | Retained. A regression test compares bounded selection with the previous full-sort ordering, and the real dashboard length and SHA-256 remain exact. Cold file-to-dashboard and process-to-timeline medians were effectively flat in these samples. |
+| Bound and fuse CPU metadata projection | On 152,903 metadata records, bounded global/per-spec strings and rendered scopes reduced native metadata projection from roughly 55 to 49 ms. Fusing global strings, per-spec summaries, and scalar counters into one record pass moved it to 32 ms and total CPU provider projection from about 64 to 42 ms. | Retained. Two five-launch browser runs reduced provider finalization from 127.5 to 88 ms, finish from 1,649.5 to 1,526 ms, file-to-dashboard from 3,366 to 3,274 ms, and process-to-timeline from 5,465 to 5,342 ms. Ordering-equivalence tests and the real-trace SHA-256 remained exact. |
 
 ## Retained result
 
@@ -71,3 +72,11 @@ rounded to zero on this capture. Bounded ranking moved frame correlation to
 so file-to-dashboard (3,366 ms) and process-to-timeline (5,465 ms) stayed flat.
 The next optimization target should therefore be CPU summary projection or a
 new dispatch sub-profile, not the already-small provider dashboards.
+
+The CPU split attributed 55–60 ms of its original 64–69 ms native projection
+to the metadata dashboard. The final bounded, fused pass reduced metadata to a
+32 ms median and the full CPU projection to about 42 ms. In the combined ten
+browser samples, provider finalization reached 88 ms, finish plus serialization
+1,526 ms, file-to-dashboard 3,274 ms, and process-to-timeline 5,342 ms. Normal
+dispatch is again the dominant finish phase; further work should add sub-phase
+attribution there before changing more event decoders.
