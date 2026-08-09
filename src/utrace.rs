@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 use serde::Serialize;
@@ -4083,6 +4084,7 @@ fn read_dashboard_events(
     let mut spec_by_id = BTreeMap::<u32, CpuScopeSpec>::new();
     let mut metadata_spec_by_id = BTreeMap::<u32, CpuMetadataSpec>::new();
     let mut metadata_by_id = FxHashMap::<u32, CpuMetadataRecord>::default();
+    let mut cpu_metadata_cache = CpuMetadataCache::default();
     let mut metadata_generation = 0_u64;
     let mut metadata_scope_totals = FxHashMap::<u32, (u64, u64)>::default();
     let mut metadata_interval_state = CpuMetadataIntervalState::default();
@@ -4457,8 +4459,13 @@ fn read_dashboard_events(
             }
             match kind {
                 DashboardEventKind::CpuProfilerMetadata => {
-                    let mut record = decode_cpu_metadata_record(event, raw_event.data, 0)?;
-                    enrich_cpu_metadata_record(&metadata_spec_by_id, &mut record);
+                    let record = decode_cpu_metadata_record(
+                        event,
+                        raw_event.data,
+                        &metadata_spec_by_id,
+                        Some(&mut cpu_metadata_cache),
+                        0,
+                    )?;
                     if let Some(timeline) = monotonic_cpu_catalog_sink.as_mut() {
                         timeline.register_metadata(
                             record.metadata_id,
@@ -4695,9 +4702,10 @@ fn read_dashboard_events(
         },
     )?;
     decoded.dispatch = Some(dispatch_summary);
-    // Cached details are only useful during serial GPU dispatch. Release them
-    // before the parallel CPU aggregation pass starts.
+    // Cache keys and their extra strong references are only useful during
+    // serial dispatch. Release them before parallel CPU aggregation starts.
     drop(gpu_breadcrumb_metadata_cache);
+    drop(cpu_metadata_cache);
     notify_finish_phase(
         &mut phase_complete,
         crate::utrace_session::ProgressiveFinishPhase::NormalEventDispatch,
@@ -4925,77 +4933,96 @@ struct GpuOpenBreadcrumb {
     details: Rc<GpuBreadcrumbDetails>,
 }
 
-const MAX_GPU_BREADCRUMB_METADATA_CACHE_ENTRIES: usize = 4_096;
-const MAX_GPU_BREADCRUMB_METADATA_CACHE_KEY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DECODED_METADATA_CACHE_ENTRIES: usize = 4_096;
+const MAX_DECODED_METADATA_CACHE_KEY_BYTES: usize = 2 * 1024 * 1024;
 
-#[derive(Default)]
-struct GpuBreadcrumbMetadataCache {
-    by_spec: FxHashMap<u32, FxHashMap<Vec<u8>, Rc<GpuBreadcrumbDetails>>>,
+struct BoundedMetadataCache<T> {
+    by_spec: FxHashMap<u32, FxHashMap<Vec<u8>, T>>,
     entries: usize,
     key_bytes: usize,
 }
 
-impl GpuBreadcrumbMetadataCache {
-    fn resolve(
-        &mut self,
-        spec_id: u32,
-        spec: Option<&GpuBreadcrumbSpec>,
-        metadata: &[u8],
-    ) -> Rc<GpuBreadcrumbDetails> {
-        if let Some(details) = self
-            .by_spec
+impl<T> Default for BoundedMetadataCache<T> {
+    fn default() -> Self {
+        Self {
+            by_spec: FxHashMap::default(),
+            entries: 0,
+            key_bytes: 0,
+        }
+    }
+}
+
+impl<T> BoundedMetadataCache<T> {
+    fn get(&self, spec_id: u32, metadata: &[u8]) -> Option<&T> {
+        self.by_spec
             .get(&spec_id)
             .and_then(|by_metadata| by_metadata.get(metadata))
-        {
-            return Rc::clone(details);
+    }
+
+    fn retain(&mut self, spec_id: u32, metadata: &[u8], value: T) {
+        if self.get(spec_id, metadata).is_some() {
+            return;
         }
-
-        let metadata_report = decode_cbor_report(metadata);
-        let mut metadata_strings = metadata_report
-            .values
-            .iter()
-            .flat_map(metadata_value_strings)
-            .collect::<Vec<_>>();
-        metadata_strings.sort();
-        metadata_strings.dedup();
-        let rendered_name = spec.and_then(|spec| {
-            render_metadata_name_parts(
-                &spec.name,
-                spec.name_format.as_deref(),
-                &metadata_report.values,
-            )
-        });
-        let details = Rc::new(GpuBreadcrumbDetails {
-            metadata_bytes: metadata.len(),
-            decoded_metadata_bytes: metadata_report.consumed_bytes,
-            skipped_metadata_bytes: metadata_report.skipped_bytes,
-            decode_failed: metadata_report.failed_reads > 0,
-            metadata_hex_prefix: if metadata.is_empty() {
-                String::new()
-            } else {
-                hex_prefix(metadata, 32)
-            },
-            metadata_strings,
-            metadata_values: metadata_report.values,
-            rendered_name,
-        });
-
         let Some(next_key_bytes) = self.key_bytes.checked_add(metadata.len()) else {
-            return details;
+            return;
         };
-        if self.entries >= MAX_GPU_BREADCRUMB_METADATA_CACHE_ENTRIES
-            || next_key_bytes > MAX_GPU_BREADCRUMB_METADATA_CACHE_KEY_BYTES
+        if self.entries >= MAX_DECODED_METADATA_CACHE_ENTRIES
+            || next_key_bytes > MAX_DECODED_METADATA_CACHE_KEY_BYTES
         {
-            return details;
+            return;
         }
         self.by_spec
             .entry(spec_id)
             .or_default()
-            .insert(metadata.to_vec(), Rc::clone(&details));
+            .insert(metadata.to_vec(), value);
         self.entries += 1;
         self.key_bytes = next_key_bytes;
-        details
     }
+}
+
+type GpuBreadcrumbMetadataCache = BoundedMetadataCache<Rc<GpuBreadcrumbDetails>>;
+
+fn resolve_gpu_breadcrumb_details(
+    cache: &mut GpuBreadcrumbMetadataCache,
+    spec_id: u32,
+    spec: Option<&GpuBreadcrumbSpec>,
+    metadata: &[u8],
+) -> Rc<GpuBreadcrumbDetails> {
+    if let Some(details) = cache.get(spec_id, metadata) {
+        return Rc::clone(details);
+    }
+
+    let metadata_report = decode_cbor_report(metadata);
+    let mut metadata_strings = metadata_report
+        .values
+        .iter()
+        .flat_map(metadata_value_strings)
+        .collect::<Vec<_>>();
+    metadata_strings.sort();
+    metadata_strings.dedup();
+    let rendered_name = spec.and_then(|spec| {
+        render_metadata_name_parts(
+            &spec.name,
+            spec.name_format.as_deref(),
+            &metadata_report.values,
+        )
+    });
+    let details = Rc::new(GpuBreadcrumbDetails {
+        metadata_bytes: metadata.len(),
+        decoded_metadata_bytes: metadata_report.consumed_bytes,
+        skipped_metadata_bytes: metadata_report.skipped_bytes,
+        decode_failed: metadata_report.failed_reads > 0,
+        metadata_hex_prefix: if metadata.is_empty() {
+            String::new()
+        } else {
+            hex_prefix(metadata, 32)
+        },
+        metadata_strings,
+        metadata_values: metadata_report.values,
+        rendered_name,
+    });
+    cache.retain(spec_id, metadata, Rc::clone(&details));
+    details
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -5195,7 +5222,8 @@ fn decode_gpu_normal_event(
                 return Ok(());
             }
             let metadata = read_aux_bytes(event, data, "Metadata", base_offset)?;
-            let details = metadata_cache.resolve(
+            let details = resolve_gpu_breadcrumb_details(
+                metadata_cache,
                 spec_id,
                 specs.get(&spec_id),
                 metadata.as_deref().unwrap_or_default(),
@@ -9016,9 +9044,7 @@ struct CborDecodeReport {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-struct CpuMetadataRecord {
-    metadata_id: u32,
-    spec_id: u32,
+struct CpuMetadataDetails {
     name: String,
     rendered_name: Option<String>,
     metadata_bytes: usize,
@@ -9028,6 +9054,23 @@ struct CpuMetadataRecord {
     values: Vec<MetadataValue>,
     strings: Vec<String>,
 }
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CpuMetadataRecord {
+    metadata_id: u32,
+    spec_id: u32,
+    details: Arc<CpuMetadataDetails>,
+}
+
+impl std::ops::Deref for CpuMetadataRecord {
+    type Target = CpuMetadataDetails;
+
+    fn deref(&self) -> &Self::Target {
+        &self.details
+    }
+}
+
+type CpuMetadataCache = BoundedMetadataCache<Arc<CpuMetadataDetails>>;
 
 trait CpuMetadataLookup: Sync {
     fn get_at(&self, metadata_id: u32, generation: u64) -> Option<&CpuMetadataRecord>;
@@ -9529,10 +9572,46 @@ fn decode_cpu_metadata_spec(
 fn decode_cpu_metadata_record(
     event: &EventTypeInfo,
     data: &[u8],
+    specs: &BTreeMap<u32, CpuMetadataSpec>,
+    cache: Option<&mut CpuMetadataCache>,
     base_offset: u64,
 ) -> Result<CpuMetadataRecord, TraceError> {
+    let metadata_id = read_u32_field(event, data, "Id", base_offset)?;
+    let spec_id = read_u32_field(event, data, "SpecId", base_offset)?;
     let metadata = read_aux_bytes(event, data, "Metadata", base_offset)?.unwrap_or_default();
-    let report = decode_cbor_report(&metadata);
+    let details = match cache {
+        Some(cache) => {
+            resolve_cpu_metadata_details(cache, spec_id, specs.get(&spec_id), metadata.as_ref())
+        }
+        None => decode_cpu_metadata_details(spec_id, specs.get(&spec_id), metadata.as_ref()),
+    };
+    Ok(CpuMetadataRecord {
+        metadata_id,
+        spec_id,
+        details,
+    })
+}
+
+fn resolve_cpu_metadata_details(
+    cache: &mut CpuMetadataCache,
+    spec_id: u32,
+    spec: Option<&CpuMetadataSpec>,
+    metadata: &[u8],
+) -> Arc<CpuMetadataDetails> {
+    if let Some(details) = cache.get(spec_id, metadata) {
+        return Arc::clone(details);
+    }
+    let details = decode_cpu_metadata_details(spec_id, spec, metadata);
+    cache.retain(spec_id, metadata, Arc::clone(&details));
+    details
+}
+
+fn decode_cpu_metadata_details(
+    spec_id: u32,
+    spec: Option<&CpuMetadataSpec>,
+    metadata: &[u8],
+) -> Arc<CpuMetadataDetails> {
+    let report = decode_cbor_report(metadata);
     let mut strings = report
         .values
         .iter()
@@ -9540,11 +9619,11 @@ fn decode_cpu_metadata_record(
         .collect::<Vec<_>>();
     strings.sort();
     strings.dedup();
-    Ok(CpuMetadataRecord {
-        metadata_id: read_u32_field(event, data, "Id", base_offset)?,
-        spec_id: read_u32_field(event, data, "SpecId", base_offset)?,
-        name: String::new(),
-        rendered_name: None,
+    Arc::new(CpuMetadataDetails {
+        name: spec
+            .map(|spec| spec.name.clone())
+            .unwrap_or_else(|| format!("#{spec_id}")),
+        rendered_name: spec.and_then(|spec| render_metadata_name(spec, &report.values)),
         metadata_bytes: metadata.len(),
         decoded_metadata_bytes: report.consumed_bytes,
         skipped_metadata_bytes: report.skipped_bytes,
@@ -9554,15 +9633,17 @@ fn decode_cpu_metadata_record(
     })
 }
 
+#[cfg(test)]
 fn enrich_cpu_metadata_record(
     specs: &BTreeMap<u32, CpuMetadataSpec>,
     record: &mut CpuMetadataRecord,
 ) {
     let spec = specs.get(&record.spec_id);
-    record.name = spec
+    let details = Arc::make_mut(&mut record.details);
+    details.name = spec
         .map(|spec| spec.name.clone())
         .unwrap_or_else(|| format!("#{}", record.spec_id));
-    record.rendered_name = spec.and_then(|spec| render_metadata_name(spec, &record.values));
+    details.rendered_name = spec.and_then(|spec| render_metadata_name(spec, &details.values));
 }
 
 fn cpu_metadata_dashboard(
@@ -12091,10 +12172,14 @@ mod tests {
         };
         let metadata = [0x61, b'x'];
 
-        let first = cache.resolve(spec.spec_id, Some(&spec), &metadata);
-        let repeated = cache.resolve(spec.spec_id, Some(&spec), &metadata);
-        let other_spec = cache.resolve(spec.spec_id + 1, None, &metadata);
-        let other_payload = cache.resolve(spec.spec_id, Some(&spec), &[0x61, b'y']);
+        let first =
+            resolve_gpu_breadcrumb_details(&mut cache, spec.spec_id, Some(&spec), &metadata);
+        let repeated =
+            resolve_gpu_breadcrumb_details(&mut cache, spec.spec_id, Some(&spec), &metadata);
+        let other_spec =
+            resolve_gpu_breadcrumb_details(&mut cache, spec.spec_id + 1, None, &metadata);
+        let other_payload =
+            resolve_gpu_breadcrumb_details(&mut cache, spec.spec_id, Some(&spec), &[0x61, b'y']);
 
         assert!(Rc::ptr_eq(&first, &repeated));
         assert!(!Rc::ptr_eq(&first, &other_spec));
@@ -12107,22 +12192,49 @@ mod tests {
     fn gpu_breadcrumb_metadata_cache_stops_at_both_resource_caps() {
         let metadata = [0x01];
         let mut entry_limited = GpuBreadcrumbMetadataCache {
-            entries: MAX_GPU_BREADCRUMB_METADATA_CACHE_ENTRIES,
+            entries: MAX_DECODED_METADATA_CACHE_ENTRIES,
             ..GpuBreadcrumbMetadataCache::default()
         };
-        let first = entry_limited.resolve(1, None, &metadata);
-        let repeated = entry_limited.resolve(1, None, &metadata);
+        let first = resolve_gpu_breadcrumb_details(&mut entry_limited, 1, None, &metadata);
+        let repeated = resolve_gpu_breadcrumb_details(&mut entry_limited, 1, None, &metadata);
         assert!(!Rc::ptr_eq(&first, &repeated));
         assert!(entry_limited.by_spec.is_empty());
 
         let mut byte_limited = GpuBreadcrumbMetadataCache {
-            key_bytes: MAX_GPU_BREADCRUMB_METADATA_CACHE_KEY_BYTES,
+            key_bytes: MAX_DECODED_METADATA_CACHE_KEY_BYTES,
             ..GpuBreadcrumbMetadataCache::default()
         };
-        let first = byte_limited.resolve(1, None, &metadata);
-        let repeated = byte_limited.resolve(1, None, &metadata);
+        let first = resolve_gpu_breadcrumb_details(&mut byte_limited, 1, None, &metadata);
+        let repeated = resolve_gpu_breadcrumb_details(&mut byte_limited, 1, None, &metadata);
         assert!(!Rc::ptr_eq(&first, &repeated));
         assert!(byte_limited.by_spec.is_empty());
+    }
+
+    #[test]
+    fn cpu_metadata_cache_reuses_only_matching_spec_payloads() {
+        let mut cache = CpuMetadataCache::default();
+        let spec = CpuMetadataSpec {
+            spec_id: 7,
+            name: "Frame".to_owned(),
+            name_format: Some(" %s".to_owned()),
+            ..CpuMetadataSpec::default()
+        };
+        let metadata = [0x61, b'x'];
+
+        let first = resolve_cpu_metadata_details(&mut cache, spec.spec_id, Some(&spec), &metadata);
+        let repeated =
+            resolve_cpu_metadata_details(&mut cache, spec.spec_id, Some(&spec), &metadata);
+        let other_spec =
+            resolve_cpu_metadata_details(&mut cache, spec.spec_id + 1, None, &metadata);
+        let other_payload =
+            resolve_cpu_metadata_details(&mut cache, spec.spec_id, Some(&spec), &[0x61, b'y']);
+
+        assert!(Arc::ptr_eq(&first, &repeated));
+        assert!(!Arc::ptr_eq(&first, &other_spec));
+        assert!(!Arc::ptr_eq(&first, &other_payload));
+        assert_eq!(cache.entries, 3);
+        assert_eq!(cache.key_bytes, metadata.len() * 3);
+        assert_eq!(first.rendered_name.as_deref(), Some("Frame x"));
     }
 
     #[test]
@@ -12566,7 +12678,9 @@ mod tests {
         record_data.extend_from_slice(&7_u32.to_le_bytes());
         record_data.extend_from_slice(&aux(2, b"\x82\x6b/Test/Asset\x18\x2a"));
         record_data.push(3);
-        let mut record = decode_cpu_metadata_record(&record_event, &record_data, 0).unwrap();
+        let empty_specs = BTreeMap::new();
+        let mut record =
+            decode_cpu_metadata_record(&record_event, &record_data, &empty_specs, None, 0).unwrap();
         assert_eq!(record.metadata_bytes, 15);
         assert_eq!(record.decoded_metadata_bytes, 15);
         assert_eq!(record.skipped_metadata_bytes, 0);
@@ -12579,7 +12693,8 @@ mod tests {
         trailing_data.extend_from_slice(&aux(2, b"\x65Valid\xc1"));
         trailing_data.push(3);
         let mut trailing_record =
-            decode_cpu_metadata_record(&record_event, &trailing_data, 0).unwrap();
+            decode_cpu_metadata_record(&record_event, &trailing_data, &empty_specs, None, 0)
+                .unwrap();
         assert_eq!(trailing_record.metadata_bytes, 7);
         assert_eq!(trailing_record.decoded_metadata_bytes, 6);
         assert_eq!(trailing_record.skipped_metadata_bytes, 1);
@@ -12591,7 +12706,8 @@ mod tests {
         malformed_data.extend_from_slice(&aux(2, b"\xc1"));
         malformed_data.push(3);
         let mut malformed_record =
-            decode_cpu_metadata_record(&record_event, &malformed_data, 0).unwrap();
+            decode_cpu_metadata_record(&record_event, &malformed_data, &empty_specs, None, 0)
+                .unwrap();
         assert_eq!(malformed_record.metadata_bytes, 1);
         assert_eq!(malformed_record.decoded_metadata_bytes, 0);
         assert_eq!(malformed_record.skipped_metadata_bytes, 1);
@@ -12607,16 +12723,18 @@ mod tests {
         let other_record = CpuMetadataRecord {
             metadata_id: 100,
             spec_id: 8,
-            name: "Other".to_owned(),
-            rendered_name: None,
-            metadata_bytes: 8,
-            decoded_metadata_bytes: 8,
-            skipped_metadata_bytes: 0,
-            decode_failed: false,
-            values: vec![MetadataValue::Text {
-                value: "OtherOne".to_owned(),
-            }],
-            strings: vec!["OtherOne".to_owned()],
+            details: Arc::new(CpuMetadataDetails {
+                name: "Other".to_owned(),
+                rendered_name: None,
+                metadata_bytes: 8,
+                decoded_metadata_bytes: 8,
+                skipped_metadata_bytes: 0,
+                decode_failed: false,
+                values: vec![MetadataValue::Text {
+                    value: "OtherOne".to_owned(),
+                }],
+                strings: vec!["OtherOne".to_owned()],
+            }),
         };
 
         let specs = [(spec.spec_id, spec), (other_spec.spec_id, other_spec)]
@@ -12702,14 +12820,11 @@ mod tests {
             CpuMetadataRecord {
                 metadata_id: 42,
                 spec_id: 7,
-                name: "Frame".to_owned(),
-                rendered_name: Some("Frame 366401".to_owned()),
-                metadata_bytes: 0,
-                decoded_metadata_bytes: 0,
-                skipped_metadata_bytes: 0,
-                decode_failed: false,
-                values: Vec::new(),
-                strings: Vec::new(),
+                details: Arc::new(CpuMetadataDetails {
+                    name: "Frame".to_owned(),
+                    rendered_name: Some("Frame 366401".to_owned()),
+                    ..CpuMetadataDetails::default()
+                }),
             },
         );
         assert_eq!(context.active_frame_number(&metadata, 1), Some(366401));
@@ -12999,14 +13114,10 @@ mod tests {
             CpuMetadataRecord {
                 metadata_id: 42,
                 spec_id: 7,
-                name: "Metadata".to_owned(),
-                rendered_name: None,
-                metadata_bytes: 0,
-                decoded_metadata_bytes: 0,
-                skipped_metadata_bytes: 0,
-                decode_failed: false,
-                values: Vec::new(),
-                strings: Vec::new(),
+                details: Arc::new(CpuMetadataDetails {
+                    name: "Metadata".to_owned(),
+                    ..CpuMetadataDetails::default()
+                }),
             },
         )]
         .into_iter()
@@ -13301,14 +13412,11 @@ mod tests {
             CpuMetadataRecord {
                 metadata_id: 42,
                 spec_id: 7,
-                name: "Frame".to_owned(),
-                rendered_name: Some("Frame 366401".to_owned()),
-                metadata_bytes: 0,
-                decoded_metadata_bytes: 0,
-                skipped_metadata_bytes: 0,
-                decode_failed: false,
-                values: Vec::new(),
-                strings: Vec::new(),
+                details: Arc::new(CpuMetadataDetails {
+                    name: "Frame".to_owned(),
+                    rendered_name: Some("Frame 366401".to_owned()),
+                    ..CpuMetadataDetails::default()
+                }),
             },
         )]
         .into_iter()

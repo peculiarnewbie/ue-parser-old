@@ -140,6 +140,7 @@ pub(super) fn aggregate_serial_fallback(
         thread_scope_totals: FxHashMap::default(),
     };
     let mut metadata = FxHashMap::<u32, CpuMetadataRecord>::default();
+    let mut metadata_cache = CpuMetadataCache::default();
     let mut metadata_generation = 0_u64;
     let mut thread_states = FxHashMap::<u16, CpuBatchThreadState>::default();
     let mut metadata_stack_contexts = FxHashMap::<u16, CpuMetadataStackRuntimeState>::default();
@@ -164,8 +165,13 @@ pub(super) fn aggregate_serial_fallback(
                 .unwrap_or(DashboardEventKind::Ignored)
             {
                 DashboardEventKind::CpuProfilerMetadata => {
-                    let mut record = decode_cpu_metadata_record(event, raw_event.data, 0)?;
-                    enrich_cpu_metadata_record(metadata_specs, &mut record);
+                    let record = decode_cpu_metadata_record(
+                        event,
+                        raw_event.data,
+                        metadata_specs,
+                        Some(&mut metadata_cache),
+                        0,
+                    )?;
                     metadata.insert(record.metadata_id, record);
                     metadata_generation = metadata_generation.saturating_add(1);
                 }
@@ -552,14 +558,11 @@ mod tests {
             CpuMetadataRecord {
                 metadata_id: 42,
                 spec_id: 7,
-                name: "Frame".to_owned(),
-                rendered_name: Some("Frame 366401".to_owned()),
-                metadata_bytes: 0,
-                decoded_metadata_bytes: 0,
-                skipped_metadata_bytes: 0,
-                decode_failed: false,
-                values: Vec::new(),
-                strings: Vec::new(),
+                details: Arc::new(CpuMetadataDetails {
+                    name: "Frame".to_owned(),
+                    rendered_name: Some("Frame 366401".to_owned()),
+                    ..CpuMetadataDetails::default()
+                }),
             },
         )]
         .into_iter()
