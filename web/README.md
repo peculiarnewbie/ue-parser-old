@@ -7,6 +7,12 @@ browser Worker backed by Rust/WASM.
 
 - `/` — landing
 - `/utrace` — progressive dashboard, in-browser timeline index, and charts
+- `/utrace/compare` — baseline/candidate frame distributions, CPU attribution,
+  independent local range aggregation, and timeline evidence
+
+The comparison worker retains two captures and releases them on replacement or
+navigation. See [the comparison contract](../docs/utrace-comparison-contract.md)
+for normalization, timer matching, and incomplete-evidence rules.
 
 Analytical charts use
 [`@tanstack/solid-charts`](https://tanstack.com/charts/latest/docs/framework/solid/adapter).

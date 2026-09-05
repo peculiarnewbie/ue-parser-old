@@ -189,6 +189,11 @@ struct TimelineBody<T: Serialize> {
     timeline: T,
 }
 
+#[derive(Serialize)]
+struct TimerStatsBody<T: Serialize> {
+    timer_stats: T,
+}
+
 #[derive(serde::Deserialize, Default)]
 struct DashboardInput {
     max_frames: Option<usize>,
@@ -232,6 +237,15 @@ fn dashboard_options(options_json: &str) -> Result<crate::utrace::DashboardOptio
         gpu_timeline_frame: input.gpu_frame,
         gpu_timeline_limit: input.gpu_timeline_limit,
     })
+}
+
+#[derive(serde::Deserialize, Default)]
+struct TimerStatsQueryInput {
+    start_cycle: Option<u64>,
+    end_cycle: Option<u64>,
+    thread: Option<u16>,
+    search: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(serde::Deserialize)]
@@ -548,6 +562,29 @@ impl ProgressiveUtraceSession {
             status: "ok",
             path: self.filename.clone(),
             body: TimelineBody { timeline },
+        })
+    }
+
+    pub fn query_timer_stats(&self, options_json: &str) -> Result<String, JsValue> {
+        let input: TimerStatsQueryInput = serde_json::from_str(options_json)
+            .map_err(|error| JsValue::from_str(&format!("invalid timer stats query: {error}")))?;
+        let timer_stats = self
+            .timeline_index
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("timeline index is not ready"))?
+            .aggregate_timers(&crate::utrace_timer_stats::CpuTimerStatsQuery {
+                start_cycle: input.start_cycle,
+                end_cycle: input.end_cycle,
+                thread_id: input.thread,
+                search: input.search,
+                limit: input.limit,
+            })
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        json(&UtraceOutput {
+            schema_version: UTRACE_SCHEMA_VERSION,
+            status: "ok",
+            path: self.filename.clone(),
+            body: TimerStatsBody { timer_stats },
         })
     }
 

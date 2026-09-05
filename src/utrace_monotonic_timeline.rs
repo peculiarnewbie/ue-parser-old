@@ -12,9 +12,13 @@ use serde::Serialize;
 
 use crate::utrace::{CpuTimelineInterval, CpuTimelineQuery, CpuTimelineQueryResult};
 use crate::utrace_timeline::{CpuTimelineIndexInfo, SourceIdentity, TimelineIndexError};
+use crate::utrace_timer_stats::{
+    CpuTimerStatsQuery, CpuTimerStatsResult, CpuTimerStatsRow, MAX_AGGREGATED_TIMER_IDENTITIES,
+    MAX_TIMER_STATS_ROWS, TimerStatsAccumulator,
+};
 
 const PAGE_ENTRIES: usize = 65_536;
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum CpuTimerRef {
     Spec(u32),
     Metadata(u32),
@@ -94,11 +98,11 @@ impl CpuMonotonicTimelineIndex {
                 let Some(timer) = self.resolve_timer(timer_ref) else {
                     return;
                 };
-                let name = self.timer_name(timer);
-                let rendered_name = timer
-                    .rendered_name
-                    .and_then(|reference| text_at(&self.strings, reference));
                 if needle.as_deref().is_some_and(|needle| {
+                    let name = self.timer_name(timer);
+                    let rendered_name = timer
+                        .rendered_name
+                        .and_then(|reference| text_at(&self.strings, reference));
                     !name.to_lowercase().contains(needle)
                         && !rendered_name.is_some_and(|name| name.to_lowercase().contains(needle))
                 }) {
@@ -156,6 +160,121 @@ impl CpuMonotonicTimelineIndex {
             interval_count,
             truncated: interval_count > u64::try_from(limit).unwrap_or(u64::MAX),
             intervals,
+        })
+    }
+
+    pub fn aggregate_timers(
+        &self,
+        query: &CpuTimerStatsQuery,
+    ) -> Result<CpuTimerStatsResult, TimelineIndexError> {
+        let start_cycle = query.start_cycle.or(self.info.begin_cycle).unwrap_or(0);
+        let end_cycle = query
+            .end_cycle
+            .or(self.info.end_cycle)
+            .unwrap_or(start_cycle);
+        if start_cycle >= end_cycle {
+            return Err(TimelineIndexError::InvalidQuery(
+                "timer stats start_cycle must precede end_cycle".to_owned(),
+            ));
+        }
+        let limit = query.limit.unwrap_or(5_000).clamp(1, MAX_TIMER_STATS_ROWS);
+        let needle = query.search.as_ref().map(|value| value.to_lowercase());
+        let mut aggregates = FxHashMap::<CpuTimerRef, TimerStatsAccumulator>::default();
+        let mut interval_count = 0_u64;
+        let mut exceeded_identity_limit = false;
+        for (&thread_id, timeline) in &self.threads {
+            if query.thread_id.is_some_and(|wanted| wanted != thread_id) {
+                continue;
+            }
+            timeline.enumerate(start_cycle, end_cycle, |timer_ref, begin, end| {
+                if exceeded_identity_limit || begin >= end_cycle || end <= start_cycle {
+                    return;
+                }
+                let Some(timer) = self.resolve_timer(timer_ref) else {
+                    return;
+                };
+                if needle.as_deref().is_some_and(|needle| {
+                    let name = self.timer_name(timer);
+                    let rendered_name = timer
+                        .rendered_name
+                        .and_then(|reference| text_at(&self.strings, reference));
+                    !name.to_lowercase().contains(needle)
+                        && !rendered_name.is_some_and(|name| name.to_lowercase().contains(needle))
+                }) {
+                    return;
+                }
+                if !aggregates.contains_key(&timer_ref)
+                    && aggregates.len() >= MAX_AGGREGATED_TIMER_IDENTITIES
+                {
+                    exceeded_identity_limit = true;
+                    return;
+                }
+                interval_count = interval_count.saturating_add(1);
+                let clipped_begin = begin.max(start_cycle);
+                let clipped_end = end.min(end_cycle);
+                let accumulator = aggregates.entry(timer_ref).or_default();
+                accumulator.overlap_count = accumulator.overlap_count.saturating_add(1);
+                if begin >= start_cycle {
+                    accumulator.begin_count = accumulator.begin_count.saturating_add(1);
+                }
+                accumulator.clipped_inclusive_cycles = accumulator
+                    .clipped_inclusive_cycles
+                    .saturating_add(clipped_end.saturating_sub(clipped_begin));
+            });
+        }
+        if exceeded_identity_limit {
+            return Err(TimelineIndexError::ResourceLimit(format!(
+                "timer stats range exceeds {MAX_AGGREGATED_TIMER_IDENTITIES} distinct timer identities; narrow the range or add a filter"
+            )));
+        }
+        let distinct_timer_count = u64::try_from(aggregates.len()).unwrap_or(u64::MAX);
+        let mut timers = aggregates
+            .into_iter()
+            .filter_map(|(timer_ref, aggregate)| {
+                let timer = self.resolve_timer(timer_ref)?;
+                Some(CpuTimerStatsRow {
+                    spec_id: timer.spec_id,
+                    metadata_id: timer.metadata_id,
+                    name: self.timer_name(timer).into_owned(),
+                    rendered_name: timer
+                        .rendered_name
+                        .and_then(|reference| text_at(&self.strings, reference))
+                        .map(str::to_owned),
+                    overlap_count: aggregate.overlap_count,
+                    begin_count: aggregate.begin_count,
+                    clipped_inclusive_cycles: aggregate.clipped_inclusive_cycles,
+                    clipped_inclusive_seconds: self.info.cycle_frequency.map(|frequency| {
+                        aggregate.clipped_inclusive_cycles as f64 / frequency as f64
+                    }),
+                })
+            })
+            .collect::<Vec<_>>();
+        timers.sort_by(|left, right| {
+            right
+                .clipped_inclusive_cycles
+                .cmp(&left.clipped_inclusive_cycles)
+                .then_with(|| right.overlap_count.cmp(&left.overlap_count))
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.spec_id.cmp(&right.spec_id))
+                .then_with(|| left.metadata_id.cmp(&right.metadata_id))
+        });
+        let response_truncated = timers.len() > limit;
+        timers.truncate(limit);
+        let mut index = self.info.clone();
+        index.truncated |= self.stats.completed_scope_count < self.stats.begin_count;
+        let truncated = index.truncated || response_truncated;
+        Ok(CpuTimerStatsResult {
+            index,
+            begin_cycle: start_cycle,
+            end_cycle,
+            duration_seconds: self
+                .info
+                .cycle_frequency
+                .map(|frequency| end_cycle.saturating_sub(start_cycle) as f64 / frequency as f64),
+            interval_count,
+            distinct_timer_count,
+            truncated,
+            timers,
         })
     }
 
@@ -880,5 +999,131 @@ mod tests {
         assert_eq!(result.interval_count, 2);
         assert_eq!(result.intervals[0].name, "early");
         assert!(result.truncated);
+    }
+
+    #[test]
+    fn timer_stats_clip_overlapping_scopes_to_the_selected_range() {
+        let mut builder = CpuMonotonicTimelineBuilder::new();
+        builder.register_spec(1, "outer");
+        builder.register_spec(2, "inner");
+        builder.append_begin(2, 10, CpuTimerRef::Spec(1));
+        builder.append_begin(2, 20, CpuTimerRef::Spec(2));
+        builder.append_end(2, 30);
+        builder.append_end(2, 40);
+        let index = builder.finish(SourceIdentity::from_bytes(b"trace"), Some(10));
+
+        let result = index
+            .aggregate_timers(&CpuTimerStatsQuery {
+                start_cycle: Some(15),
+                end_cycle: Some(35),
+                ..CpuTimerStatsQuery::default()
+            })
+            .unwrap();
+
+        assert_eq!(result.interval_count, 2);
+        assert_eq!(result.distinct_timer_count, 2);
+        assert!(!result.truncated);
+        assert_eq!(result.timers[0].name, "outer");
+        assert_eq!(result.timers[0].overlap_count, 1);
+        assert_eq!(result.timers[0].begin_count, 0);
+        assert_eq!(result.timers[0].clipped_inclusive_cycles, 20);
+        assert_eq!(result.timers[1].name, "inner");
+        assert_eq!(result.timers[1].begin_count, 1);
+        assert_eq!(result.timers[1].clipped_inclusive_cycles, 10);
+    }
+
+    #[test]
+    fn timer_stats_exclude_touching_boundaries_and_reject_empty_ranges() {
+        let mut builder = CpuMonotonicTimelineBuilder::new();
+        builder.register_spec(1, "work");
+        for (begin, end) in [(0, 10), (10, 20), (20, 30)] {
+            builder.append_begin(2, begin, CpuTimerRef::Spec(1));
+            builder.append_end(2, end);
+        }
+        let index = builder.finish(SourceIdentity::from_bytes(b"trace"), Some(10));
+        let result = index
+            .aggregate_timers(&CpuTimerStatsQuery {
+                start_cycle: Some(10),
+                end_cycle: Some(20),
+                ..CpuTimerStatsQuery::default()
+            })
+            .unwrap();
+        assert_eq!(result.interval_count, 1);
+        assert_eq!(result.timers[0].overlap_count, 1);
+        assert_eq!(result.timers[0].begin_count, 1);
+        assert_eq!(result.timers[0].clipped_inclusive_cycles, 10);
+        assert!(matches!(
+            index.aggregate_timers(&CpuTimerStatsQuery {
+                start_cycle: Some(10),
+                end_cycle: Some(10),
+                ..CpuTimerStatsQuery::default()
+            }),
+            Err(TimelineIndexError::InvalidQuery(_))
+        ));
+    }
+
+    #[test]
+    fn timer_stats_bound_identities_after_applying_filters() {
+        let mut builder = CpuMonotonicTimelineBuilder::new();
+        for id in 0..=MAX_AGGREGATED_TIMER_IDENTITIES as u32 {
+            builder.register_spec(id, if id == 0 { "selected" } else { "other" });
+            builder.append_begin(2, u64::from(id) * 2, CpuTimerRef::Spec(id));
+            builder.append_end(2, u64::from(id) * 2 + 1);
+        }
+        let index = builder.finish(SourceIdentity::from_bytes(b"trace"), None);
+        assert!(matches!(
+            index.aggregate_timers(&CpuTimerStatsQuery::default()),
+            Err(TimelineIndexError::ResourceLimit(_))
+        ));
+        let result = index
+            .aggregate_timers(&CpuTimerStatsQuery {
+                search: Some("SELECTED".to_owned()),
+                thread_id: Some(2),
+                ..CpuTimerStatsQuery::default()
+            })
+            .unwrap();
+        assert_eq!(result.interval_count, 1);
+        assert_eq!(result.timers[0].name, "selected");
+    }
+
+    #[test]
+    fn timer_stats_mark_unterminated_source_scopes_as_incomplete() {
+        let mut builder = CpuMonotonicTimelineBuilder::new();
+        builder.register_spec(1, "open");
+        builder.append_begin(2, 10, CpuTimerRef::Spec(1));
+        builder.append_begin(3, 20, CpuTimerRef::Spec(1));
+        builder.append_end(3, 30);
+        let index = builder.finish(SourceIdentity::from_bytes(b"trace"), Some(10));
+        let result = index
+            .aggregate_timers(&CpuTimerStatsQuery::default())
+            .unwrap();
+        assert!(result.truncated);
+        assert!(result.index.truncated);
+        assert_eq!(result.timers[0].overlap_count, 2);
+    }
+
+    #[test]
+    fn timer_stats_sort_before_bounding_response_rows() {
+        let mut builder = CpuMonotonicTimelineBuilder::new();
+        builder.register_spec(1, "small");
+        builder.register_spec(2, "large");
+        builder.append_begin(2, 0, CpuTimerRef::Spec(1));
+        builder.append_end(2, 2);
+        builder.append_begin(2, 3, CpuTimerRef::Spec(2));
+        builder.append_end(2, 20);
+        let index = builder.finish(SourceIdentity::from_bytes(b"trace"), None);
+
+        let result = index
+            .aggregate_timers(&CpuTimerStatsQuery {
+                limit: Some(1),
+                ..CpuTimerStatsQuery::default()
+            })
+            .unwrap();
+
+        assert_eq!(result.distinct_timer_count, 2);
+        assert!(result.truncated);
+        assert_eq!(result.timers.len(), 1);
+        assert_eq!(result.timers[0].name, "large");
+        assert_eq!(result.timers[0].clipped_inclusive_cycles, 17);
     }
 }

@@ -43,6 +43,9 @@ export type UtraceDashboardQuery = {
   gpu_timeline_limit?: number;
 };
 
+/** Browser sessions retain every completed frame; charts bound only rendered points. */
+export const RETAIN_ALL_UTRACE_FRAMES = 0xffff_ffff;
+
 export function formatParseTiming(timing: ParseTiming): string {
   const parts = [`browser ${formatMs(timing.client_ms)}`];
   if (timing.wasm_threads != null) {

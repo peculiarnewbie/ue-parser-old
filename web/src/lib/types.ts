@@ -186,6 +186,33 @@ export type GpuTimelineDashboard = {
   intervals: GpuTimelineInterval[];
 };
 
+export type CpuTimerStatsRow = {
+  spec_id: number;
+  metadata_id?: number;
+  name: string;
+  rendered_name?: string;
+  overlap_count: number;
+  begin_count: number;
+  clipped_inclusive_cycles: number;
+  clipped_inclusive_seconds?: number;
+};
+
+export type UtraceTimerStatsQuery = {
+  schema_version: number;
+  status: InspectStatus;
+  path: string;
+  timer_stats: {
+    index: UtraceTimelineQuery["timeline"]["index"];
+    begin_cycle: number;
+    end_cycle: number;
+    duration_seconds?: number;
+    interval_count: number;
+    distinct_timer_count: number;
+    truncated: boolean;
+    timers: CpuTimerStatsRow[];
+  };
+};
+
 export type UtraceGpuTimelineQuery = {
   schema_version: number;
   status: InspectStatus;

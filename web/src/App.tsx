@@ -3,6 +3,7 @@ import { Shell } from "./components/Shell";
 import Home from "./routes/Home";
 import UassetPage from "./routes/Uasset";
 import UtracePage from "./routes/Utrace";
+import UtraceComparePage from "./routes/UtraceCompare";
 
 export default function App() {
   return (
@@ -10,6 +11,7 @@ export default function App() {
       <Route path="/" component={Home} />
       <Route path="/uasset" component={UassetPage} />
       <Route path="/utrace" component={UtracePage} />
+      <Route path="/utrace/compare" component={UtraceComparePage} />
     </Router>
   );
 }
