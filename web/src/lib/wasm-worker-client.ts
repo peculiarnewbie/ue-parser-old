@@ -1,5 +1,5 @@
 import { ParseRequestError, type TimedResult } from "./api";
-import type { WorkerTiming } from "./wasm-worker";
+import type { WasmCommand, WasmResponse, WorkerTiming } from "./wasm-worker";
 import { UTRACE_SPAN } from "./perf-span-types";
 import {
   beginUtraceSpan,
@@ -31,21 +31,33 @@ type Pending = {
   sentAt: number;
   parentSpan?: UtraceSpanHandle;
   roundTripSpan: UtraceSpanHandle;
+  onProgress?: (json: string, timing: WorkerTiming) => void;
 };
 
 let worker: Worker | null = null;
+let preparation: Promise<void> | null = null;
 let nextId = 1;
 const pending = new Map<number, Pending>();
 
 function getWorker(): Worker {
   if (worker) return worker;
   worker = new Worker(new URL("./wasm-worker.ts", import.meta.url), { type: "module" });
-  worker.onmessage = (event: MessageEvent<{ id: number; ok: boolean; json?: string; error?: string; timing: WorkerTiming; sent_at: number }>) => {
+  worker.onmessage = (event: MessageEvent<WasmResponse>) => {
     const entry = pending.get(event.data.id);
     if (!entry) return;
-    pending.delete(event.data.id);
     recordRemoteUtraceSpans({ spans: event.data.timing.spans, parent: entry.parentSpan });
-    if (event.data.ok && event.data.json != null) {
+    if ("kind" in event.data) {
+      try {
+        entry.onProgress?.(event.data.json, event.data.timing);
+      } catch (error) {
+        pending.delete(event.data.id);
+        endUtraceSpan(entry.roundTripSpan, { error });
+        entry.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+      return;
+    }
+    pending.delete(event.data.id);
+    if (event.data.ok) {
       endUtraceSpan(entry.roundTripSpan, {
         attributes: { "worker.response_bytes": event.data.json.length },
       });
@@ -72,6 +84,7 @@ function getWorker(): Worker {
     pending.clear();
     worker?.terminate();
     worker = null;
+    preparation = null;
   };
   return worker;
 }
@@ -79,12 +92,28 @@ function getWorker(): Worker {
 export function cancelWasmParsing(): void {
   worker?.terminate();
   worker = null;
+  preparation = null;
   const error = new Error("WASM parsing cancelled");
   for (const entry of pending.values()) {
     endUtraceSpan(entry.roundTripSpan, { error });
     entry.reject(error);
   }
   pending.clear();
+}
+
+/** Best-effort preparation while the viewer is empty; file loading still awaits initialization. */
+export function prepareUtraceWasm(): Promise<void> {
+  if (preparation) return preparation;
+  const preparingWorker = getWorker();
+  const span = beginUtraceSpan({ name: UTRACE_SPAN.prepare, domain: "browser" });
+  preparation = workerCall({ message: { kind: "utrace-prepare" }, parentSpan: span }).then(
+    () => { endUtraceSpan(span); },
+    (error: unknown) => {
+      endUtraceSpan(span, { error });
+      if (worker === preparingWorker && pending.size === 0) cancelWasmParsing();
+    },
+  );
+  return preparation;
 }
 
 export async function parseWithWasm<T>(request: { kind: WasmOperation; file: File; options?: Record<string, number | undefined> }): Promise<TimedResult<T>> {
@@ -128,14 +157,15 @@ export async function parseWithWasm<T>(request: { kind: WasmOperation; file: Fil
 
 async function workerCall(
   input: {
-    message: Record<string, unknown>;
+    message: WasmCommand;
     transfers?: Transferable[];
     parentSpan?: UtraceSpanHandle;
+    onProgress?: (json: string, timing: WorkerTiming) => void;
   },
 ): Promise<{ json: string; timing: WorkerTiming }> {
   const id = nextId++;
   return new Promise((resolve, reject) => {
-    const requestKind = String(input.message.kind ?? "unknown");
+    const requestKind = input.message.kind;
     const roundTripSpan = beginUtraceSpan({
       name: UTRACE_SPAN.workerRoundTrip,
       domain: "browser",
@@ -148,6 +178,7 @@ async function workerCall(
       sentAt: performance.now(),
       parentSpan: input.parentSpan,
       roundTripSpan,
+      onProgress: input.onProgress,
     });
     getWorker().postMessage({ ...input.message, id }, input.transfers ?? []);
   });
@@ -186,6 +217,7 @@ export async function parseUtraceProgressWithWasm(
       if (event.type === "complete") finalDashboard = event.dashboard;
     }
   };
+  const sessionWorker = getWorker();
   const startupTiming = (await workerCall({
     message: {
       kind: "utrace-progress-start",
@@ -196,7 +228,6 @@ export async function parseUtraceProgressWithWasm(
     },
     parentSpan: input.parentSpan,
   })).timing;
-  const reader = input.file.stream().getReader();
   const fileSpan = beginUtraceSpan({
     name: UTRACE_SPAN.fileStream,
     domain: "browser",
@@ -217,7 +248,7 @@ export async function parseUtraceProgressWithWasm(
   };
   let chunkCount = 0;
   const abort = async () => {
-    await reader.cancel().catch(() => undefined);
+    if (worker !== sessionWorker) return;
     await workerCall({
       message: { kind: "utrace-progress-cancel", session_id: sessionId },
       parentSpan: input.parentSpan,
@@ -226,24 +257,18 @@ export async function parseUtraceProgressWithWasm(
   const abortListener = () => void abort();
   input.signal?.addEventListener("abort", abortListener, { once: true });
   try {
-    for (;;) {
-      if (input.signal?.aborted) throw new DOMException("WASM parsing cancelled", "AbortError");
-      const { value, done } = await reader.read();
-      input.signal?.throwIfAborted();
-      if (done) break;
-      for (let offset = 0; offset < value.byteLength; offset += 1024 * 1024) {
+    input.signal?.throwIfAborted();
+    await workerCall({
+      message: { kind: "utrace-progress-read", session_id: sessionId, file: input.file },
+      parentSpan: input.parentSpan,
+      onProgress: (json, timing) => {
         input.signal?.throwIfAborted();
-        const chunk = value.slice(offset, Math.min(value.byteLength, offset + 1024 * 1024));
         chunkCount += 1;
-        const result = await workerCall({
-          message: { kind: "utrace-progress-chunk", session_id: sessionId, bytes: chunk.buffer },
-          transfers: [chunk.buffer],
-          parentSpan: input.parentSpan,
-        });
-        parseMs += result.timing.parse_ms;
-        dispatch(result.json);
-      }
-    }
+        parseMs += timing.parse_ms;
+        dispatch(json);
+      },
+    });
+    input.signal?.throwIfAborted();
     endFileSpan();
     const analyzing = await workerCall({
       message: {

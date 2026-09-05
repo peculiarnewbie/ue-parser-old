@@ -1,4 +1,5 @@
 export const UTRACE_SPAN = {
+  prepare: "utrace.prepare",
   load: "utrace.load",
   fileStream: "browser.file.stream",
   workerRoundTrip: "browser.worker.round_trip",

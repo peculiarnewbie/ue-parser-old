@@ -17,7 +17,7 @@ use crate::utrace_timer_stats::{
     MAX_TIMER_STATS_ROWS, TimerStatsAccumulator,
 };
 
-const PAGE_ENTRIES: usize = 65_536;
+const PAGE_ENTRIES: usize = 8_192;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum CpuTimerRef {
     Spec(u32),
@@ -95,10 +95,8 @@ impl CpuMonotonicTimelineIndex {
                 continue;
             }
             timeline.enumerate(start_cycle, end_cycle, |timer_ref, begin, end| {
-                let Some(timer) = self.resolve_timer(timer_ref) else {
-                    return;
-                };
                 if needle.as_deref().is_some_and(|needle| {
+                    let timer = self.resolve_timer(timer_ref);
                     let name = self.timer_name(timer);
                     let rendered_name = timer
                         .rendered_name
@@ -113,24 +111,23 @@ impl CpuMonotonicTimelineIndex {
                     start_cycle: begin,
                     end_cycle: end,
                     thread_id,
-                    timer: timer.timer,
+                    timer: timer_ref,
                 };
                 if hits.len() < limit {
                     hits.push(hit);
                 } else if hits.peek().is_some_and(|latest| hit < *latest) {
-                    hits.pop();
-                    hits.push(hit);
+                    *hits.peek_mut().expect("bounded heap is full") = hit;
                 }
             });
         }
         let intervals = hits
             .into_sorted_vec()
             .into_iter()
-            .filter_map(|hit| {
-                let timer = self.resolve_timer(hit.timer)?;
+            .map(|hit| {
+                let timer = self.resolve_timer(hit.timer);
                 let name = self.timer_name(timer);
                 let duration = hit.end_cycle.saturating_sub(hit.start_cycle);
-                Some(CpuTimelineInterval {
+                CpuTimelineInterval {
                     thread_id: hit.thread_id,
                     spec_id: timer.spec_id,
                     name: name.into_owned(),
@@ -146,7 +143,7 @@ impl CpuMonotonicTimelineIndex {
                         .rendered_name
                         .and_then(|reference| text_at(&self.strings, reference))
                         .map(str::to_owned),
-                })
+                }
             })
             .collect();
         Ok(CpuTimelineQueryResult {
@@ -190,10 +187,8 @@ impl CpuMonotonicTimelineIndex {
                 if exceeded_identity_limit || begin >= end_cycle || end <= start_cycle {
                     return;
                 }
-                let Some(timer) = self.resolve_timer(timer_ref) else {
-                    return;
-                };
                 if needle.as_deref().is_some_and(|needle| {
+                    let timer = self.resolve_timer(timer_ref);
                     let name = self.timer_name(timer);
                     let rendered_name = timer
                         .rendered_name
@@ -230,9 +225,9 @@ impl CpuMonotonicTimelineIndex {
         let distinct_timer_count = u64::try_from(aggregates.len()).unwrap_or(u64::MAX);
         let mut timers = aggregates
             .into_iter()
-            .filter_map(|(timer_ref, aggregate)| {
-                let timer = self.resolve_timer(timer_ref)?;
-                Some(CpuTimerStatsRow {
+            .map(|(timer_ref, aggregate)| {
+                let timer = self.resolve_timer(timer_ref);
+                CpuTimerStatsRow {
                     spec_id: timer.spec_id,
                     metadata_id: timer.metadata_id,
                     name: self.timer_name(timer).into_owned(),
@@ -246,7 +241,7 @@ impl CpuMonotonicTimelineIndex {
                     clipped_inclusive_seconds: self.info.cycle_frequency.map(|frequency| {
                         aggregate.clipped_inclusive_cycles as f64 / frequency as f64
                     }),
-                })
+                }
             })
             .collect::<Vec<_>>();
         timers.sort_by(|left, right| {
@@ -278,26 +273,24 @@ impl CpuMonotonicTimelineIndex {
         })
     }
 
-    fn resolve_timer(&self, timer: CpuTimerRef) -> Option<ResolvedTimer> {
+    fn resolve_timer(&self, timer: CpuTimerRef) -> ResolvedTimer {
         match timer {
-            CpuTimerRef::Spec(spec_id) => Some(ResolvedTimer {
-                timer,
+            CpuTimerRef::Spec(spec_id) => ResolvedTimer {
                 spec_id,
                 name: self.spec(spec_id).map(|spec| spec.name),
                 metadata_id: None,
                 rendered_name: None,
-            }),
+            },
             CpuTimerRef::Metadata(metadata_id) => {
                 let metadata = self.metadata(metadata_id);
-                Some(ResolvedTimer {
-                    timer,
+                ResolvedTimer {
                     spec_id: metadata.map_or(u32::MAX, |metadata| metadata.spec_id),
                     name: metadata
                         .and_then(|metadata| self.spec(metadata.spec_id))
                         .map(|spec| spec.name),
                     metadata_id: Some(metadata_id),
                     rendered_name: metadata.and_then(|metadata| metadata.rendered_name),
-                })
+                }
             }
         }
     }
@@ -335,7 +328,6 @@ struct QueryHit {
 
 #[derive(Clone, Copy, Debug)]
 struct ResolvedTimer {
-    timer: CpuTimerRef,
     spec_id: u32,
     name: Option<StringRef>,
     metadata_id: Option<u32>,
@@ -422,7 +414,9 @@ impl Page {
     }
 
     fn is_full(&self) -> bool {
-        self.entry_count() == PAGE_ENTRIES
+        // Amortize each stack checkpoint over at least that many entries.
+        // Deep nesting must not make retained checkpoint storage quadratic.
+        self.entry_count() >= PAGE_ENTRIES && self.entry_count() >= self.initial_stack.len()
     }
 
     fn append_begin(&mut self, cycle: u64, timer: CpuTimerRef) {
@@ -946,6 +940,80 @@ fn apply_zigzag_delta(previous: u64, encoded: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_nesting_keeps_checkpoint_storage_linear_and_queries_exact() {
+        let depth = PAGE_ENTRIES * 6;
+        let mut builder = CpuMonotonicTimelineBuilder::new();
+        builder.register_spec(1, "nested");
+        for cycle in 0..depth as u64 {
+            builder.append_begin(2, cycle, CpuTimerRef::Spec(1));
+        }
+        for cycle in depth as u64..(depth * 2) as u64 {
+            builder.append_end(2, cycle);
+        }
+        let index = builder.finish(SourceIdentity::from_bytes(b"trace"), None);
+        let checkpoint_entries = index.threads[&2]
+            .pages
+            .iter()
+            .map(|page| page.initial_stack.len())
+            .sum::<usize>();
+        assert!(checkpoint_entries <= index.stats().entry_count as usize * 2);
+        assert_eq!(index.stats().completed_scope_count, depth as u64);
+        let query = index
+            .query(&CpuTimelineQuery {
+                start_cycle: Some(depth as u64),
+                end_cycle: Some(depth as u64 + 1),
+                limit: Some(5),
+                ..CpuTimelineQuery::default()
+            })
+            .unwrap();
+        assert_eq!(query.interval_count, depth as u64);
+        assert_eq!(query.intervals.len(), 5);
+        assert!(query.truncated);
+        assert_eq!(query.intervals[0].start_cycle, 0);
+        assert_eq!(query.intervals[4].start_cycle, 4);
+    }
+
+    #[test]
+    fn deferred_names_preserve_missing_catalog_entries_and_text_filters() {
+        let mut builder = CpuMonotonicTimelineBuilder::new();
+        builder.register_spec(1, "scope");
+        builder.register_metadata(2, 1, Some("Frame 7"));
+        for (index, timer) in [
+            CpuTimerRef::Spec(99),
+            CpuTimerRef::Metadata(2),
+            CpuTimerRef::Metadata(3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let start = index as u64 * 10;
+            builder.append_begin(2, start, timer);
+            builder.append_end(2, start + 5);
+        }
+        let index = builder.finish(SourceIdentity::from_bytes(b"trace"), None);
+        let all = index.query(&CpuTimelineQuery::default()).unwrap();
+        assert_eq!(all.interval_count, 3);
+        assert_eq!(all.intervals[0].name, "#99");
+        assert_eq!(all.intervals[2].name, format!("#{}", u32::MAX));
+        for (search, expected) in [("FRAME 7", 1), ("#99", 1), ("absent", 0)] {
+            let query = index
+                .query(&CpuTimelineQuery {
+                    search: Some(search.into()),
+                    ..CpuTimelineQuery::default()
+                })
+                .unwrap();
+            let timers = index
+                .aggregate_timers(&CpuTimerStatsQuery {
+                    search: Some(search.into()),
+                    ..CpuTimerStatsQuery::default()
+                })
+                .unwrap();
+            assert_eq!(query.interval_count, expected);
+            assert_eq!(timers.interval_count, expected);
+        }
+    }
 
     #[test]
     fn nested_scopes_query_from_parallel_columns() {

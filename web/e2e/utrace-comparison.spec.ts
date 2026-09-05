@@ -1,11 +1,34 @@
 import { expect as baseExpect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
+import { UTRACE_SPAN, type UtraceBenchmarkSnapshot, type UtraceSpanName } from "../src/lib/perf-span-types";
 
 const expect = baseExpect.configure({ timeout: 15_000 });
 test.use({ actionTimeout: 15_000 });
 const workTrace = Buffer.from(readFileSync(new URL("../../tests/fixtures/tiny/comparison-work.utrace.hex", import.meta.url), "utf8")
   .replace(/#.*$/gm, "").replace(/\s/g, ""), "hex");
 const capture = (name: string) => ({ name, mimeType: "application/octet-stream", buffer: workTrace });
+
+test("single-capture viewer reuses prepared workers and releases replaced indexes", async ({ page }) => {
+  let parserWorkers = 0;
+  const errors: string[] = [];
+  page.on("worker", (worker) => { if (worker.url().includes("wasm-worker")) parserWorkers += 1; });
+  page.on("pageerror", (error) => errors.push(error.message));
+  const countSpan = (name: UtraceSpanName) => page.evaluate((name) => {
+    const benchmark = (window as Window & { __UTRACE_BENCHMARK__: { snapshot: () => UtraceBenchmarkSnapshot } }).__UTRACE_BENCHMARK__;
+    return benchmark.snapshot().spans.filter((span) => span.name === name).length;
+  }, name);
+  await page.goto("/utrace");
+  await expect.poll(() => countSpan(UTRACE_SPAN.prepare)).toBe(1);
+  for (const name of ["first.utrace", "second.utrace", "third.utrace"]) {
+    await expect(page.locator('input[type="file"]')).toBeEnabled();
+    await page.locator('input[type="file"]').setInputFiles(capture(name));
+    await expect(page.locator("[data-utrace-dashboard-ready]")).toBeVisible();
+    await expect(page.getByText(name, { exact: true }).first()).toBeVisible();
+    await expect.poll(() => countSpan(UTRACE_SPAN.load)).toBe(1);
+  }
+  expect(parserWorkers).toBe(1);
+  expect(errors).toEqual([]);
+});
 
 test("comparison route starts with independent baseline and candidate slots", async ({ page }) => {
   await page.goto("/utrace/compare");

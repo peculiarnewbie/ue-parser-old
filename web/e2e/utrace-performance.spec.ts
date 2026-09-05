@@ -1,5 +1,5 @@
 import { chromium, expect, test, type Page } from "@playwright/test";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -33,11 +33,56 @@ const durableOutputDirectory = process.env.UTRACE_E2E_OUTPUT_DIR
   ? resolve(process.env.UTRACE_E2E_OUTPUT_DIR)
   : null;
 
+async function leaveDuringFileRead(page: Page): Promise<void> {
+  await page.waitForFunction(({ push, finish }) => {
+    const benchmark = (window as Window & { __UTRACE_BENCHMARK__: { snapshot: () => UtraceBenchmarkSnapshot } }).__UTRACE_BENCHMARK__;
+    const spans = benchmark.snapshot().spans;
+    if (!spans.some((span) => span.name === push) || spans.some((span) => span.name === finish)) return false;
+    document.querySelector<HTMLAnchorElement>(".nav a[href='/uasset']")!.click();
+    return true;
+  }, { push: UTRACE_SPAN.sessionPush, finish: UTRACE_SPAN.sessionFinish });
+}
+
 test.describe("UTrace browser performance", () => {
   test.skip(
     tracePath == null,
     "requires a real .utrace fixture; set UTRACE_E2E_TRACE",
   );
+
+  test("leaving the single viewer during reading does not recreate its terminated worker", async ({ page }) => {
+    let parserWorkers = 0;
+    const errors: string[] = [];
+    page.on("worker", (worker) => { if (worker.url().includes("wasm-worker")) parserWorkers += 1; });
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.goto("/utrace");
+    await page.locator('input[type="file"]').setInputFiles(tracePath!);
+    await leaveDuringFileRead(page);
+    await expect(page).toHaveURL(/\/uasset$/);
+    await expect.poll(async () => (await browserSnapshot(page)).spans
+      .filter((span) => span.name === UTRACE_SPAN.load && span.status === "error").length).toBe(1);
+    expect(parserWorkers).toBe(1);
+    expect(errors).toEqual([]);
+  });
+
+  test("leaving during worker file reading releases the session and permits two new captures", async ({ page }) => {
+    const errors: string[] = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.goto("/utrace/compare");
+    await page.getByLabel("Baseline capture", { exact: true }).locator("input[type=file]").setInputFiles(tracePath!);
+    await leaveDuringFileRead(page);
+    await expect(page).toHaveURL(/\/uasset$/);
+    await expect.poll(async () => completedSpanCount(await browserSnapshot(page), UTRACE_SPAN.sessionCancel)).toBeGreaterThan(0);
+    await page.locator(".nav a[href='/utrace/compare']").click();
+    const bytes = Buffer.from(readFileSync(resolve(repositoryRoot, "tests/fixtures/tiny/comparison-work.utrace.hex"), "utf8")
+      .replace(/#.*$/gm, "").replace(/\s/g, ""), "hex");
+    for (const side of ["Baseline", "Candidate"]) {
+      const slot = page.getByLabel(`${side} capture`, { exact: true });
+      await slot.locator("input[type=file]").setInputFiles({ name: `${side}.utrace`, mimeType: "application/octet-stream", buffer: bytes });
+      await expect(slot.locator(".compare-capture-state")).toBeVisible();
+    }
+    await expect(page.getByRole("heading", { name: "No material tail shift" })).toBeVisible();
+    expect(errors).toEqual([]);
+  });
 
   test("records cold launch, dashboard, and timeline paint milestones", async ({}, testInfo) => {
     test.setTimeout(Math.max(180_000, repeatCount * 90_000));
@@ -67,6 +112,7 @@ test.describe("UTrace browser performance", () => {
         await expect(page.getByRole("button", { name: /Drop a \.utrace/ })).toBeVisible();
         await waitForTwoAnimationFrames(page);
         const appReadyAt = performance.now();
+        const preparationSnapshot = await browserSnapshot(page);
 
         await fileInput.setInputFiles(tracePath!);
         await expect(page.locator("[data-utrace-dashboard-ready]")).toBeVisible();
@@ -127,6 +173,14 @@ test.describe("UTrace browser performance", () => {
         await expect(page.getByRole("button", { name: "Fit window" })).toHaveCount(0);
 
         const snapshot = await browserSnapshot(page);
+        // Keep preparation work visible even when file selection resets load telemetry.
+        snapshot.spans = [...new Map(
+          [...preparationSnapshot.spans, ...snapshot.spans].map((span) => [span.span_id, span]),
+        ).values()];
+        expect(snapshot.spans
+          .filter((span) => span.name === UTRACE_SPAN.sessionPush)
+          .reduce((bytes, span) => bytes + Number(span.attributes["utrace.chunk_bytes"]), 0))
+          .toBe(statSync(tracePath!).size);
         lastSnapshot = snapshot;
         const runtime = await page.evaluate(() => {
           const chromiumPerformance = performance as Performance & {
@@ -224,6 +278,15 @@ test.describe("UTrace browser performance", () => {
           lastChromeTrace = await page.evaluate(() =>
             (window as BenchmarkWindow).__UTRACE_BENCHMARK__.chromeTrace(),
           );
+          const eventKeys = new Set(lastChromeTrace.traceEvents.map((event) => `${event.name}:${event.ts}`));
+          for (const span of preparationSnapshot.spans) {
+            const ts = Math.round(span.start_time_unix_ms * 1000);
+            if (eventKeys.has(`${span.name}:${ts}`)) continue;
+            lastChromeTrace.traceEvents.push({
+              name: span.name, cat: span.domain, ph: "X", ts,
+              dur: Math.round(span.duration_ms * 1000), pid: 1, tid: span.domain, args: span.attributes,
+            });
+          }
           await page.screenshot({ path: screenshotPath, fullPage: true });
           if (durableOutputDirectory) {
             await inspector.screenshot({

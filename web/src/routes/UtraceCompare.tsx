@@ -1,4 +1,4 @@
-import { Match, Show, Switch, createMemo, createSignal, onCleanup } from "solid-js";
+import { Match, Show, Switch, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { ScopeTimeline, type TimelineLaneInterval } from "../components/ScopeTimeline";
 import { ComparisonCaptureSlot } from "../components/utrace/compare/CaptureSlot";
 import { ComparisonOverview } from "../components/utrace/compare/ComparisonOverview";
@@ -25,6 +25,7 @@ import type {
 } from "../lib/types";
 import {
   parseUtraceProgressWithWasm,
+  prepareUtraceWasm,
   queryUtraceTimerStatsWithWasm,
   queryUtraceTimelineWithWasm,
   releaseUtraceSessionWithWasm,
@@ -86,6 +87,7 @@ function comparisonError(error: unknown): string {
 }
 
 export default function UtraceComparePage() {
+  onMount(() => { void prepareUtraceWasm(); });
   const [baselineState, setBaselineState] = createSignal<ComparisonCaptureState>(EMPTY_CAPTURE);
   const [candidateState, setCandidateState] = createSignal<ComparisonCaptureState>(EMPTY_CAPTURE);
   const [activeTab, setActiveTab] = createSignal<CompareTab>("outcome");

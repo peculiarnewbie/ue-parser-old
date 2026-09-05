@@ -1,4 +1,4 @@
-import { For, Show, createMemo, createSignal, onCleanup } from "solid-js";
+import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { DropZone } from "../components/DropZone";
 import { FrameBrowser } from "../components/FrameBrowser";
 import { ScopeTimeline, type TimelineLaneInterval } from "../components/ScopeTimeline";
@@ -56,6 +56,8 @@ import {
 import {
   cancelWasmParsing,
   parseUtraceProgressWithWasm,
+  prepareUtraceWasm,
+  releaseUtraceSessionWithWasm,
   queryUtraceGpuTimelineWithWasm,
   queryUtraceTimelineWithWasm,
 } from "../lib/wasm-worker-client";
@@ -112,6 +114,7 @@ function progressPercent(event: UtraceProgressEvent | null, fallback: number): s
 }
 
 export default function UtracePage() {
+  onMount(() => { void prepareUtraceWasm(); });
   const [busy, setBusy] = createSignal(false);
   const [timelineBusy, setTimelineBusy] = createSignal(false);
   const [gpuBusy, setGpuBusy] = createSignal(false);
@@ -501,10 +504,12 @@ export default function UtracePage() {
   };
 
   const onFile = async (next: File) => {
+    const interrupted = loadAbort !== null;
+    const previousSession = timelineSessionId();
     setBusy(true);
     cancelActiveLoad();
     invalidateDetailRequests();
-    cancelWasmParsing();
+    if (interrupted) cancelWasmParsing();
     resetUtraceTelemetry();
     const loadSpan = beginUtraceSpan({
       name: UTRACE_SPAN.load,
@@ -553,6 +558,8 @@ export default function UtracePage() {
     setStreamedBootstrap(undefined);
     const wallStarted = performance.now();
     try {
+      if (!interrupted && previousSession) await releaseUtraceSessionWithWasm(previousSession);
+      abortController.signal.throwIfAborted();
       let latestSequence = -1;
       const dashResult = await parseUtraceProgressWithWasm({
         file: next,

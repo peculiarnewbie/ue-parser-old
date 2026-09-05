@@ -8,28 +8,30 @@ import {
 } from "./perf-span-types";
 import { finishPhaseSpanName, parseWasmFinishProfile } from "./wasm-finish-profile";
 
-type WasmParseRequest = {
-  id: number;
+type WasmParseCommand = {
   kind: "uasset-inspect" | "utrace-inventory" | "utrace-dashboard" | "utrace-dashboard-bundle";
   filename: string;
   bytes: ArrayBuffer;
   options: Record<string, number | undefined>;
 };
 
-type WasmProgressRequest =
-  | { id: number; kind: "utrace-progress-start"; session_id: number; filename: string; total_bytes: number; options: Record<string, number | undefined> }
-  | { id: number; kind: "utrace-progress-chunk"; session_id: number; bytes: ArrayBuffer }
-  | { id: number; kind: "utrace-progress-analyzing"; session_id: number }
-  | { id: number; kind: "utrace-progress-finish"; session_id: number }
-  | { id: number; kind: "utrace-progress-query"; session_id: number; options: Record<string, number | string | undefined> }
-  | { id: number; kind: "utrace-progress-timer-stats"; session_id: number; options: Record<string, number | string | undefined> }
-  | { id: number; kind: "utrace-progress-gpu-query"; session_id: number; options: Record<string, number | undefined> }
-  | { id: number; kind: "utrace-progress-release"; session_id: number }
-  | { id: number; kind: "utrace-progress-cancel"; session_id: number };
+type WasmProgressCommand =
+  | { kind: "utrace-progress-start"; session_id: number; filename: string; total_bytes: number; options: Record<string, number | undefined> }
+  | { kind: "utrace-progress-read"; session_id: number; file: File }
+  | { kind: "utrace-progress-analyzing"; session_id: number }
+  | { kind: "utrace-progress-finish"; session_id: number }
+  | { kind: "utrace-progress-query"; session_id: number; options: Record<string, number | string | undefined> }
+  | { kind: "utrace-progress-timer-stats"; session_id: number; options: Record<string, number | string | undefined> }
+  | { kind: "utrace-progress-gpu-query"; session_id: number; options: Record<string, number | undefined> }
+  | { kind: "utrace-progress-release"; session_id: number }
+  | { kind: "utrace-progress-cancel"; session_id: number };
 
-type WasmRequest = WasmParseRequest | WasmProgressRequest;
+export type WasmCommand = WasmParseCommand | WasmProgressCommand | { kind: "utrace-prepare" };
 
-type WasmResponse =
+type WasmRequest = WasmCommand & { id: number };
+
+export type WasmResponse =
+  | { id: number; kind: "progress"; json: string; timing: WorkerTiming; sent_at: number }
   | { id: number; ok: true; json: string; timing: WorkerTiming; sent_at: number }
   | { id: number; ok: false; error: string; timing: WorkerTiming; sent_at: number };
 
@@ -68,7 +70,15 @@ let wasmInitializationPromise: Promise<void> | null = null;
 let threadPoolPromise: Promise<void> | null = null;
 const wasmThreads = self.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
 const progressiveSessions = new Map<number, InstanceType<WasmModule["ProgressiveUtraceSession"]>>();
+const progressiveReaders = new Map<number, ReadableStreamDefaultReader<Uint8Array>>();
 const MAX_RETAINED_UTRACE_SESSIONS = 2;
+
+function releaseProgressiveSession(id: number): void {
+  void progressiveReaders.get(id)?.cancel().catch(() => undefined);
+  progressiveReaders.delete(id);
+  progressiveSessions.get(id)?.free();
+  progressiveSessions.delete(id);
+}
 
 async function wasm(spans: RemoteUtraceSpan[]): Promise<WasmModule> {
   if (!modulePromise) {
@@ -123,10 +133,17 @@ self.onmessage = async (event: MessageEvent<WasmRequest>) => {
   try {
     const loaded = await wasm(spans);
     const afterInit = performance.now();
+    if (request.kind === "utrace-prepare") {
+      spans.push(requestSpan(request, started));
+      self.postMessage({
+        id: request.id, ok: true, json: "[]", sent_at: performance.now(),
+        timing: { worker_startup_ms: afterInit - started, wasm_threads: wasmThreads, wasm_copy_ms: 0, parse_ms: 0, spans },
+      } satisfies WasmResponse);
+      return;
+    }
     if (request.kind === "utrace-progress-start") {
       const operationStarted = performance.now();
-      progressiveSessions.get(request.session_id)?.free();
-      progressiveSessions.delete(request.session_id);
+      releaseProgressiveSession(request.session_id);
       if (progressiveSessions.size >= MAX_RETAINED_UTRACE_SESSIONS) {
         throw new Error(
           `browser UTrace session limit (${MAX_RETAINED_UTRACE_SESSIONS}) reached; release a capture before loading another`,
@@ -170,27 +187,49 @@ self.onmessage = async (event: MessageEvent<WasmRequest>) => {
       request.kind === "utrace-progress-release"
     ) {
       const operationStarted = performance.now();
-      progressiveSessions.get(request.session_id)?.free();
-      progressiveSessions.delete(request.session_id);
+      releaseProgressiveSession(request.session_id);
       spans.push(remoteSpan({ name: UTRACE_SPAN.sessionCancel, domain: "wasm", started: operationStarted }));
       spans.push(requestSpan(request, started));
       self.postMessage({ id: request.id, ok: true, json: "[]", timing: { wasm_copy_ms: 0, parse_ms: 0, spans }, sent_at: performance.now() } satisfies WasmResponse);
       return;
     }
-    if (request.kind === "utrace-progress-chunk") {
+    if (request.kind === "utrace-progress-read") {
       const session = progressiveSessions.get(request.session_id);
       if (!session) throw new Error("unknown progressive WASM session");
-      const beforeParse = performance.now();
-      const json = session.push_chunk(new Uint8Array(request.bytes));
-      const parseMs = performance.now() - beforeParse;
-      spans.push(remoteSpan({
-        name: UTRACE_SPAN.sessionPush,
-        domain: "wasm",
-        started: beforeParse,
-        attributes: { "utrace.chunk_bytes": request.bytes.byteLength },
-      }));
+      if (progressiveReaders.has(request.session_id)) throw new Error("capture is already being read");
+      const reader = request.file.stream().getReader();
+      progressiveReaders.set(request.session_id, reader);
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (progressiveSessions.get(request.session_id) !== session) {
+            throw new Error("WASM parsing cancelled");
+          }
+          if (done) break;
+          for (let offset = 0; offset < value.byteLength; offset += 1024 * 1024) {
+            const chunk = value.subarray(offset, Math.min(value.byteLength, offset + 1024 * 1024));
+            const beforeParse = performance.now();
+            const json = session.push_chunk(chunk);
+            const parseMs = performance.now() - beforeParse;
+            self.postMessage({
+              id: request.id, kind: "progress", json, sent_at: performance.now(),
+              timing: {
+                wasm_copy_ms: 0, parse_ms: parseMs,
+                spans: [remoteSpan({
+                  name: UTRACE_SPAN.sessionPush, domain: "wasm", started: beforeParse,
+                  attributes: { "utrace.chunk_bytes": chunk.byteLength },
+                })],
+              },
+            } satisfies WasmResponse);
+          }
+        }
+      } finally {
+        if (progressiveReaders.get(request.session_id) === reader) progressiveReaders.delete(request.session_id);
+        await reader.cancel().catch(() => undefined);
+        reader.releaseLock();
+      }
       spans.push(requestSpan(request, started));
-      self.postMessage({ id: request.id, ok: true, json, timing: { wasm_copy_ms: beforeParse - afterInit, parse_ms: parseMs, spans }, sent_at: performance.now() } satisfies WasmResponse);
+      self.postMessage({ id: request.id, ok: true, json: "[]", timing: { wasm_copy_ms: 0, parse_ms: 0, spans }, sent_at: performance.now() } satisfies WasmResponse);
       return;
     }
     if (request.kind === "utrace-progress-finish") {

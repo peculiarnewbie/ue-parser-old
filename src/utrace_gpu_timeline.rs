@@ -20,7 +20,33 @@ pub(crate) trait GpuTimelineSink {
         end_timestamp: u64,
     ) -> SinkAppetite;
 
-    fn record(&mut self, interval: GpuTimelineInterval, active_frame: Option<u32>);
+    fn record(&mut self, interval: GpuTimelineIntervalView<'_>, active_frame: Option<u32>);
+}
+
+/// Borrowed provider output; only retained UI rows and new interned names allocate.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GpuTimelineIntervalView<'a> {
+    pub queue_id: u32,
+    pub kind: GpuTimelineIntervalKind,
+    pub spec_id: Option<u32>,
+    pub name: &'a str,
+    pub start_timestamp: u64,
+    pub end_timestamp: u64,
+    pub duration: u64,
+}
+
+impl From<GpuTimelineIntervalView<'_>> for GpuTimelineInterval {
+    fn from(interval: GpuTimelineIntervalView<'_>) -> Self {
+        Self {
+            queue_id: interval.queue_id,
+            kind: interval.kind,
+            spec_id: interval.spec_id,
+            name: interval.name.to_owned(),
+            start_timestamp: interval.start_timestamp,
+            end_timestamp: interval.end_timestamp,
+            duration: interval.duration,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,13 +143,13 @@ impl GpuTimelineIndexBuilder {
         }
     }
 
-    fn intern(&mut self, value: String) -> u32 {
-        if let Some(&id) = self.string_ids.get(value.as_str()) {
+    fn intern(&mut self, value: &str) -> u32 {
+        if let Some(&id) = self.string_ids.get(value) {
             return id;
         }
         let id = u32::try_from(self.strings.len()).unwrap();
-        self.strings.push(value.clone());
-        self.string_ids.insert(value, id);
+        self.strings.push(value.to_owned());
+        self.string_ids.insert(value.to_owned(), id);
         id
     }
 }
@@ -162,7 +188,7 @@ impl GpuTimelineSink for GpuTimelineIndexBuilder {
         SinkAppetite::WantsRecord
     }
 
-    fn record(&mut self, interval: GpuTimelineInterval, active_frame: Option<u32>) {
+    fn record(&mut self, interval: GpuTimelineIntervalView<'_>, active_frame: Option<u32>) {
         let frame_number = active_frame.expect("GPU sink requested a record without a frame");
         let name_id = self.intern(interval.name);
         self.frames
@@ -182,6 +208,160 @@ impl GpuTimelineSink for GpuTimelineIndexBuilder {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct GpuTimelineCollector {
+    frame_number: u32,
+    limit: usize,
+    begin_timestamp: Option<u64>,
+    end_timestamp: Option<u64>,
+    interval_count: u64,
+    truncated: bool,
+    intervals: Vec<GpuTimelineInterval>,
+}
+
+impl GpuTimelineCollector {
+    pub(crate) fn new(frame_number: u32, limit: usize) -> Self {
+        Self {
+            frame_number,
+            limit,
+            begin_timestamp: None,
+            end_timestamp: None,
+            interval_count: 0,
+            truncated: false,
+            intervals: Vec::new(),
+        }
+    }
+
+    pub(crate) fn into_dashboard(self) -> GpuTimelineDashboard {
+        let begin_timestamp = self.begin_timestamp.unwrap_or(0);
+        GpuTimelineDashboard {
+            frame_number: self.frame_number,
+            begin_timestamp,
+            end_timestamp: self.end_timestamp.unwrap_or(begin_timestamp),
+            interval_count: self.interval_count,
+            truncated: self.truncated,
+            intervals: self.intervals,
+        }
+    }
+}
+
+impl GpuTimelineSink for GpuTimelineCollector {
+    fn note(
+        &mut self,
+        active_frame: Option<u32>,
+        start_timestamp: u64,
+        end_timestamp: u64,
+    ) -> SinkAppetite {
+        if active_frame != Some(self.frame_number) {
+            return SinkAppetite::Full;
+        }
+        self.begin_timestamp = Some(
+            self.begin_timestamp
+                .map_or(start_timestamp, |begin| begin.min(start_timestamp)),
+        );
+        self.end_timestamp = Some(
+            self.end_timestamp
+                .map_or(end_timestamp, |end| end.max(end_timestamp)),
+        );
+        self.interval_count = self.interval_count.saturating_add(1);
+        if self.intervals.len() >= self.limit {
+            self.truncated = true;
+            return SinkAppetite::Full;
+        }
+        SinkAppetite::WantsRecord
+    }
+
+    fn record(&mut self, interval: GpuTimelineIntervalView<'_>, active_frame: Option<u32>) {
+        debug_assert_eq!(active_frame, Some(self.frame_number));
+        self.intervals.push(interval.into());
+    }
+}
+
+pub(crate) struct GpuTimelineFanout<'a> {
+    collector: &'a mut GpuTimelineCollector,
+    index: &'a mut dyn GpuTimelineSink,
+    collector_wants_record: bool,
+    index_wants_record: bool,
+}
+
+impl<'a> GpuTimelineFanout<'a> {
+    pub(crate) fn new(
+        collector: &'a mut GpuTimelineCollector,
+        index: &'a mut dyn GpuTimelineSink,
+    ) -> Self {
+        Self {
+            collector,
+            index,
+            collector_wants_record: false,
+            index_wants_record: false,
+        }
+    }
+}
+
+impl GpuTimelineSink for GpuTimelineFanout<'_> {
+    fn note(
+        &mut self,
+        active_frame: Option<u32>,
+        start_timestamp: u64,
+        end_timestamp: u64,
+    ) -> SinkAppetite {
+        self.collector_wants_record =
+            self.collector
+                .note(active_frame, start_timestamp, end_timestamp)
+                == SinkAppetite::WantsRecord;
+        self.index_wants_record = self
+            .index
+            .note(active_frame, start_timestamp, end_timestamp)
+            == SinkAppetite::WantsRecord;
+        if self.collector_wants_record || self.index_wants_record {
+            SinkAppetite::WantsRecord
+        } else {
+            SinkAppetite::Full
+        }
+    }
+
+    fn record(&mut self, interval: GpuTimelineIntervalView<'_>, active_frame: Option<u32>) {
+        match (self.collector_wants_record, self.index_wants_record) {
+            (true, true) => {
+                self.collector.record(interval, active_frame);
+                self.index.record(interval, active_frame);
+            }
+            (true, false) => self.collector.record(interval, active_frame),
+            (false, true) => self.index.record(interval, active_frame),
+            (false, false) => debug_assert!(false, "record called without a GPU sink appetite"),
+        }
+    }
+}
+
+pub(crate) enum GpuTimelineSinks<'a> {
+    Collector(&'a mut GpuTimelineCollector),
+    Index(&'a mut dyn GpuTimelineSink),
+    Both(GpuTimelineFanout<'a>),
+}
+
+impl GpuTimelineSink for GpuTimelineSinks<'_> {
+    fn note(
+        &mut self,
+        active_frame: Option<u32>,
+        start_timestamp: u64,
+        end_timestamp: u64,
+    ) -> SinkAppetite {
+        match self {
+            Self::Collector(sink) => sink.note(active_frame, start_timestamp, end_timestamp),
+            Self::Index(sink) => sink.note(active_frame, start_timestamp, end_timestamp),
+            Self::Both(sink) => sink.note(active_frame, start_timestamp, end_timestamp),
+        }
+    }
+
+    fn record(&mut self, interval: GpuTimelineIntervalView<'_>, active_frame: Option<u32>) {
+        match self {
+            Self::Collector(sink) => sink.record(interval, active_frame),
+            Self::Index(sink) => sink.record(interval, active_frame),
+            Self::Both(sink) => sink.record(interval, active_frame),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,11 +377,11 @@ mod tests {
             == SinkAppetite::WantsRecord
         {
             builder.record(
-                GpuTimelineInterval {
+                GpuTimelineIntervalView {
                     queue_id: 3,
                     kind: GpuTimelineIntervalKind::Breadcrumb,
                     spec_id: Some(7),
-                    name: name.to_owned(),
+                    name,
                     start_timestamp,
                     end_timestamp,
                     duration: end_timestamp - start_timestamp,
@@ -238,5 +418,42 @@ mod tests {
         assert_eq!(bounded.interval_count, 3);
         assert_eq!(bounded.intervals.len(), 1);
         assert!(bounded.truncated);
+    }
+
+    #[test]
+    fn fanout_owns_retained_names_and_preserves_independent_limits() {
+        let mut index = GpuTimelineIndexBuilder::new(3);
+        let mut collector = GpuTimelineCollector::new(7, 1);
+        {
+            let mut sinks = GpuTimelineFanout::new(&mut collector, &mut index);
+            for (frame, start) in [(7, 10), (7, 20), (8, 30), (8, 40)] {
+                let name = String::from("Repeated name");
+                if sinks.note(Some(frame), start, start + 5) == SinkAppetite::WantsRecord {
+                    sinks.record(
+                        GpuTimelineIntervalView {
+                            queue_id: 3,
+                            kind: GpuTimelineIntervalKind::Breadcrumb,
+                            spec_id: Some(11),
+                            name: &name,
+                            start_timestamp: start,
+                            end_timestamp: start + 5,
+                            duration: 5,
+                        },
+                        Some(frame),
+                    );
+                }
+            }
+        }
+        assert_eq!(index.strings.len(), 1);
+        let index = index.finish();
+        let selected = collector.into_dashboard();
+        assert_eq!(selected.intervals, index.query(7, Some(1)).intervals);
+        assert_eq!(selected.interval_count, 2);
+        assert!(selected.truncated);
+        let other = index.query(8, Some(10));
+        assert_eq!(other.interval_count, 2);
+        assert_eq!(other.intervals.len(), 1);
+        assert_eq!(other.intervals[0].name, "Repeated name");
+        assert!(other.truncated);
     }
 }

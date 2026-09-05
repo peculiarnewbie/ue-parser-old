@@ -17,7 +17,10 @@ use crate::utrace_framing::{
 pub use crate::utrace_gpu_timeline::{
     DEFAULT_MAX_GPU_INDEXED_INTERVALS, GpuTimelineMemoryIndex, MAX_GPU_QUERY_INTERVALS,
 };
-use crate::utrace_gpu_timeline::{GpuTimelineIndexBuilder, GpuTimelineSink};
+use crate::utrace_gpu_timeline::{
+    GpuTimelineCollector, GpuTimelineFanout, GpuTimelineIndexBuilder, GpuTimelineIntervalView,
+    GpuTimelineSink, GpuTimelineSinks,
+};
 use crate::utrace_memory::{
     LlmTag, LlmTagSet, LlmTracker, MemoryAllocation, MemoryFree, MemoryInit, MemoryProvider,
     MemoryTag,
@@ -5334,9 +5337,12 @@ fn decode_gpu_normal_event(
                         || {
                             details
                                 .rendered_name
-                                .clone()
-                                .or_else(|| specs.get(&begin.spec_id).map(|spec| spec.name.clone()))
-                                .unwrap_or_else(|| format!("#{}", begin.spec_id))
+                                .as_deref()
+                                .or_else(|| {
+                                    specs.get(&begin.spec_id).map(|spec| spec.name.as_str())
+                                })
+                                .map(Cow::Borrowed)
+                                .unwrap_or_else(|| Cow::Owned(format!("#{}", begin.spec_id)))
                         },
                     );
                 }
@@ -5373,9 +5379,10 @@ fn decode_gpu_normal_event(
                     || {
                         details
                             .rendered_name
-                            .clone()
-                            .or_else(|| specs.get(&begin.spec_id).map(|spec| spec.name.clone()))
-                            .unwrap_or_else(|| format!("#{}", begin.spec_id))
+                            .as_deref()
+                            .or_else(|| specs.get(&begin.spec_id).map(|spec| spec.name.as_str()))
+                            .map(Cow::Borrowed)
+                            .unwrap_or_else(|| Cow::Owned(format!("#{}", begin.spec_id)))
                     },
                 );
             }
@@ -5526,7 +5533,7 @@ fn decode_gpu_normal_event(
                     begin.gpu_timestamp_top,
                     gpu_timestamp_bop,
                     duration,
-                    || "Work".to_owned(),
+                    || Cow::Borrowed("Work"),
                 );
             }
         }
@@ -5634,7 +5641,7 @@ fn decode_gpu_normal_event(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_gpu_timeline_interval(
+fn record_gpu_timeline_interval<'a>(
     timeline: &mut dyn GpuTimelineSink,
     active_frame: Option<u32>,
     queue_id: u32,
@@ -5643,17 +5650,18 @@ fn record_gpu_timeline_interval(
     start_timestamp: u64,
     end_timestamp: u64,
     duration: u64,
-    name: impl FnOnce() -> String,
+    name: impl FnOnce() -> Cow<'a, str>,
 ) {
     if timeline.note(active_frame, start_timestamp, end_timestamp) != SinkAppetite::WantsRecord {
         return;
     }
+    let name = name();
     timeline.record(
-        GpuTimelineInterval {
+        GpuTimelineIntervalView {
             queue_id,
             kind,
             spec_id,
-            name: name(),
+            name: &name,
             start_timestamp,
             end_timestamp,
             duration,
@@ -9139,157 +9147,6 @@ impl ProgressiveCpuTimelineDecoder {
 }
 
 #[derive(Clone, Debug)]
-struct GpuTimelineCollector {
-    frame_number: u32,
-    limit: usize,
-    begin_timestamp: Option<u64>,
-    end_timestamp: Option<u64>,
-    interval_count: u64,
-    truncated: bool,
-    intervals: Vec<GpuTimelineInterval>,
-}
-
-impl GpuTimelineCollector {
-    fn new(frame_number: u32, limit: usize) -> Self {
-        Self {
-            frame_number,
-            limit,
-            begin_timestamp: None,
-            end_timestamp: None,
-            interval_count: 0,
-            truncated: false,
-            intervals: Vec::new(),
-        }
-    }
-
-    fn into_dashboard(self) -> GpuTimelineDashboard {
-        let begin_timestamp = self.begin_timestamp.unwrap_or(0);
-        GpuTimelineDashboard {
-            frame_number: self.frame_number,
-            begin_timestamp,
-            end_timestamp: self.end_timestamp.unwrap_or(begin_timestamp),
-            interval_count: self.interval_count,
-            truncated: self.truncated,
-            intervals: self.intervals,
-        }
-    }
-}
-
-impl GpuTimelineSink for GpuTimelineCollector {
-    fn note(
-        &mut self,
-        active_frame: Option<u32>,
-        start_timestamp: u64,
-        end_timestamp: u64,
-    ) -> SinkAppetite {
-        if active_frame != Some(self.frame_number) {
-            return SinkAppetite::Full;
-        }
-        self.begin_timestamp = Some(
-            self.begin_timestamp
-                .map_or(start_timestamp, |begin| begin.min(start_timestamp)),
-        );
-        self.end_timestamp = Some(
-            self.end_timestamp
-                .map_or(end_timestamp, |end| end.max(end_timestamp)),
-        );
-        self.interval_count = self.interval_count.saturating_add(1);
-        if self.intervals.len() >= self.limit {
-            self.truncated = true;
-            return SinkAppetite::Full;
-        }
-        SinkAppetite::WantsRecord
-    }
-
-    fn record(&mut self, interval: GpuTimelineInterval, active_frame: Option<u32>) {
-        debug_assert_eq!(active_frame, Some(self.frame_number));
-        self.intervals.push(interval);
-    }
-}
-
-struct GpuTimelineFanout<'a> {
-    collector: &'a mut GpuTimelineCollector,
-    index: &'a mut dyn GpuTimelineSink,
-    collector_wants_record: bool,
-    index_wants_record: bool,
-}
-
-impl<'a> GpuTimelineFanout<'a> {
-    fn new(collector: &'a mut GpuTimelineCollector, index: &'a mut dyn GpuTimelineSink) -> Self {
-        Self {
-            collector,
-            index,
-            collector_wants_record: false,
-            index_wants_record: false,
-        }
-    }
-}
-
-impl GpuTimelineSink for GpuTimelineFanout<'_> {
-    fn note(
-        &mut self,
-        active_frame: Option<u32>,
-        start_timestamp: u64,
-        end_timestamp: u64,
-    ) -> SinkAppetite {
-        self.collector_wants_record =
-            self.collector
-                .note(active_frame, start_timestamp, end_timestamp)
-                == SinkAppetite::WantsRecord;
-        self.index_wants_record = self
-            .index
-            .note(active_frame, start_timestamp, end_timestamp)
-            == SinkAppetite::WantsRecord;
-        if self.collector_wants_record || self.index_wants_record {
-            SinkAppetite::WantsRecord
-        } else {
-            SinkAppetite::Full
-        }
-    }
-
-    fn record(&mut self, interval: GpuTimelineInterval, active_frame: Option<u32>) {
-        match (self.collector_wants_record, self.index_wants_record) {
-            (true, true) => {
-                self.collector.record(interval.clone(), active_frame);
-                self.index.record(interval, active_frame);
-            }
-            (true, false) => self.collector.record(interval, active_frame),
-            (false, true) => self.index.record(interval, active_frame),
-            (false, false) => debug_assert!(false, "record called without a GPU sink appetite"),
-        }
-    }
-}
-
-enum GpuTimelineSinks<'a> {
-    Collector(&'a mut GpuTimelineCollector),
-    Index(&'a mut dyn GpuTimelineSink),
-    Both(GpuTimelineFanout<'a>),
-}
-
-impl GpuTimelineSink for GpuTimelineSinks<'_> {
-    fn note(
-        &mut self,
-        active_frame: Option<u32>,
-        start_timestamp: u64,
-        end_timestamp: u64,
-    ) -> SinkAppetite {
-        match self {
-            Self::Collector(sink) => sink.note(active_frame, start_timestamp, end_timestamp),
-            Self::Index(sink) => sink.note(active_frame, start_timestamp, end_timestamp),
-            Self::Both(sink) => sink.note(active_frame, start_timestamp, end_timestamp),
-        }
-    }
-
-    fn record(&mut self, interval: GpuTimelineInterval, active_frame: Option<u32>) {
-        match self {
-            Self::Collector(sink) => sink.record(interval, active_frame),
-            Self::Index(sink) => sink.record(interval, active_frame),
-            Self::Both(sink) => sink.record(interval, active_frame),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
 struct CpuTimelineCollector {
     frame_number: u32,
     limit: usize,
@@ -12301,7 +12158,7 @@ mod tests {
             100,
             120,
             20,
-            || "Work".to_owned(),
+            || Cow::Borrowed("Work"),
         );
         record_gpu_timeline_interval(
             &mut timeline,
@@ -12312,7 +12169,7 @@ mod tests {
             125,
             140,
             15,
-            || "RenderPass".to_owned(),
+            || Cow::Borrowed("RenderPass"),
         );
         record_gpu_timeline_interval(
             &mut timeline,
@@ -12323,7 +12180,7 @@ mod tests {
             145,
             170,
             25,
-            || "Work".to_owned(),
+            || Cow::Borrowed("Work"),
         );
         record_gpu_timeline_interval(
             &mut timeline,
@@ -12334,7 +12191,7 @@ mod tests {
             200,
             220,
             20,
-            || "OtherFrame".to_owned(),
+            || Cow::Borrowed("OtherFrame"),
         );
 
         let dashboard = timeline.into_dashboard();
