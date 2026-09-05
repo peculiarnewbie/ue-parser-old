@@ -11,6 +11,9 @@ use serde::Serialize;
 
 use crate::utrace_callstacks::{CallstackId, CallstackProvider, decode_callstack_spec};
 use crate::utrace_format_args::{format_arg_display_strings, render_format_message};
+use crate::utrace_framing::{
+    decode_known_scope_cycle, normal_event_layouts, parse_protocol5_normal_event,
+};
 pub use crate::utrace_gpu_timeline::{
     DEFAULT_MAX_GPU_INDEXED_INTERVALS, GpuTimelineMemoryIndex, MAX_GPU_QUERY_INTERVALS,
 };
@@ -23,7 +26,8 @@ use crate::utrace_modules::{
     ModuleProvider, decode_module_init, decode_module_load, decode_module_unload,
 };
 use crate::utrace_monotonic_timeline::{
-    CpuMonotonicTimelineBuilder, CpuMonotonicTimelineSink, CpuTimelineCatalogSink, CpuTimerRef,
+    CpuMonotonicTimelineBuilder, CpuMonotonicTimelineSink, CpuTimelineBuild,
+    CpuTimelineCatalogSink, CpuTimerRef,
 };
 pub use crate::utrace_monotonic_timeline::{CpuMonotonicTimelineIndex, CpuMonotonicTimelineStats};
 use crate::utrace_platform_file::PlatformFileProvider;
@@ -41,6 +45,8 @@ use crate::{ArchiveError, ArchiveErrorKind, Reader};
 
 #[cfg(feature = "utrace-parallel")]
 mod cpu_parallel;
+mod cpu_rendered_totals;
+use cpu_rendered_totals::CpuRenderedScopeTotals;
 
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
@@ -3472,7 +3478,7 @@ pub(crate) fn dashboard_from_decoded_with_monotonic_timeline_index_profiled(
     decoded: DecodedStreams,
     options: DashboardOptions,
     source: SourceIdentity,
-    builder: CpuMonotonicTimelineBuilder,
+    builder: CpuTimelineBuild,
     phase_complete: &mut dyn FnMut(crate::utrace_session::ProgressiveFinishPhase),
 ) -> Result<
     (
@@ -3523,9 +3529,16 @@ fn dashboard_from_decoded_with_timeline_builder(
     options: DashboardOptions,
     mut timeline_index_builder: Option<CpuTimelineIndexBuilder>,
     mut gpu_timeline_index_builder: Option<GpuTimelineIndexBuilder>,
-    mut monotonic_timeline_builder: Option<CpuMonotonicTimelineBuilder>,
+    monotonic_timeline: Option<CpuTimelineBuild>,
     mut phase_complete: Option<&mut dyn FnMut(crate::utrace_session::ProgressiveFinishPhase)>,
 ) -> Result<DashboardTimelineBuild, TraceError> {
+    #[cfg(feature = "utrace-parallel")]
+    let parallel_timeline = matches!(monotonic_timeline, Some(CpuTimelineBuild::Parallel));
+    let mut monotonic_timeline_builder = monotonic_timeline.map(|build| match build {
+        CpuTimelineBuild::Ready(builder) => *builder,
+        #[cfg(feature = "utrace-parallel")]
+        CpuTimelineBuild::Parallel => CpuMonotonicTimelineBuilder::new(),
+    });
     let events = read_event_registry(&header, &decoded.streams)?;
     notify_finish_phase(
         &mut phase_complete,
@@ -3554,27 +3567,49 @@ fn dashboard_from_decoded_with_timeline_builder(
                 (None, Some(index)) => Some(CpuTimelineSinks::Index(index)),
                 (None, None) => None,
             };
-        read_dashboard_events(
-            &header,
-            &decoded.streams,
-            &events,
-            &decoded_importants,
-            decoded.summary.sync_count,
-            DashboardDecodeOptions::full(options, decoded.serial_dispatch_hint),
-            DashboardDecodeHooks {
-                cpu: cpu_timeline_sink
+        let mut read_providers = || {
+            read_dashboard_events(
+                &header,
+                &decoded.streams,
+                &events,
+                &decoded_importants,
+                decoded.summary.sync_count,
+                DashboardDecodeOptions::full(options, decoded.serial_dispatch_hint),
+                DashboardDecodeHooks {
+                    cpu: cpu_timeline_sink
+                        .as_mut()
+                        .map(|sink| sink as &mut dyn CpuTimelineSink),
+                    gpu: gpu_timeline_index_builder
+                        .as_mut()
+                        .map(|sink| sink as &mut dyn GpuTimelineSink),
+                    monotonic_cpu: monotonic_timeline_builder
+                        .as_mut()
+                        .map(|sink| sink as &mut dyn CpuTimelineCatalogSink),
+                    monotonic_events: None,
+                    phase_complete: phase_complete.take(),
+                },
+            )
+        };
+        #[cfg(feature = "utrace-parallel")]
+        {
+            if parallel_timeline {
+                let (dashboard, pages) = cpu_parallel::with_timeline(
+                    &decoded.streams,
+                    &events,
+                    decoded_importants.prologue.as_ref(),
+                    read_providers,
+                )?;
+                monotonic_timeline_builder
                     .as_mut()
-                    .map(|sink| sink as &mut dyn CpuTimelineSink),
-                gpu: gpu_timeline_index_builder
-                    .as_mut()
-                    .map(|sink| sink as &mut dyn GpuTimelineSink),
-                monotonic_cpu: monotonic_timeline_builder
-                    .as_mut()
-                    .map(|sink| sink as &mut dyn CpuTimelineCatalogSink),
-                monotonic_events: None,
-                phase_complete: phase_complete.take(),
-            },
-        )?
+                    .expect("parallel builder supplied")
+                    .merge_threads(pages);
+                dashboard?
+            } else {
+                read_providers()?
+            }
+        }
+        #[cfg(not(feature = "utrace-parallel"))]
+        read_providers()?
     };
     if let Some(collector) = timeline_collector {
         dashboard.cpu.timeline = Some(collector.into_dashboard(cycle_frequency));
@@ -4772,7 +4807,10 @@ fn read_dashboard_events(
         );
 
     decoded.cpu.specs = spec_by_id.values().cloned().collect();
-    let cpu_metadata_rendered_totals = metadata_interval_state.rendered_scope_totals.clone();
+    let cpu_metadata_rendered_totals = metadata_interval_state
+        .rendered_scope_totals
+        .clone()
+        .into_ordered();
     decoded.cpu.metadata = cpu_metadata_dashboard(
         &metadata_spec_by_id,
         &metadata_by_id,
@@ -8840,26 +8878,16 @@ struct OwnedRawEvent {
     scope_cycle: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ParsedNormalEvent {
-    pub(super) uid: u16,
-    pub(super) offset: usize,
-    pub(super) total_end: usize,
-    pub(super) data_start: usize,
-    pub(super) data_end: usize,
-    pub(super) has_aux: bool,
-    pub(super) serial: Option<u32>,
-}
-
 fn read_protocol5_normal_events(
     stream: &[u8],
     registry: &BTreeMap<u16, &EventTypeInfo>,
 ) -> Result<Vec<OwnedRawEvent>, TraceError> {
+    let layouts = normal_event_layouts(registry);
     let mut reader = Reader::new(stream);
     let mut events = Vec::new();
     let mut scope_cycles = Vec::<u64>::new();
     while reader.remaining() > 0 {
-        let parsed = parse_protocol5_normal_event(&mut reader, registry)?;
+        let parsed = parse_protocol5_normal_event(&mut reader, &layouts)?;
         if parsed.uid == 3 {
             continue;
         }
@@ -8880,7 +8908,7 @@ fn read_protocol5_normal_events(
             .flatten();
         if parsed.has_aux {
             loop {
-                let aux = parse_protocol5_normal_event(&mut reader, registry)?;
+                let aux = parse_protocol5_normal_event(&mut reader, &layouts)?;
                 match aux.uid {
                     1 => {
                         let mut aux_bytes = stream[aux.offset..aux.total_end].to_vec();
@@ -8904,110 +8932,6 @@ fn read_protocol5_normal_events(
         });
     }
     Ok(events)
-}
-
-pub(super) fn decode_known_scope_cycle(uid: u16, data: &[u8]) -> Option<u64> {
-    match uid {
-        6 if data.len() == 8 => Some(u64::from_le_bytes(data.try_into().ok()?)),
-        8 if data.len() == 7 => {
-            let mut bytes = [0_u8; 8];
-            bytes[..7].copy_from_slice(data);
-            Some(u64::from_le_bytes(bytes))
-        }
-        _ => None,
-    }
-}
-
-/// Lookup used by normal-stream event framing. Accepts both owned registry maps
-/// (`BTreeMap<u16, EventTypeInfo>`) and borrowed views (`BTreeMap<u16, &EventTypeInfo>`).
-pub(super) trait EventTypeRegistry {
-    fn lookup(&self, uid: u16) -> Option<&EventTypeInfo>;
-}
-
-impl EventTypeRegistry for BTreeMap<u16, EventTypeInfo> {
-    #[inline]
-    fn lookup(&self, uid: u16) -> Option<&EventTypeInfo> {
-        self.get(&uid)
-    }
-}
-
-impl EventTypeRegistry for BTreeMap<u16, &EventTypeInfo> {
-    #[inline]
-    fn lookup(&self, uid: u16) -> Option<&EventTypeInfo> {
-        self.get(&uid).copied()
-    }
-}
-
-pub(super) fn parse_protocol5_normal_event(
-    reader: &mut Reader<'_>,
-    registry: &impl EventTypeRegistry,
-) -> Result<ParsedNormalEvent, TraceError> {
-    const USER_UID: u16 = 16;
-    let offset = usize::try_from(reader.tell()).unwrap();
-    let first = reader.read_u8("Events.Uid")?;
-    let raw_uid = if (first & 1) != 0 {
-        let second = reader.read_u8("Events.Uid")?;
-        u16::from(first) | (u16::from(second) << 8)
-    } else {
-        u16::from(first)
-    };
-    let uid = raw_uid >> 1;
-
-    let (event_size, has_aux, serial) = if uid < USER_UID {
-        let size = match uid {
-            1 => {
-                if reader.remaining() < 3 {
-                    return Err(TraceError::new(
-                        TraceErrorKind::MalformedData,
-                        reader.tell(),
-                        "Aux.Header",
-                        "truncated aux header",
-                    ));
-                }
-                let rest = reader.read_bytes(3, "Aux.Header")?;
-                let pack = u32::from(first)
-                    | (u32::from(rest[0]) << 8)
-                    | (u32::from(rest[1]) << 16)
-                    | (u32::from(rest[2]) << 24);
-                usize::try_from(pack >> 13).unwrap()
-            }
-            6 | 7 => 8,
-            8 | 9 => 7,
-            _ => 0,
-        };
-        (size, false, None)
-    } else {
-        let Some(event) = registry.lookup(uid) else {
-            return Err(TraceError::new(
-                TraceErrorKind::MalformedData,
-                u64::try_from(offset).unwrap(),
-                "Events.Uid",
-                format!("unknown event uid {uid} in normal stream"),
-            ));
-        };
-        let serial = if event.flags.no_sync {
-            None
-        } else {
-            let b0 = u32::from(reader.read_u8("Events.Serial[0]")?);
-            let b1 = u32::from(reader.read_u8("Events.Serial[1]")?);
-            let b2 = u32::from(reader.read_u8("Events.Serial[2]")?);
-            Some(b0 | (b1 << 8) | (b2 << 16))
-        };
-        (event_data_size(event), event.flags.maybe_has_aux, serial)
-    };
-
-    let data_start = usize::try_from(reader.tell()).unwrap();
-    reader.skip(u64::try_from(event_size).unwrap(), "Events.Data")?;
-    let data_end = usize::try_from(reader.tell()).unwrap();
-    Ok(ParsedNormalEvent {
-        uid,
-        offset,
-        total_end: data_end,
-        data_start,
-        data_end,
-        has_aux,
-        serial,
-    })
 }
 
 fn decode_cpu_event_spec(
@@ -9109,7 +9033,7 @@ struct CpuBatchThreadState {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct CpuMetadataIntervalState {
-    rendered_scope_totals: BTreeMap<(u32, String), (u64, u64)>,
+    rendered_scope_totals: CpuRenderedScopeTotals,
     samples: Vec<CpuMetadataIntervalSample>,
     sample_orders: Vec<(u64, u64)>,
     next_sample_order: Option<(u64, u64)>,
@@ -9693,8 +9617,10 @@ fn cpu_metadata_dashboard(
         .iter()
         .filter_map(|summary| summary.sample.clone())
         .collect();
-    let rendered_scopes =
-        cpu_metadata_rendered_scope_summaries(specs, interval_state.rendered_scope_totals);
+    let rendered_scopes = cpu_metadata_rendered_scope_summaries(
+        specs,
+        interval_state.rendered_scope_totals.into_ordered(),
+    );
     let CpuMetadataProjection {
         strings,
         spec_summaries,
@@ -10628,14 +10554,10 @@ fn record_cpu_metadata_interval<M: CpuMetadataLookup + ?Sized>(
     let Some(record) = metadata.get_at(interval.metadata_id, metadata_generation) else {
         return;
     };
-    let rendered_name = record.rendered_name.clone();
-    if let Some(rendered_name) = &rendered_name {
-        let entry = state
+    if let Some(rendered_name) = record.rendered_name.as_deref() {
+        state
             .rendered_scope_totals
-            .entry((interval.spec_id, rendered_name.clone()))
-            .or_insert((0, 0));
-        entry.0 += 1;
-        entry.1 = entry.1.saturating_add(interval.duration);
+            .record(interval.spec_id, rendered_name, interval.duration);
     }
     if state.samples.len() < 40 {
         state.samples.push(CpuMetadataIntervalSample {
@@ -10643,7 +10565,7 @@ fn record_cpu_metadata_interval<M: CpuMetadataLookup + ?Sized>(
             metadata_id: interval.metadata_id,
             attribution: interval.attribution,
             name: record.name.clone(),
-            rendered_name,
+            rendered_name: record.rendered_name.clone(),
             start_cycle: interval.start_cycle,
             end_cycle: interval.end_cycle,
             duration_cycles: interval.duration,
@@ -13491,7 +13413,10 @@ mod tests {
         assert_eq!(frame_cycle_bounds[&366401], (10, 30));
         assert_eq!(metadata_scope_totals[&7], (1, 20));
         assert_eq!(
-            metadata_interval_state.rendered_scope_totals[&(7, "Frame 366401".to_owned())],
+            metadata_interval_state
+                .rendered_scope_totals
+                .clone()
+                .into_ordered()[&(7, "Frame 366401".to_owned())],
             (1, 20)
         );
         assert_eq!(metadata_interval_state.samples.len(), 1);

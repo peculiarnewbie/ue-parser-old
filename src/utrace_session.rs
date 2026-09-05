@@ -3,6 +3,7 @@
 //! Provider/event projection still occurs at `finish`; packet framing and LZ4
 //! decoding are incremental and never retain the complete capture byte stream.
 
+use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::Reader;
@@ -13,15 +14,21 @@ use crate::utrace::{
     TimelineIndexRequest, TraceDashboard, TraceError, TraceErrorKind, TraceHeader, TraceInventory,
     TracePrologue, TraceThreadInfo, dashboard_from_decoded,
     dashboard_from_decoded_with_memory_timeline_index, dashboard_from_decoded_with_timeline_index,
-    decode_frame_marker, decode_known_scope_cycle, decode_new_event, decode_new_trace,
-    decode_thread_info, decompress_lz4_into_stream, inventory_from_observations,
-    parse_protocol5_normal_event, read_u32_field, read_u64_field,
+    decode_frame_marker, decode_new_event, decode_new_trace, decode_thread_info,
+    decompress_lz4_into_stream, inventory_from_observations,
 };
 use crate::utrace_dispatch::SerialDispatchPreparation;
+use crate::utrace_framing::{
+    NormalEventLayout, decode_known_scope_cycle, parse_protocol5_normal_event,
+};
+use crate::utrace_monotonic_timeline::CpuTimelineBuild;
 use crate::utrace_progress::{
     DashboardBootstrap, DashboardPatch, DecodePhase, DecodeProgress, FrameTimingDashboard,
     ProgressiveFrameTiming,
 };
+
+mod live_event;
+use live_event::{LiveEvent, LiveEventKind};
 
 pub(crate) const MAX_PUSH_CHUNK_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_INPUT_BYTES: usize = 1024 * 1024 * 1024;
@@ -78,6 +85,13 @@ struct ProgressiveFrameSlot {
     published_index: Option<usize>,
 }
 
+enum CpuTimelineDecode {
+    Disabled,
+    Eager(Box<ProgressiveCpuTimelineDecoder>),
+    #[cfg(feature = "utrace-parallel")]
+    Parallel,
+}
+
 pub struct ProgressiveDashboardSession {
     options: DashboardOptions,
     header: Option<TraceHeader>,
@@ -91,39 +105,56 @@ pub struct ProgressiveDashboardSession {
     important_cursors: BTreeMap<u16, usize>,
     normal_cursors: BTreeMap<u16, usize>,
     bootstrap_registry: BTreeMap<u16, EventTypeInfo>,
+    normal_layouts: Vec<Option<NormalEventLayout>>,
+    live_event_kinds: Vec<Option<LiveEventKind>>,
     bootstrap_prologue: Option<TracePrologue>,
     bootstrap_threads: Vec<TraceThreadInfo>,
     bootstrap_threads_truncated: bool,
-    inventory_observed: BTreeMap<u16, u64>,
-    inventory_known_observed: BTreeMap<u16, u64>,
-    inventory_samples: BTreeMap<u16, ProgressiveInventorySample>,
+    inventory_observed: FxHashMap<u16, u64>,
+    inventory_known_observed: FxHashMap<u16, u64>,
+    inventory_samples: FxHashMap<u16, ProgressiveInventorySample>,
     /// Insights `FFrameProvider` parity: each `BeginFrame` pushes a slot; each
     /// `EndFrame` updates the latest slot for that `FrameType` (and may extend an
     /// already-closed frame). See TraceServices `Frames.cpp`.
     frames_by_type: BTreeMap<u8, Vec<ProgressiveFrameSlot>>,
     progressive_frames: Vec<ProgressiveFrameTiming>,
+    // Conservative bounds also cover frames whose repeated EndFrame moved back.
+    // Work outside this range cannot match any published frame.
+    progressive_frame_bounds: Option<(u64, u64)>,
     progressive_frame_count: u64,
     progressive_frame_revision: u64,
     progressive_gpu_open_work: BTreeMap<u32, VecDeque<ProgressiveGpuOpenWork>>,
     pending_progressive_gpu_work: VecDeque<ProgressiveGpuCompletedWork>,
     source_fingerprint: SourceFingerprint,
     serial_dispatch_preparation: SerialDispatchPreparation,
-    progressive_cpu_timeline: Option<ProgressiveCpuTimelineDecoder>,
+    progressive_cpu_timeline: CpuTimelineDecode,
     normal_scope_cycles: BTreeMap<u16, Vec<u64>>,
 }
 
 impl ProgressiveDashboardSession {
     #[must_use]
     pub fn new(options: DashboardOptions) -> Self {
-        Self::with_eager_cpu_timeline(options, false)
+        Self::with_cpu_timeline(options, CpuTimelineDecode::Disabled)
     }
 
     #[must_use]
     pub fn new_with_eager_cpu_timeline(options: DashboardOptions) -> Self {
-        Self::with_eager_cpu_timeline(options, true)
+        Self::with_cpu_timeline(
+            options,
+            CpuTimelineDecode::Eager(Box::new(ProgressiveCpuTimelineDecoder::new())),
+        )
     }
 
-    fn with_eager_cpu_timeline(options: DashboardOptions, eager_cpu_timeline: bool) -> Self {
+    /// Keep live frame markers incremental, then build exact CPU pages on
+    /// independent physical threads alongside provider analysis at finish.
+    /// Timeline columns and the metadata catalog are joined before returning.
+    #[cfg(feature = "utrace-parallel")]
+    #[must_use]
+    pub fn new_with_parallel_cpu_timeline(options: DashboardOptions) -> Self {
+        Self::with_cpu_timeline(options, CpuTimelineDecode::Parallel)
+    }
+
+    fn with_cpu_timeline(options: DashboardOptions, cpu_timeline: CpuTimelineDecode) -> Self {
         Self {
             options,
             header: None,
@@ -137,21 +168,24 @@ impl ProgressiveDashboardSession {
             important_cursors: BTreeMap::new(),
             normal_cursors: BTreeMap::new(),
             bootstrap_registry: BTreeMap::new(),
+            normal_layouts: Vec::new(),
+            live_event_kinds: Vec::new(),
             bootstrap_prologue: None,
             bootstrap_threads: Vec::new(),
             bootstrap_threads_truncated: false,
-            inventory_observed: BTreeMap::new(),
-            inventory_known_observed: BTreeMap::new(),
-            inventory_samples: BTreeMap::new(),
+            inventory_observed: FxHashMap::default(),
+            inventory_known_observed: FxHashMap::default(),
+            inventory_samples: FxHashMap::default(),
             frames_by_type: BTreeMap::new(),
             progressive_frames: Vec::new(),
+            progressive_frame_bounds: None,
             progressive_frame_count: 0,
             progressive_frame_revision: 0,
             progressive_gpu_open_work: BTreeMap::new(),
             pending_progressive_gpu_work: VecDeque::new(),
             source_fingerprint: SourceFingerprint::new(),
             serial_dispatch_preparation: SerialDispatchPreparation::new(),
-            progressive_cpu_timeline: eager_cpu_timeline.then(ProgressiveCpuTimelineDecoder::new),
+            progressive_cpu_timeline: cpu_timeline,
             normal_scope_cycles: BTreeMap::new(),
         }
     }
@@ -291,7 +325,7 @@ impl ProgressiveDashboardSession {
                         TraceErrorKind::MalformedData,
                         0,
                         "TimelineIndex",
-                        "eager CPU timeline was not enabled for this session",
+                        "CPU timeline was not enabled for this session",
                     )
                 })?,
                 phase_complete,
@@ -381,7 +415,7 @@ impl ProgressiveDashboardSession {
             TraceHeader,
             DecodedStreams,
             InventoryObservations,
-            Option<crate::utrace_monotonic_timeline::CpuMonotonicTimelineBuilder>,
+            Option<CpuTimelineBuild>,
         ),
         TraceError,
     > {
@@ -411,10 +445,18 @@ impl ProgressiveDashboardSession {
         }
         self.summary.threads = self.threads.into_values().collect();
         self.summary.thread_count = self.summary.threads.len();
+        let progressive_cpu_timeline = match self.progressive_cpu_timeline {
+            CpuTimelineDecode::Disabled => None,
+            CpuTimelineDecode::Eager(decoder) => {
+                Some(CpuTimelineBuild::Ready(Box::new(decoder.finish())))
+            }
+            #[cfg(feature = "utrace-parallel")]
+            CpuTimelineDecode::Parallel => Some(CpuTimelineBuild::Parallel),
+        };
         let inventory_observations = InventoryObservations {
             events: self.bootstrap_registry.into_values().collect(),
-            observed: self.inventory_observed,
-            known_observed: self.inventory_known_observed,
+            observed: self.inventory_observed.into_iter().collect(),
+            known_observed: self.inventory_known_observed.into_iter().collect(),
             samples_by_uid: self
                 .inventory_samples
                 .into_iter()
@@ -430,9 +472,6 @@ impl ProgressiveDashboardSession {
                 .collect(),
         };
         let serial_dispatch_hint = Some(self.serial_dispatch_preparation.finish()?);
-        let progressive_cpu_timeline = self
-            .progressive_cpu_timeline
-            .map(ProgressiveCpuTimelineDecoder::finish);
         Ok((
             header,
             DecodedStreams {
@@ -646,6 +685,14 @@ impl ProgressiveDashboardSession {
                     .protocol;
                 let declaration =
                     decode_new_event(data, protocol, u64::try_from(event_offset + 4).unwrap())?;
+                // UID is a u16, so this table cannot exceed 65,536 entries.
+                let uid = usize::from(declaration.uid);
+                if self.normal_layouts.len() <= uid {
+                    self.normal_layouts.resize(uid + 1, None);
+                    self.live_event_kinds.resize(uid + 1, None);
+                }
+                self.normal_layouts[uid] = Some(NormalEventLayout::from(&declaration));
+                self.live_event_kinds[uid] = Some(LiveEventKind::from(&declaration));
                 self.bootstrap_registry.insert(declaration.uid, declaration);
             } else if let Some(event) = self.bootstrap_registry.get(&uid) {
                 match (event.logger.as_str(), event.event.as_str()) {
@@ -716,8 +763,19 @@ impl ProgressiveDashboardSession {
     }
 
     fn decode_normal_frame_events(&mut self, thread_id: u16) -> Result<(), TraceError> {
+        let mut cursor = *self.normal_cursors.get(&thread_id).unwrap_or(&0);
+        let result = self.decode_normal_frame_events_from(thread_id, &mut cursor);
+        self.normal_cursors.insert(thread_id, cursor);
+        result
+    }
+
+    fn decode_normal_frame_events_from(
+        &mut self,
+        thread_id: u16,
+        next_cursor: &mut usize,
+    ) -> Result<(), TraceError> {
         loop {
-            let cursor = *self.normal_cursors.get(&thread_id).unwrap_or(&0);
+            let cursor = *next_cursor;
             let parsed = {
                 let Some(stream) = self.streams.get(&thread_id) else {
                     return Ok(());
@@ -725,37 +783,33 @@ impl ProgressiveDashboardSession {
                 if cursor >= stream.len() {
                     return Ok(());
                 }
-                // Registry is append-only and never modified by this decode path;
-                // pass it directly instead of rebuilding a BTreeMap per event.
+                // Layouts are resolved when declarations arrive; framing never
+                // scans field definitions in this per-event loop.
                 let mut reader = Reader::new(&stream[cursor..]);
-                let event =
-                    match parse_protocol5_normal_event(&mut reader, &self.bootstrap_registry) {
-                        Ok(event) => event,
-                        Err(_) => return Ok(()),
-                    };
+                let event = match parse_protocol5_normal_event(&mut reader, &self.normal_layouts) {
+                    Ok(event) => event,
+                    Err(_) => return Ok(()),
+                };
                 let mut total_end = event.total_end;
-                let event_info = self.bootstrap_registry.get(&event.uid);
-                let needs_provider_data = event_info.is_some_and(|event| {
-                    (event.logger == "Misc"
-                        && matches!(event.event.as_str(), "BeginFrame" | "EndFrame"))
-                        || event.logger == "GpuProfiler"
-                });
-                let needs_cpu_timeline = self.progressive_cpu_timeline.is_some()
-                    && event_info.is_some_and(|event| {
-                        event.logger == "CpuProfiler" && event.event == "EventBatchV3"
-                    });
+                let kind = self
+                    .live_event_kinds
+                    .get(usize::from(event.uid))
+                    .copied()
+                    .flatten();
+                let needs_cpu_timeline =
+                    matches!(self.progressive_cpu_timeline, CpuTimelineDecode::Eager(_))
+                        && matches!(kind, Some(LiveEventKind::CpuBatch));
                 let sample_offset = cursor + event.offset;
-                let needs_inventory_sample = event_info.is_some()
+                let needs_inventory_sample = kind.is_some()
                     && self.inventory_samples.get(&event.uid).is_none_or(|sample| {
                         (thread_id, sample_offset) < (sample.thread_id, sample.stream_offset)
                     });
-                let needs_data = needs_provider_data || needs_inventory_sample;
-                let mut data = needs_data
+                let mut data = needs_inventory_sample
                     .then(|| stream[cursor + event.data_start..cursor + event.data_end].to_vec());
                 if event.has_aux {
                     loop {
                         let Ok(aux) =
-                            parse_protocol5_normal_event(&mut reader, &self.bootstrap_registry)
+                            parse_protocol5_normal_event(&mut reader, &self.normal_layouts)
                         else {
                             return Ok(());
                         };
@@ -780,20 +834,35 @@ impl ProgressiveDashboardSession {
                         }
                     }
                 }
-                let scope_cycle = self
-                    .normal_scope_cycles
-                    .get(&thread_id)
-                    .and_then(|cycles| cycles.last().copied());
+                let eager_timeline =
+                    matches!(self.progressive_cpu_timeline, CpuTimelineDecode::Eager(_));
+                let scope_cycle = eager_timeline
+                    .then(|| {
+                        self.normal_scope_cycles
+                            .get(&thread_id)
+                            .and_then(|cycles| cycles.last().copied())
+                    })
+                    .flatten();
                 let main_data = &stream[cursor + event.data_start..cursor + event.data_end];
-                let scope_action = match event.uid {
-                    6 | 8 => decode_known_scope_cycle(event.uid, main_data)
+                let scope_action = match (eager_timeline, event.uid) {
+                    (true, 6 | 8) => decode_known_scope_cycle(event.uid, main_data)
                         .map(ProgressiveScopeAction::Push),
-                    7 | 9 => Some(ProgressiveScopeAction::Pop),
+                    (true, 7 | 9) => Some(ProgressiveScopeAction::Pop),
                     _ => None,
                 };
+                let provider_event = match kind.filter(|kind| kind.needs_provider()) {
+                    Some(kind) => kind.decode(
+                        self.bootstrap_registry
+                            .get(&event.uid)
+                            .expect("live event is declared"),
+                        &stream[cursor + event.data_start..cursor + total_end],
+                        u64::try_from(cursor).unwrap(),
+                        thread_id,
+                    )?,
+                    None => None,
+                };
                 (
-                    needs_provider_data.then(|| event_info.expect("checked above").clone()),
-                    needs_cpu_timeline.then(|| event_info.expect("checked above").clone()),
+                    provider_event,
                     needs_cpu_timeline.then_some((
                         cursor + event.data_start,
                         cursor + total_end,
@@ -802,7 +871,7 @@ impl ProgressiveDashboardSession {
                     data,
                     total_end,
                     event.uid,
-                    event_info.is_some(),
+                    kind.is_some(),
                     needs_inventory_sample,
                     sample_offset,
                     event.serial,
@@ -811,7 +880,6 @@ impl ProgressiveDashboardSession {
             };
             let (
                 event,
-                cpu_event,
                 cpu_data,
                 data,
                 consumed,
@@ -822,7 +890,7 @@ impl ProgressiveDashboardSession {
                 serial,
                 scope_action,
             ) = parsed;
-            self.normal_cursors.insert(thread_id, cursor + consumed);
+            *next_cursor = cursor + consumed;
             self.serial_dispatch_preparation.note(serial);
             match scope_action {
                 Some(ProgressiveScopeAction::Push(cycle)) => self
@@ -845,15 +913,18 @@ impl ProgressiveDashboardSession {
                         ProgressiveInventorySample {
                             thread_id,
                             stream_offset: sample_offset,
-                            data: data.as_ref().expect("sample data was requested").clone(),
+                            data: data.expect("sample data was requested"),
                         },
                     );
                 }
             } else {
                 *self.inventory_known_observed.entry(uid).or_default() += 1;
             }
-            if let (Some(event), Some((data_start, data_end, scope_cycle))) = (cpu_event, cpu_data)
-            {
+            if let Some((data_start, data_end, scope_cycle)) = cpu_data {
+                let event = self
+                    .bootstrap_registry
+                    .get(&uid)
+                    .expect("CPU event is declared");
                 let prologue_start_cycle = self
                     .bootstrap_prologue
                     .as_ref()
@@ -864,40 +935,19 @@ impl ProgressiveDashboardSession {
                     .map(|prologue| prologue.cycle_frequency);
                 let data = &self.streams.get(&thread_id).expect("normal stream exists")
                     [data_start..data_end];
-                self.progressive_cpu_timeline
-                    .as_mut()
-                    .expect("CPU timeline was enabled")
-                    .record_event_batch(
-                        &event,
-                        data,
-                        thread_id,
-                        scope_cycle.or(prologue_start_cycle),
-                        cycle_frequency,
-                    )?;
-            }
-            let (Some(event), Some(data)) = (event, data) else {
-                continue;
-            };
-            if event.logger == "Misc" && matches!(event.event.as_str(), "BeginFrame" | "EndFrame") {
-                let kind = if event.event == "BeginFrame" {
-                    FrameMarkerKind::Begin
-                } else {
-                    FrameMarkerKind::End
+                let CpuTimelineDecode::Eager(decoder) = &mut self.progressive_cpu_timeline else {
+                    unreachable!("eager timeline was requested");
                 };
-                let marker = decode_frame_marker(
-                    &event,
-                    &data,
-                    u64::try_from(cursor).unwrap(),
+                decoder.record_event_batch(
+                    event,
+                    data,
                     thread_id,
-                    kind,
+                    scope_cycle.or(prologue_start_cycle),
+                    cycle_frequency,
                 )?;
-                self.record_frame_marker(marker);
-            } else if event.logger == "GpuProfiler" {
-                self.record_progressive_gpu_work_event(
-                    &event,
-                    &data,
-                    u64::try_from(cursor).unwrap(),
-                )?;
+            }
+            if let Some(event) = event {
+                self.record_live_event(event);
             }
         }
     }
@@ -942,6 +992,12 @@ impl ProgressiveDashboardSession {
                     .filter(|frequency| *frequency > 0)
                     .map(|frequency| duration_cycles as f64 / frequency as f64);
 
+                let bounds = self
+                    .progressive_frame_bounds
+                    .get_or_insert((begin_cycle, marker.cycle));
+                bounds.0 = bounds.0.min(begin_cycle);
+                bounds.1 = bounds.1.max(marker.cycle);
+
                 if let Some(published_index) = published_index {
                     let frame = &mut self.progressive_frames[published_index];
                     frame.end_cycle = marker.cycle;
@@ -978,23 +1034,19 @@ impl ProgressiveDashboardSession {
         }
     }
 
-    fn record_progressive_gpu_work_event(
-        &mut self,
-        event: &EventTypeInfo,
-        data: &[u8],
-        base_offset: u64,
-    ) -> Result<(), TraceError> {
-        match event.event.as_str() {
-            "EventBeginWork" => {
-                let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
-                let gpu_timestamp_top =
-                    read_u64_field(event, data, "GPUTimestampTOP", base_offset)?;
-                let cpu_timestamp = read_u64_field(event, data, "CPUTimestamp", base_offset)?;
+    fn record_live_event(&mut self, event: LiveEvent) {
+        match event {
+            LiveEvent::Frame(marker) => self.record_frame_marker(marker),
+            LiveEvent::GpuBeginWork {
+                queue_id,
+                gpu_timestamp_top,
+                cpu_timestamp,
+            } => {
                 let works = if let Some(works) = self.progressive_gpu_open_work.get_mut(&queue_id) {
                     works
                 } else {
                     if self.progressive_gpu_open_work.len() >= MAX_PROGRESSIVE_GPU_QUEUES {
-                        return Ok(());
+                        return;
                     }
                     self.progressive_gpu_open_work.entry(queue_id).or_default()
                 };
@@ -1006,34 +1058,38 @@ impl ProgressiveDashboardSession {
                     cpu_timestamp,
                 });
             }
-            "EventEndWork" => {
-                let queue_id = read_u32_field(event, data, "QueueId", base_offset)?;
-                let gpu_timestamp_bop =
-                    read_u64_field(event, data, "GPUTimestampBOP", base_offset)?;
+            LiveEvent::GpuEndWork {
+                queue_id,
+                gpu_timestamp_bop,
+            } => {
                 let Some(open) = self
                     .progressive_gpu_open_work
                     .get_mut(&queue_id)
                     .and_then(VecDeque::pop_back)
                 else {
-                    return Ok(());
+                    return;
                 };
                 if gpu_timestamp_bop < open.gpu_timestamp_top {
-                    return Ok(());
+                    return;
                 }
                 self.record_progressive_gpu_work(ProgressiveGpuCompletedWork {
                     cpu_timestamp: open.cpu_timestamp,
                     duration_cycles: gpu_timestamp_bop - open.gpu_timestamp_top,
                 });
             }
-            _ => {}
         }
-        Ok(())
     }
 
     fn record_progressive_gpu_work(&mut self, work: ProgressiveGpuCompletedWork) {
-        if let Some(frame) = self.progressive_frames.iter_mut().rev().find(|frame| {
-            work.cpu_timestamp >= frame.begin_cycle && work.cpu_timestamp <= frame.end_cycle
-        }) {
+        let frame = self
+            .progressive_frame_bounds
+            .filter(|&(begin, end)| (begin..=end).contains(&work.cpu_timestamp))
+            .and_then(|_| {
+                self.progressive_frames.iter_mut().rev().find(|frame| {
+                    work.cpu_timestamp >= frame.begin_cycle && work.cpu_timestamp <= frame.end_cycle
+                })
+            });
+        if let Some(frame) = frame {
             frame.gpu_submitted_work_count = frame.gpu_submitted_work_count.saturating_add(1);
             frame.gpu_submitted_work_cycles = frame
                 .gpu_submitted_work_cycles
@@ -1048,17 +1104,17 @@ impl ProgressiveDashboardSession {
     }
 
     fn apply_pending_progressive_gpu_work(&mut self, frame: &mut ProgressiveFrameTiming) {
-        let mut pending = std::mem::take(&mut self.pending_progressive_gpu_work);
-        while let Some(work) = pending.pop_front() {
+        self.pending_progressive_gpu_work.retain(|work| {
             if work.cpu_timestamp >= frame.begin_cycle && work.cpu_timestamp <= frame.end_cycle {
                 frame.gpu_submitted_work_count = frame.gpu_submitted_work_count.saturating_add(1);
                 frame.gpu_submitted_work_cycles = frame
                     .gpu_submitted_work_cycles
                     .saturating_add(work.duration_cycles);
+                false
             } else {
-                self.pending_progressive_gpu_work.push_back(work);
+                true
             }
-        }
+        });
     }
 
     fn packet_snapshot(&self) -> PacketSummary {
@@ -1379,6 +1435,79 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "utrace-parallel")]
+    #[test]
+    fn parallel_timeline_matches_eager_across_threads_and_chunk_boundaries() {
+        let mut bytes = trace_with_cpu_batch();
+        let normal_start = 8 + usize::from(u16::from_le_bytes([bytes[8], bytes[9]]));
+        let mut normal_packet = bytes[normal_start..].to_vec();
+        for thread in [3_u16, 127, 4095] {
+            normal_packet[2..4].copy_from_slice(&thread.to_le_bytes());
+            bytes.extend_from_slice(&normal_packet);
+        }
+        let mut eager =
+            ProgressiveDashboardSession::new_with_eager_cpu_timeline(DashboardOptions::default());
+        eager.push_chunk(&bytes).unwrap();
+        let (expected_dashboard, expected_inventory, expected_index, _) = eager
+            .finish_with_inventory_and_monotonic_timeline_index()
+            .unwrap();
+        assert_eq!(expected_index.stats().thread_count, 4);
+        assert_eq!(expected_index.stats().completed_scope_count, 4);
+        for chunk_size in [1, 3, 11, bytes.len()] {
+            // Exercise nested Rayon scheduling with one worker as well as
+            // concurrent physical-thread decoders.
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(if chunk_size == 1 { 1 } else { 2 })
+                .build()
+                .unwrap();
+            let mut parallel = ProgressiveDashboardSession::new_with_parallel_cpu_timeline(
+                DashboardOptions::default(),
+            );
+            for chunk in bytes.chunks(chunk_size) {
+                parallel.push_chunk(chunk).unwrap();
+            }
+            let (dashboard, inventory, index, _) = pool
+                .install(|| parallel.finish_with_inventory_and_monotonic_timeline_index())
+                .unwrap();
+            assert_eq!(dashboard, expected_dashboard);
+            assert_eq!(inventory, expected_inventory);
+            assert_eq!(index.stats(), expected_index.stats());
+            assert_eq!(
+                index
+                    .query(&crate::utrace::CpuTimelineQuery::default())
+                    .unwrap(),
+                expected_index
+                    .query(&crate::utrace::CpuTimelineQuery::default())
+                    .unwrap()
+            );
+            assert_eq!(
+                index
+                    .aggregate_timers(&crate::utrace::CpuTimerStatsQuery::default())
+                    .unwrap(),
+                expected_index
+                    .aggregate_timers(&crate::utrace::CpuTimerStatsQuery::default())
+                    .unwrap()
+            );
+        }
+    }
+
+    #[cfg(feature = "utrace-parallel")]
+    #[test]
+    fn parallel_timeline_propagates_malformed_cpu_batches() {
+        let mut bytes = trace_with_cpu_batch();
+        let last_varint_byte = bytes.len() - 2;
+        bytes[last_varint_byte] |= 0x80;
+        let mut session = ProgressiveDashboardSession::new_with_parallel_cpu_timeline(
+            DashboardOptions::default(),
+        );
+        session.push_chunk(&bytes).unwrap();
+        assert!(
+            session
+                .finish_with_inventory_and_monotonic_timeline_index()
+                .is_err()
+        );
+    }
+
     #[test]
     fn rejects_chunks_over_the_named_session_limit() {
         let mut session = DashboardSession::new(DashboardOptions::default());
@@ -1472,6 +1601,66 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_live_gpu_events_resume_across_every_packet_split() {
+        let declarations = [
+            protocol7_declaration(
+                300,
+                6,
+                "GpuProfiler",
+                "EventBeginWork",
+                &[
+                    (16, 4, 2, "QueueId"),
+                    (0, 8, 3, "GPUTimestampTOP"),
+                    (8, 8, 3, "CPUTimestamp"),
+                    (20, 0, 0x80, "Extra"),
+                ],
+            ),
+            protocol7_declaration(
+                301,
+                4,
+                "GpuProfiler",
+                "EventEndWork",
+                &[(8, 4, 2, "QueueId"), (0, 8, 3, "GPUTimestampBOP")],
+            ),
+        ]
+        .concat();
+        let mut normal = vec![0x59, 2]; // Sparse, two-byte UID 300.
+        normal.extend_from_slice(&500_u64.to_le_bytes());
+        normal.extend_from_slice(&150_u64.to_le_bytes());
+        normal.extend_from_slice(&7_u32.to_le_bytes());
+        normal.extend_from_slice(&raw_aux(3, &[3, 6, 32]));
+        normal.push(6);
+        normal.extend_from_slice(&[0x5b, 2]); // UID 301.
+        normal.extend_from_slice(&560_u64.to_le_bytes());
+        normal.extend_from_slice(&7_u32.to_le_bytes());
+        for split in 0..=normal.len() {
+            let mut trace = trace_with_normal_frame();
+            for (thread, payload) in [
+                (0_u16, declarations.as_slice()),
+                (2, &normal[..split]),
+                (2, &normal[split..]),
+            ] {
+                trace.extend_from_slice(&u16::try_from(payload.len() + 4).unwrap().to_le_bytes());
+                trace.extend_from_slice(&thread.to_le_bytes());
+                trace.extend_from_slice(payload);
+            }
+            let mut session = ProgressiveDashboardSession::new(DashboardOptions::default());
+            for chunk in trace.chunks(3) {
+                session.push_chunk(chunk).unwrap();
+            }
+            let (_, patch) = session.frame_patch(None);
+            let DashboardPatch::Frames { frames, .. } = patch else {
+                panic!("expected frames");
+            };
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].gpu_submitted_work_count, 1, "split {split}");
+            assert_eq!(frames[0].gpu_submitted_work_cycles, 60, "split {split}");
+            assert_eq!(session.inventory_observed[&300], 1);
+            assert_eq!(session.inventory_observed[&301], 1);
+        }
+    }
+
+    #[test]
     fn frame_pairing_matches_insights_begin_stack_and_end_extends_latest() {
         let mut session = ProgressiveDashboardSession::new(DashboardOptions::default());
         let mark = |kind, cycle, frame_type| crate::utrace::FrameMarker {
@@ -1502,6 +1691,43 @@ mod tests {
         assert_eq!(session.progressive_frames.len(), 1);
         assert_eq!(session.progressive_frames[0].end_cycle, 400);
         assert_eq!(session.progressive_frames[0].duration_cycles, 250);
+    }
+
+    #[test]
+    fn progressive_gpu_lookup_preserves_overlaps_and_repeated_frame_ends() {
+        let mut session = ProgressiveDashboardSession::new(DashboardOptions::default());
+        let mark = |kind, cycle, frame_type| crate::utrace::FrameMarker {
+            kind,
+            cycle,
+            frame_type,
+            thread_id: 2,
+        };
+        for (begin, end, kind) in [(100, 200, 0), (90, 180, 1)] {
+            session.record_frame_marker(mark(FrameMarkerKind::Begin, begin, kind));
+            session.record_frame_marker(mark(FrameMarkerKind::End, end, kind));
+        }
+        let work = |cpu_timestamp| ProgressiveGpuCompletedWork {
+            cpu_timestamp,
+            duration_cycles: 1,
+        };
+        // Newer published frames win overlaps, even if their begin is earlier.
+        session.record_progressive_gpu_work(work(150));
+        assert_eq!(session.progressive_frames[1].gpu_submitted_work_count, 1);
+        session.record_frame_marker(mark(FrameMarkerKind::End, 120, 1));
+        session.record_progressive_gpu_work(work(150));
+        assert_eq!(session.progressive_frames[0].gpu_submitted_work_count, 1);
+        session.record_progressive_gpu_work(work(250));
+        session.record_progressive_gpu_work(work(50));
+        assert_eq!(session.pending_progressive_gpu_work.len(), 2);
+        session.record_frame_marker(mark(FrameMarkerKind::End, 300, 0));
+        session.record_progressive_gpu_work(work(300));
+        assert_eq!(session.progressive_frames[0].gpu_submitted_work_count, 2);
+        // A later publication consumes only matching pending work, in place.
+        session.record_frame_marker(mark(FrameMarkerKind::Begin, 240, 2));
+        session.record_frame_marker(mark(FrameMarkerKind::End, 260, 2));
+        assert_eq!(session.progressive_frames[2].gpu_submitted_work_count, 1);
+        assert_eq!(session.pending_progressive_gpu_work.len(), 1);
+        assert_eq!(session.pending_progressive_gpu_work[0].cpu_timestamp, 50);
     }
 
     #[test]

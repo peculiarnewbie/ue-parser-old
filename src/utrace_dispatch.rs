@@ -16,7 +16,10 @@ use std::collections::{BTreeMap, BinaryHeap};
 use serde::Serialize;
 
 use crate::Reader;
-use crate::utrace::{EventTypeInfo, TraceError, TraceErrorKind};
+use crate::utrace::{EventTypeInfo, TraceError, TraceErrorKind, event_data_size};
+use crate::utrace_framing::{
+    NormalEventLayout, decode_known_scope_cycle, normal_event_layouts, parse_protocol5_normal_event,
+};
 
 const SERIAL_BITS: u32 = 24;
 const SERIAL_MASK: u32 = (1 << SERIAL_BITS) - 1;
@@ -167,39 +170,6 @@ impl PartialOrd for HeapEntry {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ParsedNormalEvent {
-    uid: u16,
-    offset: usize,
-    total_end: usize,
-    data_start: usize,
-    data_end: usize,
-    has_aux: bool,
-    serial: Option<TraceSerial>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct NormalEventLayout {
-    data_size: usize,
-    maybe_has_aux: bool,
-    no_sync: bool,
-}
-
-fn normal_event_layouts(
-    registry: &BTreeMap<u16, &EventTypeInfo>,
-) -> Vec<Option<NormalEventLayout>> {
-    let max_uid = registry.keys().next_back().copied().unwrap_or(0);
-    let mut layouts = vec![None; usize::from(max_uid) + 1];
-    for (&uid, event) in registry {
-        layouts[usize::from(uid)] = Some(NormalEventLayout {
-            data_size: event_data_size(event),
-            maybe_has_aux: event.flags.maybe_has_aux,
-            no_sync: event.flags.no_sync,
-        });
-    }
-    layouts
-}
-
 impl<'a> ThreadCursor<'a> {
     fn new(stream: &'a [u8]) -> Self {
         Self {
@@ -281,7 +251,7 @@ impl<'a> ThreadCursor<'a> {
                     )
                 })?,
                 scope_cycle,
-                serial: parsed.serial,
+                serial: parsed.serial.map(TraceSerial),
             }));
         }
         Ok(None)
@@ -729,103 +699,6 @@ fn heap_entry_for_pending(
         thread_index,
         serial,
     })
-}
-
-fn decode_known_scope_cycle(uid: u16, data: &[u8]) -> Option<u64> {
-    match uid {
-        6 if data.len() == 8 => Some(u64::from_le_bytes(data.try_into().ok()?)),
-        8 if data.len() == 7 => {
-            let mut bytes = [0_u8; 8];
-            bytes[..7].copy_from_slice(data);
-            Some(u64::from_le_bytes(bytes))
-        }
-        _ => None,
-    }
-}
-
-fn read_serial_24(reader: &mut Reader<'_>) -> Result<TraceSerial, TraceError> {
-    let b0 = u32::from(reader.read_u8("Events.Serial[0]")?);
-    let b1 = u32::from(reader.read_u8("Events.Serial[1]")?);
-    let b2 = u32::from(reader.read_u8("Events.Serial[2]")?);
-    Ok(TraceSerial((b0 | (b1 << 8) | (b2 << 16)) & SERIAL_MASK))
-}
-
-fn parse_protocol5_normal_event(
-    reader: &mut Reader<'_>,
-    layouts: &[Option<NormalEventLayout>],
-) -> Result<ParsedNormalEvent, TraceError> {
-    const USER_UID: u16 = 16;
-    let offset = usize::try_from(reader.tell()).unwrap();
-    let first = reader.read_u8("Events.Uid")?;
-    let raw_uid = if (first & 1) != 0 {
-        let second = reader.read_u8("Events.Uid")?;
-        u16::from(first) | (u16::from(second) << 8)
-    } else {
-        u16::from(first)
-    };
-    let uid = raw_uid >> 1;
-
-    let (event_size, has_aux, serial) = if uid < USER_UID {
-        let size = match uid {
-            1 => {
-                if reader.remaining() < 3 {
-                    return Err(TraceError::new(
-                        TraceErrorKind::MalformedData,
-                        reader.tell(),
-                        "Aux.Header",
-                        "truncated aux header",
-                    ));
-                }
-                let rest = reader.read_bytes(3, "Aux.Header")?;
-                let pack = u32::from(first)
-                    | (u32::from(rest[0]) << 8)
-                    | (u32::from(rest[1]) << 16)
-                    | (u32::from(rest[2]) << 24);
-                usize::try_from(pack >> 13).unwrap()
-            }
-            6 | 7 => 8,
-            8 | 9 => 7,
-            _ => 0,
-        };
-        (size, false, None)
-    } else {
-        let Some(layout) = layouts.get(usize::from(uid)).copied().flatten() else {
-            return Err(TraceError::new(
-                TraceErrorKind::MalformedData,
-                u64::try_from(offset).unwrap(),
-                "Events.Uid",
-                format!("unknown event uid {uid} in normal stream"),
-            ));
-        };
-        let serial = if layout.no_sync {
-            None
-        } else {
-            Some(read_serial_24(reader)?)
-        };
-        (layout.data_size, layout.maybe_has_aux, serial)
-    };
-
-    let data_start = usize::try_from(reader.tell()).unwrap();
-    reader.skip(u64::try_from(event_size).unwrap(), "Events.Data")?;
-    let data_end = usize::try_from(reader.tell()).unwrap();
-    Ok(ParsedNormalEvent {
-        uid,
-        offset,
-        total_end: data_end,
-        data_start,
-        data_end,
-        has_aux,
-        serial,
-    })
-}
-
-fn event_data_size(event: &EventTypeInfo) -> usize {
-    event
-        .fields
-        .iter()
-        .map(|field| usize::from(field.offset) + usize::from(field.size))
-        .max()
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

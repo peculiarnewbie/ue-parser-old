@@ -14,6 +14,8 @@ pub mod utrace_dispatch;
 #[cfg(feature = "utrace")]
 pub(crate) mod utrace_format_args;
 #[cfg(feature = "utrace")]
+mod utrace_framing;
+#[cfg(feature = "utrace")]
 pub(crate) mod utrace_gpu_timeline;
 #[cfg(feature = "utrace")]
 pub(crate) mod utrace_memory;
@@ -27,6 +29,8 @@ pub(crate) mod utrace_platform_file;
 pub mod utrace_progress;
 #[cfg(feature = "utrace")]
 mod utrace_session;
+#[cfg(any(test, all(feature = "utrace-wasm", target_arch = "wasm32")))]
+mod utrace_snapshot_cadence;
 #[cfg(feature = "utrace")]
 pub(crate) mod utrace_stats_batch;
 #[cfg(feature = "utrace")]

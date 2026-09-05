@@ -2,6 +2,71 @@ use rayon::prelude::*;
 
 use super::*;
 
+pub(super) fn build_timeline(
+    streams: &BTreeMap<u16, Vec<u8>>,
+    events: &[EventTypeInfo],
+    prologue: Option<&TracePrologue>,
+) -> Result<CpuMonotonicTimelineBuilder, TraceError> {
+    let registry = events.iter().map(|event| (event.uid, event)).collect();
+    // Resolve CPU routing at the declaration boundary, including sparse UIDs.
+    let max_uid = events.iter().map(|event| event.uid).max().unwrap_or(0);
+    let mut cpu_batches = vec![None; usize::from(max_uid) + 1];
+    for event in events {
+        if event.logger == "CpuProfiler" && event.event == "EventBatchV3" {
+            cpu_batches[usize::from(event.uid)] = Some(event);
+        }
+    }
+    let work = streams
+        .iter()
+        .filter(|(id, _)| **id >= 2)
+        .collect::<Vec<_>>();
+    let results = work
+        .par_iter()
+        .map(|&(thread_id, stream)| {
+            let mut decoder = ProgressiveCpuTimelineDecoder::new();
+            crate::utrace_dispatch::visit_normal_thread_events(
+                *thread_id,
+                stream,
+                &registry,
+                |raw| {
+                    if let Some(event) = cpu_batches.get(usize::from(raw.uid)).copied().flatten() {
+                        decoder.record_event_batch(
+                            event,
+                            raw.data,
+                            *thread_id,
+                            raw.scope_cycle.or(prologue.map(|p| p.start_cycle)),
+                            prologue.map(|p| p.cycle_frequency),
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+            Ok(decoder.finish())
+        })
+        .collect::<Vec<Result<_, TraceError>>>();
+    let mut builder = CpuMonotonicTimelineBuilder::new();
+    for result in results {
+        builder.merge_threads(result?);
+    }
+    Ok(builder)
+}
+
+/// Run the catalog/provider consumer on the calling thread while independent
+/// CPU pages are built on the pool. The scope joins before either result escapes.
+pub(super) fn with_timeline<R>(
+    streams: &BTreeMap<u16, Vec<u8>>,
+    events: &[EventTypeInfo],
+    prologue: Option<&TracePrologue>,
+    read_providers: impl FnOnce() -> R,
+) -> Result<(R, CpuMonotonicTimelineBuilder), TraceError> {
+    let mut timeline = None;
+    let providers = rayon::in_place_scope(|scope| {
+        scope.spawn(|_| timeline = Some(build_timeline(streams, events, prologue)));
+        read_providers()
+    });
+    Ok((providers, timeline.expect("timeline task joined")?))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct BatchContext {
     pub generation: u32,
@@ -98,10 +163,10 @@ pub(super) fn aggregate(inputs: ParallelCpuInputs<'_>) -> Result<ParallelCpuAggr
             &mut aggregate.metadata_scope_totals,
             result.metadata_scope_totals,
         );
-        merge_rendered_totals(
-            &mut aggregate.metadata_interval_state.rendered_scope_totals,
-            result.metadata_interval_state.rendered_scope_totals,
-        );
+        aggregate
+            .metadata_interval_state
+            .rendered_scope_totals
+            .merge(result.metadata_interval_state.rendered_scope_totals);
         ordered_samples.extend(
             result
                 .metadata_interval_state
@@ -377,17 +442,6 @@ fn merge_batches(target: &mut CpuBatchSummary, source: &CpuBatchSummary) {
 fn merge_totals(target: &mut FxHashMap<u32, (u64, u64)>, source: FxHashMap<u32, (u64, u64)>) {
     for (id, (count, cycles)) in source {
         let total = target.entry(id).or_insert((0, 0));
-        total.0 = total.0.saturating_add(count);
-        total.1 = total.1.saturating_add(cycles);
-    }
-}
-
-fn merge_rendered_totals(
-    target: &mut BTreeMap<(u32, String), (u64, u64)>,
-    source: BTreeMap<(u32, String), (u64, u64)>,
-) {
-    for (key, (count, cycles)) in source {
-        let total = target.entry(key).or_insert((0, 0));
         total.0 = total.0.saturating_add(count);
         total.1 = total.1.saturating_add(cycles);
     }

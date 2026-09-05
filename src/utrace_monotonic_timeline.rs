@@ -646,6 +646,12 @@ impl ThreadTimeline {
     }
 }
 
+pub(crate) enum CpuTimelineBuild {
+    Ready(Box<CpuMonotonicTimelineBuilder>),
+    #[cfg(feature = "utrace-parallel")]
+    Parallel,
+}
+
 pub(crate) struct CpuMonotonicTimelineBuilder {
     begin_count: u64,
     begin_cycle: Option<u64>,
@@ -657,6 +663,25 @@ pub(crate) struct CpuMonotonicTimelineBuilder {
 }
 
 impl CpuMonotonicTimelineBuilder {
+    /// Merge disjoint physical-thread pages without copying their columns.
+    #[cfg(feature = "utrace-parallel")]
+    pub(crate) fn merge_threads(&mut self, other: Self) {
+        debug_assert!(other.specs.is_empty() && other.metadata.is_empty());
+        self.begin_count = self.begin_count.saturating_add(other.begin_count);
+        if let Some(cycle) = other.begin_cycle {
+            self.begin_cycle = Some(self.begin_cycle.map_or(cycle, |begin| begin.min(cycle)));
+        }
+        if let Some(cycle) = other.end_cycle {
+            self.end_cycle = Some(self.end_cycle.map_or(cycle, |end| end.max(cycle)));
+        }
+        for (thread_id, timeline) in other.threads {
+            assert!(
+                self.threads.insert(thread_id, timeline).is_none(),
+                "CPU timeline shards must own distinct threads"
+            );
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             begin_count: 0,

@@ -5,6 +5,13 @@ Unreal Insights. It deliberately separates parser, application-state, and
 render milestones so a fast decoder cannot hide a slow interface, and a fast
 paint cannot hide incomplete analysis.
 
+The latest [September 6 follow-up](utrace-performance-experiments-2026-09-06.md)
+reduces file-to-dashboard medians by another 12–14% in alternating browser runs:
+1.76 to 1.51 seconds on the 65 MB capture and 2.39 to 2.09 seconds on the 94 MB
+capture. Together with the [preceding round](utrace-performance-experiments-2026-09-05.md),
+opening is about 47–48% faster than the original controls. The earlier
+measurements below remain historical context.
+
 ## What the harness measures
 
 The browser run uses a real `.utrace` file in headless Chromium with the same

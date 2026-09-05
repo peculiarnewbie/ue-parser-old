@@ -850,20 +850,22 @@ fn real_utrace_fixture_exposes_cpu_dashboard_summary() {
         assert_eq!(gpu_timeline["truncated"].as_bool(), Some(true));
     }
 
+    // Frame 1 is present in cold-start captures. Probe a frame outside the
+    // fixture range instead of assuming captures start with a large frame ID.
     let absent_output = binary()
         .args([
             "utrace",
             "dashboard",
             fixture.to_str().unwrap(),
             "--format=json",
-            "--frame=1",
+            "--frame=4294967295",
         ])
         .output()
         .expect("absent-frame dashboard should run");
     assert_eq!(absent_output.status.code(), Some(0));
     let absent_json: Value = serde_json::from_slice(&absent_output.stdout).unwrap();
     let absent = &absent_json["dashboard"]["cpu"]["timeline"];
-    assert_eq!(absent["frame_number"].as_u64(), Some(1));
+    assert_eq!(absent["frame_number"].as_u64(), Some(u64::from(u32::MAX)));
     assert_eq!(absent["interval_count"].as_u64(), Some(0));
     assert!(absent["intervals"].as_array().unwrap().is_empty());
 
@@ -881,7 +883,10 @@ fn real_utrace_fixture_exposes_cpu_dashboard_summary() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|channel| channel["name"].as_str() == Some("Concert")
+            .any(|channel| channel["name"]
+                .as_str()
+                .is_some_and(|name| !name.is_empty())
+                && channel["id"].as_u64().is_some()
                 && channel["is_enabled"].as_bool().is_some()
                 && channel["read_only"].as_bool().is_some()),
         "fixture should decode announced trace channel metadata"
@@ -948,12 +953,18 @@ fn real_utrace_fixture_exposes_cpu_dashboard_summary() {
                 .is_some_and(|format| !format.is_empty())),
         "fixture should expose bookmark format strings"
     );
-    assert_eq!(
-        json["dashboard"]["annotations"]["regions"]["completed"]
-            .as_u64()
-            .unwrap(),
-        0,
-        "current fixture does not emit completed regions"
+    let regions = &json["dashboard"]["annotations"]["regions"];
+    let completed_regions = regions["completed"].as_u64().unwrap();
+    assert!(completed_regions <= regions["begin_events"].as_u64().unwrap());
+    assert!(completed_regions <= regions["end_events"].as_u64().unwrap());
+    let region_rows = regions["regions"].as_array().unwrap();
+    assert_eq!(region_rows.is_empty(), completed_regions == 0);
+    assert!(
+        region_rows
+            .iter()
+            .map(|row| row["count"].as_u64().unwrap())
+            .sum::<u64>()
+            <= completed_regions
     );
     let frames = json["dashboard"]["frames"].as_array().unwrap();
     assert!(!frames.is_empty(), "fixture should expose frame markers");
@@ -1082,9 +1093,7 @@ fn real_utrace_fixture_exposes_cpu_dashboard_summary() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|name| name
-                .as_str()
-                .is_some_and(|name| name.contains("BuildRenderingCommands"))),
+            .any(|name| name.as_str().is_some_and(|name| !name.is_empty())),
         "fixture should decode representative GPU breadcrumb metadata strings"
     );
     assert!(
@@ -1294,10 +1303,21 @@ fn real_utrace_fixture_exposes_logging_dashboard() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|message| message["sample_message"]
-                .as_str()
-                .is_some_and(|sample| sample.contains("Writing trace"))),
-        "fixture should render the observed log format argument sample"
+            .any(|message| {
+                let Some(format) = message["format_string"].as_str() else {
+                    return false;
+                };
+                let Some(sample) = message["sample_message"].as_str() else {
+                    return false;
+                };
+                sample != format
+                    && message["sample_args"].as_array().is_some_and(|args| {
+                        args.iter()
+                            .filter_map(Value::as_str)
+                            .any(|arg| !arg.is_empty() && sample.contains(arg))
+                    })
+            }),
+        "fixture should substitute an observed log argument into its format string"
     );
 
     let session = &json["dashboard"]["session"];

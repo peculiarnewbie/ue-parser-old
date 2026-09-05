@@ -394,6 +394,7 @@ pub struct ProgressiveUtraceSession {
     chunk_count: u64,
     bootstrap_emitted: bool,
     last_frame_revision: u64,
+    snapshot_cadence: crate::utrace_snapshot_cadence::SnapshotCadence,
     timeline_index: Option<crate::utrace::CpuMonotonicTimelineIndex>,
     gpu_timeline_index: Option<crate::utrace::GpuTimelineMemoryIndex>,
     finish_profile: Option<WasmFinishProfile>,
@@ -416,16 +417,21 @@ impl ProgressiveUtraceSession {
             )));
         }
         let options = dashboard_options(options_json)?;
+        #[cfg(feature = "utrace-parallel")]
+        let session =
+            crate::utrace::ProgressiveDashboardSession::new_with_parallel_cpu_timeline(options);
+        #[cfg(not(feature = "utrace-parallel"))]
+        let session =
+            crate::utrace::ProgressiveDashboardSession::new_with_eager_cpu_timeline(options);
         Ok(Self {
-            inner: Some(
-                crate::utrace::ProgressiveDashboardSession::new_with_eager_cpu_timeline(options),
-            ),
+            inner: Some(session),
             filename,
             total_bytes: total_bytes as u64,
             sequence: 0,
             chunk_count: 0,
             bootstrap_emitted: false,
             last_frame_revision: 0,
+            snapshot_cadence: crate::utrace_snapshot_cadence::SnapshotCadence::default(),
             timeline_index: None,
             gpu_timeline_index: None,
             finish_profile: None,
@@ -441,6 +447,7 @@ impl ProgressiveUtraceSession {
             .push_chunk(bytes)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         self.chunk_count += 1;
+        self.snapshot_cadence.pushed(bytes.len());
         let mut events = Vec::new();
         if !self.bootstrap_emitted {
             if let Some((progress, bootstrap)) = session.bootstrap(Some(self.total_bytes)) {
@@ -454,9 +461,13 @@ impl ProgressiveUtraceSession {
                 self.bootstrap_emitted = true;
             }
         }
-        let (progress, patch) = session.frame_patch(Some(self.total_bytes));
         let frame_revision = session.frame_revision();
-        if frame_revision != self.last_frame_revision {
+        if frame_revision != self.last_frame_revision
+            && self
+                .snapshot_cadence
+                .frames_due(performance_now(), self.total_bytes)
+        {
+            let (progress, patch) = session.frame_patch(Some(self.total_bytes));
             self.last_frame_revision = frame_revision;
             events.push(WasmProgressEvent::Snapshot {
                 protocol_version: PROGRESS_PROTOCOL_VERSION,
