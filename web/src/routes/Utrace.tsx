@@ -42,6 +42,7 @@ import {
 } from "../lib/frame-display";
 import {
   ParseRequestError,
+  RETAIN_ALL_UTRACE_FRAMES,
   formatParseTiming,
   type ParseTiming,
 } from "../lib/api";
@@ -86,9 +87,6 @@ type WorkbenchTab =
   | "annotations"
   | "capture";
 
-// Rust/WASM uses a 32-bit usize. This is the browser's uncapped sentinel,
-// not a retained-frame UI limit.
-const BROWSER_ALL_FRAMES = 4_294_967_295;
 const MAX_LIVE_CHART_FRAMES = Number.MAX_SAFE_INTEGER;
 const LIVE_FRAME_RENDER_POINT_BUDGET = 600;
 
@@ -558,7 +556,7 @@ export default function UtracePage() {
       let latestSequence = -1;
       const dashResult = await parseUtraceProgressWithWasm({
         file: next,
-        options: { max_frames: BROWSER_ALL_FRAMES },
+        options: { max_frames: RETAIN_ALL_UTRACE_FRAMES },
         parentSpan: loadSpan,
         onEvent: (event) => {
           if (loadAbort !== abortController) return;

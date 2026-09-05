@@ -13,8 +13,11 @@ export function Shell(props: ParentProps) {
           <A href="/uasset" activeClass="active" end={false}>
             .uasset
           </A>
-          <A href="/utrace" activeClass="active" end={false}>
+          <A href="/utrace" activeClass="active" end>
             .utrace
+          </A>
+          <A href="/utrace/compare" activeClass="active" end>
+            compare
           </A>
         </nav>
       </header>

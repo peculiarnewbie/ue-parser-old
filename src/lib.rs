@@ -35,6 +35,8 @@ pub mod utrace_symbols;
 pub(crate) mod utrace_tasks;
 #[cfg(feature = "utrace")]
 pub(crate) mod utrace_timeline;
+#[cfg(feature = "utrace")]
+pub(crate) mod utrace_timer_stats;
 #[cfg(all(feature = "utrace-wasm", target_arch = "wasm32"))]
 mod wasm;
 #[cfg(all(feature = "utrace-wasm-threads", target_arch = "wasm32"))]

@@ -36,6 +36,7 @@ pub use crate::utrace_timeline::{
     DEFAULT_MAX_INDEXED_INTERVALS, SourceFingerprint, SourceIdentity, TimelineIndexBuild,
     TimelineIndexError, TimelineIndexRequest, query_cpu_timeline_index,
 };
+pub use crate::utrace_timer_stats::{CpuTimerStatsQuery, CpuTimerStatsResult, CpuTimerStatsRow};
 use crate::{ArchiveError, ArchiveErrorKind, Reader};
 
 #[cfg(feature = "utrace-parallel")]

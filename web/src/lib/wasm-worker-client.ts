@@ -11,11 +11,19 @@ import type {
   UtraceDashboard,
   UtraceGpuTimelineQuery,
   UtraceProgressEvent,
+  UtraceTimerStatsQuery,
   UtraceTimelineQuery,
 } from "./types";
 import type { UtraceDashboardQuery } from "./api";
 
 type WasmOperation = "uasset-inspect" | "utrace-inventory" | "utrace-dashboard" | "utrace-dashboard-bundle";
+
+declare const utraceSessionIdBrand: unique symbol;
+
+/** Opaque handle for a retained browser-side UTrace session. */
+export type UtraceSessionId = string & {
+  readonly [utraceSessionIdBrand]: "UtraceSessionId";
+};
 
 type Pending = {
   resolve: (value: { json: string; timing: WorkerTiming }) => void;
@@ -153,7 +161,8 @@ export async function parseUtraceProgressWithWasm(
     signal?: AbortSignal;
     parentSpan?: UtraceSpanHandle;
   },
-): Promise<TimedResult<UtraceDashboard>> {
+): Promise<TimedResult<UtraceDashboard> & { sessionId: UtraceSessionId }> {
+  input.signal?.throwIfAborted();
   const started = performance.now();
   const sessionId = nextId++;
   let parseMs = 0;
@@ -220,8 +229,10 @@ export async function parseUtraceProgressWithWasm(
     for (;;) {
       if (input.signal?.aborted) throw new DOMException("WASM parsing cancelled", "AbortError");
       const { value, done } = await reader.read();
+      input.signal?.throwIfAborted();
       if (done) break;
       for (let offset = 0; offset < value.byteLength; offset += 1024 * 1024) {
+        input.signal?.throwIfAborted();
         const chunk = value.slice(offset, Math.min(value.byteLength, offset + 1024 * 1024));
         chunkCount += 1;
         const result = await workerCall({
@@ -241,13 +252,16 @@ export async function parseUtraceProgressWithWasm(
       },
       parentSpan: input.parentSpan,
     });
+    input.signal?.throwIfAborted();
     dispatch(analyzing.json);
     const result = await workerCall({
       message: { kind: "utrace-progress-finish", session_id: sessionId },
       parentSpan: input.parentSpan,
     });
+    input.signal?.throwIfAborted();
     parseMs += result.timing.parse_ms;
     dispatch(result.json);
+    if (!finalDashboard) throw new ParseRequestError(422, { error: "WASM progressive session ended without completion" });
   } catch (error) {
     endFileSpan({ error });
     await abort();
@@ -255,10 +269,9 @@ export async function parseUtraceProgressWithWasm(
   } finally {
     input.signal?.removeEventListener("abort", abortListener);
   }
-  if (!finalDashboard) throw new ParseRequestError(422, { error: "WASM progressive session ended without completion" });
   return {
     data: finalDashboard,
-    sessionId: String(sessionId),
+    sessionId: String(sessionId) as UtraceSessionId,
     timing: {
       backend: "wasm",
       client_ms: performance.now() - started,
@@ -268,6 +281,26 @@ export async function parseUtraceProgressWithWasm(
       wasm_threads: startupTiming.wasm_threads,
     },
   };
+}
+
+function numericSessionId(sessionId: string): number {
+  const parsedSessionId = Number(sessionId);
+  if (!Number.isSafeInteger(parsedSessionId) || parsedSessionId < 0) {
+    throw new ParseRequestError(422, { error: "invalid browser timeline session" });
+  }
+  return parsedSessionId;
+}
+
+/** Release one retained session without disturbing other captures in the Worker. */
+export async function releaseUtraceSessionWithWasm(
+  sessionId: UtraceSessionId | string,
+): Promise<void> {
+  await workerCall({
+    message: {
+      kind: "utrace-progress-release",
+      session_id: numericSessionId(sessionId),
+    },
+  });
 }
 
 export async function queryUtraceTimelineWithWasm(
@@ -320,6 +353,46 @@ export async function queryUtraceTimelineWithWasm(
   } catch (error) {
     endUtraceSpan(jsonSpan, { error });
     throw new ParseRequestError(422, { error: "WASM timeline query returned non-JSON output" });
+  }
+}
+
+export async function queryUtraceTimerStatsWithWasm(
+  input: {
+    sessionId: string;
+    options: {
+      start_cycle?: number;
+      end_cycle?: number;
+      thread?: number;
+      search?: string;
+      limit?: number;
+    };
+    parentSpan?: UtraceSpanHandle;
+  },
+): Promise<TimedResult<UtraceTimerStatsQuery>> {
+  const parsedSessionId = numericSessionId(input.sessionId);
+  const started = performance.now();
+  const result = await workerCall({
+    message: {
+      kind: "utrace-progress-timer-stats",
+      session_id: parsedSessionId,
+      options: input.options,
+    },
+    parentSpan: input.parentSpan,
+  });
+  const jsonStarted = performance.now();
+  try {
+    return {
+      data: JSON.parse(result.json) as UtraceTimerStatsQuery,
+      timing: {
+        backend: "wasm",
+        client_ms: performance.now() - started,
+        json_parse_ms: performance.now() - jsonStarted,
+        ...result.timing,
+      },
+      sessionId: input.sessionId,
+    };
+  } catch {
+    throw new ParseRequestError(422, { error: "WASM timer stats query returned non-JSON output" });
   }
 }
 

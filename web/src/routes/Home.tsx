@@ -18,6 +18,9 @@ export default function Home() {
         <A class="btn ghost" href="/utrace">
           Inspect .utrace
         </A>
+        <A class="btn ghost" href="/utrace/compare">
+          Compare captures
+        </A>
       </div>
       <p class="hero-note">
         Files stay in this browser. Inspection runs in a dedicated WASM worker.

@@ -22,7 +22,9 @@ type WasmProgressRequest =
   | { id: number; kind: "utrace-progress-analyzing"; session_id: number }
   | { id: number; kind: "utrace-progress-finish"; session_id: number }
   | { id: number; kind: "utrace-progress-query"; session_id: number; options: Record<string, number | string | undefined> }
+  | { id: number; kind: "utrace-progress-timer-stats"; session_id: number; options: Record<string, number | string | undefined> }
   | { id: number; kind: "utrace-progress-gpu-query"; session_id: number; options: Record<string, number | undefined> }
+  | { id: number; kind: "utrace-progress-release"; session_id: number }
   | { id: number; kind: "utrace-progress-cancel"; session_id: number };
 
 type WasmRequest = WasmParseRequest | WasmProgressRequest;
@@ -55,6 +57,7 @@ type WasmModule = {
     finish: () => string;
     finish_profile: () => string;
     query_timeline: (options: string) => string;
+    query_timer_stats: (options: string) => string;
     query_gpu_timeline: (options: string) => string;
     free: () => void;
   };
@@ -65,6 +68,7 @@ let wasmInitializationPromise: Promise<void> | null = null;
 let threadPoolPromise: Promise<void> | null = null;
 const wasmThreads = self.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
 const progressiveSessions = new Map<number, InstanceType<WasmModule["ProgressiveUtraceSession"]>>();
+const MAX_RETAINED_UTRACE_SESSIONS = 2;
 
 async function wasm(spans: RemoteUtraceSpan[]): Promise<WasmModule> {
   if (!modulePromise) {
@@ -122,6 +126,12 @@ self.onmessage = async (event: MessageEvent<WasmRequest>) => {
     if (request.kind === "utrace-progress-start") {
       const operationStarted = performance.now();
       progressiveSessions.get(request.session_id)?.free();
+      progressiveSessions.delete(request.session_id);
+      if (progressiveSessions.size >= MAX_RETAINED_UTRACE_SESSIONS) {
+        throw new Error(
+          `browser UTrace session limit (${MAX_RETAINED_UTRACE_SESSIONS}) reached; release a capture before loading another`,
+        );
+      }
       progressiveSessions.set(
         request.session_id,
         new loaded.ProgressiveUtraceSession(
@@ -155,7 +165,10 @@ self.onmessage = async (event: MessageEvent<WasmRequest>) => {
       } satisfies WasmResponse);
       return;
     }
-    if (request.kind === "utrace-progress-cancel") {
+    if (
+      request.kind === "utrace-progress-cancel" ||
+      request.kind === "utrace-progress-release"
+    ) {
       const operationStarted = performance.now();
       progressiveSessions.get(request.session_id)?.free();
       progressiveSessions.delete(request.session_id);
@@ -212,6 +225,17 @@ self.onmessage = async (event: MessageEvent<WasmRequest>) => {
       if (!session) throw new Error("unknown progressive WASM session");
       const beforeParse = performance.now();
       const json = session.query_timeline(JSON.stringify(request.options));
+      const parseMs = performance.now() - beforeParse;
+      spans.push(remoteSpan({ name: UTRACE_SPAN.timelineQuery, domain: "wasm", started: beforeParse }));
+      spans.push(requestSpan(request, started));
+      self.postMessage({ id: request.id, ok: true, json, timing: { wasm_copy_ms: 0, parse_ms: parseMs, spans }, sent_at: performance.now() } satisfies WasmResponse);
+      return;
+    }
+    if (request.kind === "utrace-progress-timer-stats") {
+      const session = progressiveSessions.get(request.session_id);
+      if (!session) throw new Error("unknown progressive WASM session");
+      const beforeParse = performance.now();
+      const json = session.query_timer_stats(JSON.stringify(request.options));
       const parseMs = performance.now() - beforeParse;
       spans.push(remoteSpan({ name: UTRACE_SPAN.timelineQuery, domain: "wasm", started: beforeParse }));
       spans.push(requestSpan(request, started));
